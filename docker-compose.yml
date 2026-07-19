@@ -1,0 +1,91 @@
+# Local development dependencies.
+#
+#   docker compose up -d
+#
+# Production runs managed equivalents. ClickHouse and Redpanda are optional for
+# early API work but required once channel ingest lands.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: envelock
+      POSTGRES_PASSWORD: envelock
+      POSTGRES_DB: envelock
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U envelock"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Mail and audit event telemetry. Grows very large, compresses very well.
+  # Never put this in Postgres (PRD §10).
+  clickhouse:
+    image: clickhouse/clickhouse-server:24-alpine
+    environment:
+      CLICKHOUSE_USER: envelock
+      CLICKHOUSE_PASSWORD: envelock
+      CLICKHOUSE_DB: envelock
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  # Event bus between channel ingest and detection workers. Redpanda over Kafka
+  # for operational simplicity at our scale.
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda start
+      - --smp 1
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:19092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:29092,OUTSIDE://localhost:19092
+    ports:
+      - "19092:19092"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+
+  # Attachment cascade layer 1 — free, self-hosted, catches known commodity
+  # malware before we ever pay for a detonation (PRD §12.12A).
+  clamav:
+    image: clamav/clamav:stable
+    ports:
+      - "3310:3310"
+    volumes:
+      - clamav_data:/var/lib/clamav
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+
+volumes:
+  postgres_data:
+  redis_data:
+  clickhouse_data:
+  redpanda_data:
+  clamav_data:
