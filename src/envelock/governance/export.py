@@ -104,6 +104,9 @@ _SYSLOG_SEVERITY = {
 
 
 def _cef_escape(value: str, *, extension: bool = False) -> str:
+    # Strip control characters first: a newline in any field would let an
+    # attacker forge an additional syslog record downstream.
+    value = "".join(c if c.isprintable() or c == " " else " " for c in value)
     out = value.replace("\\", "\\\\")
     out = out.replace("=", "\\=") if extension else out.replace("|", "\\|")
     return out.replace("\n", " ").replace("\r", " ")
@@ -184,6 +187,26 @@ def to_json_line(alert: AlertRecord) -> str:
 
 # ── CSV ──────────────────────────────────────────────────────────────────────
 
+#: Leading characters a spreadsheet treats as the start of a formula.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(value: str) -> str:
+    """Neutralise CSV/formula injection.
+
+    Alert fields carry attacker-controlled text — a subject line of
+    `=cmd|'/c calc'!A1` executes when the export is opened in Excel or
+    LibreOffice. We are exporting hostile input by definition, so every cell is
+    prefixed rather than trusted. RFC 4180 quoting does NOT prevent this.
+    """
+    if not value:
+        return value
+    text = str(value).replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    if text.startswith(_FORMULA_PREFIXES):
+        return "\u0027" + text
+    return text
+
+
 _CSV_COLUMNS = (
     "id",
     "raised_at",
@@ -206,16 +229,16 @@ def to_csv(alerts: list[AlertRecord]) -> str:
     for a in alerts:
         writer.writerow(
             [
-                a.id,
+                csv_safe(a.id),
                 a.raised_at.astimezone(UTC).isoformat(),
                 a.tier.value,
-                a.service,
-                a.title,
-                a.mailbox,
-                a.detail,
-                a.state,
+                csv_safe(a.service),
+                csv_safe(a.title),
+                csv_safe(a.mailbox),
+                csv_safe(a.detail),
+                csv_safe(a.state),
                 a.acknowledged_at.astimezone(UTC).isoformat() if a.acknowledged_at else "",
-                a.acknowledged_by or "",
+                csv_safe(a.acknowledged_by or ""),
             ]
         )
     return buffer.getvalue()

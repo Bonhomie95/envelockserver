@@ -34,6 +34,12 @@ from envelock.detections.base import (
     run_all,
 )
 from envelock.risk.engine import assess
+from envelock.security.limits import (
+    MAX_OBSERVED_DOMAINS,
+    MAX_RAW_MESSAGE_BYTES,
+    clamp_text,
+    valid_domain,
+)
 from envelock.util.domains import registrable_domain
 
 router = APIRouter(prefix="/api/v1")
@@ -93,14 +99,16 @@ async def trial_check(req: TrialCheckRequest) -> dict:
 
 # ── Channel 3 — works with zero integration ──────────────────────────────────
 class DomainScanRequest(BaseModel):
-    domain: str
+    domain: str = Field(max_length=253)
     #: Domains observed in CT logs / zone files. In production the worker feeds
     #: these continuously; supplying them here makes the endpoint demoable.
-    observed: list[str] = Field(default_factory=list)
+    observed: list[str] = Field(default_factory=list, max_length=MAX_OBSERVED_DOMAINS)
 
 
 @router.post("/domains/scan")
 async def domain_scan(req: DomainScanRequest) -> dict:
+    if not valid_domain(req.domain):
+        raise HTTPException(422, "invalid domain")
     protected = registrable_domain(req.domain)
     if not protected:
         raise HTTPException(422, "invalid domain")
@@ -138,6 +146,9 @@ async def domain_connect(domain: str) -> dict:
     Every provider has one — an unrecognised MX record changes the *method*, not
     whether we can protect the mailbox (PRD §5).
     """
+    # Validate structurally before this reaches a resolver.
+    if not valid_domain(domain):
+        raise HTTPException(422, "invalid domain")
     reg = registrable_domain(domain)
     if not reg:
         raise HTTPException(422, "invalid domain")
@@ -166,6 +177,9 @@ async def providers() -> dict:
 
 @router.get("/domains/{domain}/permutations")
 async def domain_permutations(domain: str, limit: int = 200) -> dict:
+    if not valid_domain(domain):
+        raise HTTPException(422, "invalid domain")
+    limit = max(1, min(limit, 1000))
     perms = sorted(permutations(domain))
     return {"domain": registrable_domain(domain), "count": len(perms), "sample": perms[:limit]}
 
@@ -193,10 +207,10 @@ async def coverage(sources: str) -> dict:
 
 # ── Analysis ─────────────────────────────────────────────────────────────────
 class AnalyseRequest(BaseModel):
-    raw_message: str
-    owned_domains: list[str] = Field(default_factory=list)
-    known_counterparties: list[str] = Field(default_factory=list)
-    counterparty_known_bank_ids: list[str] = Field(default_factory=list)
+    raw_message: str = Field(max_length=MAX_RAW_MESSAGE_BYTES)
+    owned_domains: list[str] = Field(default_factory=list, max_length=200)
+    known_counterparties: list[str] = Field(default_factory=list, max_length=2000)
+    counterparty_known_bank_ids: list[str] = Field(default_factory=list, max_length=100)
     counterparty_message_count: int = 0
     counterparty_phone: str | None = None
     source: SourceMechanism = SourceMechanism.FORWARD_INGEST
@@ -215,7 +229,7 @@ async def analyse(req: AnalyseRequest) -> dict:
     caps = capabilities_for(frozenset({req.source}))
 
     event = parse_message(
-        req.raw_message.encode(),
+        clamp_text(req.raw_message, MAX_RAW_MESSAGE_BYTES).encode(),
         tenant_id=tenant_id,
         mailbox_id=mailbox_id,
         source=req.source,

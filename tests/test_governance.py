@@ -116,7 +116,7 @@ def test_full_login_flow_issues_tokens_and_recovery_codes(client: TestClient) ->
     ).json()
 
     setup = client.post(
-        "/api/v1/auth/mfa/setup", json={"refresh_token": login["mfa_token"]}
+        "/api/v1/auth/mfa/setup", json={"token": login["mfa_token"]}
     ).json()
     code = _totp_at(setup["secret"], int(time.time()) // 30)
 

@@ -17,6 +17,10 @@ from envelock.detections import (  # noqa: F401  (registers detections)
     impersonation,
     sessions,
 )
+from envelock.security.middleware import (
+    RequestGuardMiddleware,
+    SecurityHeadersMiddleware,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +57,20 @@ def create_app() -> FastAPI:
         redoc_url=None,
     )
 
+    # Order matters: guards run before routing, headers wrap everything.
+    app.add_middleware(SecurityHeadersMiddleware, production=settings.is_production)
+    app.add_middleware(RequestGuardMiddleware)
+
     if not settings.is_production:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=["http://localhost:5173"],
-            allow_methods=["*"],
-            allow_headers=["*"],
+            # Explicit rather than "*": a wildcard with credentials is a
+            # cross-origin credential leak waiting to happen.
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type"],
+            max_age=600,
         )
 
     app.include_router(health.router, tags=["health"])

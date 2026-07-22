@@ -8,6 +8,8 @@ the endpoints.
 
 from __future__ import annotations
 
+import secrets
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -18,10 +20,12 @@ from pydantic import BaseModel, EmailStr, Field
 from envelock.auth.deps import AdminUser, CurrentUser
 from envelock.auth.security import (
     MFA_PENDING_TTL,
+    REFRESH_TTL,
     SENSITIVE_ACTIONS,
     Role,
     TokenError,
     decode_token,
+    dummy_hash,
     generate_recovery_codes,
     generate_totp_secret,
     hash_password,
@@ -32,6 +36,7 @@ from envelock.auth.security import (
     verify_password,
     verify_totp,
 )
+from envelock.security.limits import lockout, revocations, totp_replay
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
@@ -60,112 +65,139 @@ def _reset_store() -> None:
 # ── Schemas ──────────────────────────────────────────────────────────────────
 class RegisterRequest(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=12)
+    # Length ceilings everywhere: an unbounded password is unbounded scrypt work.
+    password: str = Field(min_length=12, max_length=256)
     tenant_name: str = Field(min_length=1, max_length=200)
 
 
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(max_length=256)
 
 
 class MfaVerifyRequest(BaseModel):
-    mfa_token: str
-    code: str
+    mfa_token: str = Field(max_length=4096)
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
 
 
-class MfaEnableRequest(BaseModel):
-    code: str
+class RecoveryRequest(BaseModel):
+    mfa_token: str = Field(max_length=4096)
+    recovery_code: str = Field(max_length=64)
 
 
-class RefreshRequest(BaseModel):
-    refresh_token: str
+class TokenRequest(BaseModel):
+    token: str = Field(max_length=4096)
 
 
-# ── Endpoints ────────────────────────────────────────────────────────────────
-@router.post("/register", status_code=status.HTTP_201_CREATED)
-async def register(req: RegisterRequest) -> dict:
-    """First user of a tenant becomes its owner."""
-    email = req.email.lower()
-    if email in _USERS:
-        # Same response shape as success would be better for enumeration
-        # resistance, but a 409 is the honest answer for a self-serve signup.
-        raise HTTPException(status.HTTP_409_CONFLICT, "account already exists")
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def _generic_401() -> HTTPException:
+    """One message for every credential failure.
 
-    try:
-        password_hash = hash_password(req.password)
-    except ValueError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-
-    user = _User(
-        id=uuid4(),
-        tenant_id=uuid4(),
-        email=email,
-        password_hash=password_hash,
-        role=Role.OWNER,
-    )
-    _USERS[email] = user
-
-    return {
-        "user_id": str(user.id),
-        "tenant_id": str(user.tenant_id),
-        "role": user.role.value,
-        "mfa_required": True,
-        "next": "Call /auth/mfa/setup — MFA is mandatory before this account can "
-        "hold a session.",
-    }
-
-
-@router.post("/login")
-async def login(req: LoginRequest) -> dict:
-    user = _USERS.get(req.email.lower())
-    # Verify against a dummy hash when the user is missing so timing does not
-    # leak which addresses exist.
-    stored = user.password_hash if user else hash_password("x" * 12)
-    if not verify_password(req.password, stored) or user is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
-
-    if not user.mfa_enabled:
-        return {
-            "mfa_setup_required": True,
-            "mfa_token": issue_token(
-                user_id=user.id,
-                tenant_id=user.tenant_id,
-                role=user.role,
-                typ="mfa_pending",
-                ttl=MFA_PENDING_TTL,
-            ),
-        }
-
-    return {
-        "mfa_required": True,
-        "mfa_token": issue_token(
-            user_id=user.id,
-            tenant_id=user.tenant_id,
-            role=user.role,
-            typ="mfa_pending",
-            ttl=MFA_PENDING_TTL,
-        ),
-    }
+    Distinguishing "no such account" from "wrong password" hands an attacker a
+    free account-enumeration oracle.
+    """
+    return HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
 
 
 def _user_by_id(user_id: UUID) -> _User:
     for user in _USERS.values():
         if user.id == user_id:
             return user
-    raise HTTPException(status.HTTP_401_UNAUTHORIZED, "unknown user")
+    raise _generic_401()
+
+
+def _issue_mfa_challenge(user: _User) -> str:
+    return issue_token(
+        user_id=user.id,
+        tenant_id=user.tenant_id,
+        role=user.role,
+        typ="mfa_pending",
+        ttl=MFA_PENDING_TTL,
+    )
+
+
+def _complete_login(user: _User, *, first_time: bool = False) -> dict:
+    lockout.record_success(user.email)
+    tokens = issue_pair(user_id=user.id, tenant_id=user.tenant_id, role=user.role)
+    if first_time:
+        codes = generate_recovery_codes()
+        user.recovery_hashes = {hash_recovery_code(c) for c in codes}
+        tokens["recovery_codes"] = codes  # shown exactly once
+    return tokens
+
+
+# ── Endpoints ────────────────────────────────────────────────────────────────
+@router.post("/register", status_code=status.HTTP_201_CREATED)
+async def register(req: RegisterRequest) -> dict:
+    """First user of a tenant becomes its owner."""
+    email = req.email.lower().strip()
+
+    # Identical response whether or not the address exists — a 409 here would
+    # turn signup into an account-enumeration endpoint.
+    if email not in _USERS:
+        try:
+            password_hash = hash_password(req.password)
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)
+            ) from exc
+        _USERS[email] = _User(
+            id=uuid4(),
+            tenant_id=uuid4(),
+            email=email,
+            password_hash=password_hash,
+            role=Role.OWNER,
+        )
+
+    return {
+        "status": "registration_received",
+        "mfa_required": True,
+        "next": "Sign in, then complete MFA setup. MFA is mandatory before this "
+        "account can hold a session.",
+    }
+
+
+@router.post("/login")
+async def login(req: LoginRequest) -> dict:
+    email = req.email.lower().strip()
+
+    locked, retry_after = lockout.is_locked(email)
+    if locked:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "too many failed attempts",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    user = _USERS.get(email)
+    # Compare against a precomputed hash when the account is unknown, so the
+    # timing profile matches without doing 32 MB of scrypt per bogus request.
+    stored = user.password_hash if user else dummy_hash()
+    password_ok = verify_password(req.password, stored)
+
+    if user is None or not password_ok:
+        lockout.record_failure(email)
+        raise _generic_401()
+
+    return {
+        "mfa_setup_required": not user.mfa_enabled,
+        "mfa_required": user.mfa_enabled,
+        "mfa_token": _issue_mfa_challenge(user),
+    }
 
 
 @router.post("/mfa/setup")
-async def mfa_setup(req: RefreshRequest) -> dict:
+async def mfa_setup(req: TokenRequest) -> dict:
     """Exchange an `mfa_pending` token for a TOTP secret to enrol."""
     try:
-        claims = decode_token(req.refresh_token, expect="mfa_pending")
+        claims = decode_token(req.token, expect="mfa_pending")
     except TokenError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
 
     user = _user_by_id(claims.sub)
     if user.mfa_enabled:
+        # Re-enrolment must go through the authenticated reset flow, or anyone
+        # holding the password could replace the second factor.
         raise HTTPException(status.HTTP_409_CONFLICT, "MFA already enabled")
 
     user.totp_secret = generate_totp_secret()
@@ -185,32 +217,111 @@ async def mfa_verify(req: MfaVerifyRequest) -> dict:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
 
     user = _user_by_id(claims.sub)
+
+    locked, retry_after = lockout.is_locked(f"mfa:{user.email}")
+    if locked:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "too many failed attempts",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     if not user.totp_secret:
         raise HTTPException(status.HTTP_409_CONFLICT, "MFA not set up")
+
     if not verify_totp(user.totp_secret, req.code):
+        lockout.record_failure(f"mfa:{user.email}")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid code")
+
+    # A TOTP code stays valid for its whole window, so without this an observed
+    # code (phishing proxy, shoulder-surf, malware) can be replayed.
+    if not totp_replay.check_and_record(f"{user.id}:{req.code}"):
+        lockout.record_failure(f"mfa:{user.email}")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "code already used")
 
     first_time = not user.mfa_enabled
     user.mfa_enabled = True
+    lockout.record_success(f"mfa:{user.email}")
+    return _complete_login(user, first_time=first_time)
 
-    tokens = issue_pair(user_id=user.id, tenant_id=user.tenant_id, role=user.role)
-    if first_time:
-        codes = generate_recovery_codes()
-        user.recovery_hashes = {hash_recovery_code(c) for c in codes}
-        # Shown exactly once — only hashes are retained.
-        tokens["recovery_codes"] = codes
+
+@router.post("/recovery")
+async def recovery(req: RecoveryRequest) -> dict:
+    """Redeem a single-use recovery code when the authenticator is lost.
+
+    Without this, generating recovery codes at enrolment was theatre — a user
+    who lost their device had no way back in.
+    """
+    try:
+        claims = decode_token(req.mfa_token, expect="mfa_pending")
+    except TokenError as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
+
+    user = _user_by_id(claims.sub)
+
+    locked, retry_after = lockout.is_locked(f"rec:{user.email}")
+    if locked:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "too many failed attempts",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    candidate = hash_recovery_code(req.recovery_code)
+    # Constant-time membership test over the stored hashes.
+    matched = None
+    for stored in user.recovery_hashes:
+        if secrets.compare_digest(stored, candidate):
+            matched = stored
+    if matched is None:
+        lockout.record_failure(f"rec:{user.email}")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid recovery code")
+
+    user.recovery_hashes.discard(matched)  # single use
+    lockout.record_success(f"rec:{user.email}")
+
+    tokens = _complete_login(user)
+    tokens["recovery_codes_remaining"] = len(user.recovery_hashes)
+    tokens["warning"] = (
+        "Recovery code consumed. Re-enrol your authenticator and regenerate codes."
+    )
     return tokens
 
 
 @router.post("/refresh")
-async def refresh(req: RefreshRequest) -> dict:
-    """Refresh tokens rotate: the presented token is replaced, not reused."""
+async def refresh(req: TokenRequest) -> dict:
+    """Rotating refresh with reuse detection.
+
+    The presented token is revoked on use. If it is presented again it was
+    stolen or replayed, so every session for that user is revoked rather than
+    just the one token.
+    """
     try:
-        claims = decode_token(req.refresh_token, expect="refresh")
+        claims = decode_token(req.token, expect="refresh")
     except TokenError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
+
+    if revocations.is_revoked(claims.jti, str(claims.sub)):
+        revocations.revoke_user(
+            str(claims.sub), until=time.time() + REFRESH_TTL.total_seconds()
+        )
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "refresh token reuse detected — all sessions revoked",
+        )
+
+    revocations.revoke_jti(claims.jti, expires_at=float(claims.exp))
     user = _user_by_id(claims.sub)
     return issue_pair(user_id=user.id, tenant_id=user.tenant_id, role=user.role)
+
+
+@router.post("/logout")
+async def logout(principal: CurrentUser) -> dict:
+    """Revokes every refresh token for the caller."""
+    revocations.revoke_user(
+        str(principal.user_id), until=time.time() + REFRESH_TTL.total_seconds()
+    )
+    return {"status": "logged_out"}
 
 
 @router.get("/me")
@@ -223,6 +334,7 @@ async def me(principal: CurrentUser) -> dict:
         "role": user.role.value,
         "mfa_enabled": user.mfa_enabled,
         "is_admin": principal.is_admin,
+        "recovery_codes_remaining": len(user.recovery_hashes),
     }
 
 
@@ -234,7 +346,7 @@ async def sensitive_actions(principal: CurrentUser) -> dict:
 
 @router.get("/admin/users")
 async def list_users(principal: AdminUser) -> dict:
-    """Admin-only. Demonstrates both the role guard and tenant isolation."""
+    """Admin-only, and scoped to the caller's own tenant."""
     return {
         "users": [
             {"email": u.email, "role": u.role.value, "mfa_enabled": u.mfa_enabled}

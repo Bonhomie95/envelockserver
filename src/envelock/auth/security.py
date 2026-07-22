@@ -75,6 +75,20 @@ def hash_password(password: str) -> str:
     )
 
 
+#: Computed once at import. Comparing against a live `hash_password()` call on
+#: every unknown-email login let an attacker burn 80ms and 32 MB per request —
+#: a few hundred concurrent requests exhaust the box. This keeps the timing
+#: profile without the cost.
+_DUMMY_HASH: str | None = None
+
+
+def dummy_hash() -> str:
+    global _DUMMY_HASH
+    if _DUMMY_HASH is None:
+        _DUMMY_HASH = hash_password("not-a-real-password")
+    return _DUMMY_HASH
+
+
 def verify_password(password: str, stored: str) -> bool:
     try:
         scheme, n, r, p, salt_b64, hash_b64 = stored.split("$")
@@ -210,25 +224,42 @@ def issue_token(
     return f"{_b64(payload)}.{_b64(_sign(payload))}"
 
 
+#: A token is a few hundred bytes; anything larger is an attempt to make us do
+#: pointless base64 and HMAC work.
+MAX_TOKEN_LENGTH = 4096
+
+
 def decode_token(token: str, *, expect: str | None = None) -> TokenClaims:
+    if not token or len(token) > MAX_TOKEN_LENGTH:
+        raise TokenError("malformed token")
     try:
         payload_b64, sig_b64 = token.split(".")
         payload = _unb64(payload_b64)
     except (ValueError, TypeError) as exc:
         raise TokenError("malformed token") from exc
 
-    if not hmac.compare_digest(_sign(payload), _unb64(sig_b64)):
+    try:
+        signature = _unb64(sig_b64)
+    except (ValueError, TypeError) as exc:
+        raise TokenError("malformed signature") from exc
+
+    if not hmac.compare_digest(_sign(payload), signature):
         raise TokenError("bad signature")
 
-    data = json.loads(payload)
-    claims = TokenClaims(
-        sub=UUID(data["sub"]),
-        tenant=UUID(data["tenant"]),
-        role=Role(data["role"]),
-        typ=data["typ"],
-        exp=int(data["exp"]),
-        jti=data["jti"],
-    )
+    # Parsing happens only after the signature verifies, but a malformed field
+    # must still surface as 401 rather than an unhandled 500.
+    try:
+        data = json.loads(payload)
+        claims = TokenClaims(
+            sub=UUID(data["sub"]),
+            tenant=UUID(data["tenant"]),
+            role=Role(data["role"]),
+            typ=data["typ"],
+            exp=int(data["exp"]),
+            jti=data["jti"],
+        )
+    except (ValueError, TypeError, KeyError) as exc:
+        raise TokenError("malformed claims") from exc
     if claims.expired:
         raise TokenError("expired")
     if expect and claims.typ != expect:

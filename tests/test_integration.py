@@ -50,7 +50,7 @@ def sign_in(client: TestClient, email="it@acme.com.ng") -> str:
         "/api/v1/auth/login", json={"email": email, "password": "a-long-enough-pw"}
     ).json()
     setup = client.post(
-        "/api/v1/auth/mfa/setup", json={"refresh_token": login["mfa_token"]}
+        "/api/v1/auth/mfa/setup", json={"token": login["mfa_token"]}
     ).json()
     tokens = client.post(
         "/api/v1/auth/mfa/verify",
