@@ -244,7 +244,7 @@ class ExternalEvent(EventEnvelope):
     domain: str
     registrable_domain: str
     """eTLD+1 via the Public Suffix List. Never naive string splitting — that
-    would break every .co.uk, .com.tw and .com.ng customer, i.e. our markets."""
+    would break every .co.uk, .com.au and .co.jp customer, i.e. our markets."""
 
     protected_domain: str | None = None
     """The customer domain this observation resembles, if any."""

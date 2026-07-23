@@ -119,10 +119,15 @@ class Settings(BaseSettings):
     trial_backfill_days: int = 30
     backfill_days: int = 90
 
+    # Global payment rails. Stripe is the primary processor (North America and
+    # global); the regional acquirers cover markets Stripe serves less well.
     stripe_secret_key: SecretStr | None = None
     stripe_webhook_secret: SecretStr | None = None
-    paystack_secret_key: SecretStr | None = None
-    flutterwave_secret_key: SecretStr | None = None
+    adyen_api_key: SecretStr | None = None  # Europe / global enterprise
+    adyen_merchant_account: str | None = None
+    mercadopago_access_token: SecretStr | None = None  # Latin America
+    razorpay_key_id: str | None = None  # Asia (India and neighbours)
+    razorpay_key_secret: SecretStr | None = None
     paypal_client_id: str | None = None
     paypal_client_secret: SecretStr | None = None
 

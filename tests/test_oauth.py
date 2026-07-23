@@ -59,8 +59,8 @@ def client() -> Iterator[TestClient]:
 
 
 def _admin(client: TestClient) -> dict[str, str]:
-    pw = "a-long-enough-password"
-    email = "admin@acme.com.ng"
+    pw = "a-long-enough-passphrase"
+    email = "admin@acme.com"
     client.post(
         "/api/v1/auth/register",
         json={"email": email, "password": pw, "tenant_name": "Acme"},
@@ -78,12 +78,12 @@ def _admin(client: TestClient) -> dict[str, str]:
     # A tenant must exist and own the mailbox.
     client.post(
         "/api/v1/tenants/bootstrap",
-        json={"name": "Acme", "domain": "acme.com.ng"},
+        json={"name": "Acme", "domain": "acme.com"},
         headers=h,
     )
     client.post(
         "/api/v1/mailboxes",
-        json={"address": "pay@acme.com.ng", "mailbox_class": "protected", "sources": []},
+        json={"address": "pay@acme.com", "mailbox_class": "protected", "sources": []},
         headers=h,
     )
     return h
@@ -93,7 +93,7 @@ def test_authorize_returns_a_consent_url(client: TestClient, configured_ms: None
     h = _admin(client)
     body = client.post(
         "/api/v1/connect/oauth/microsoft/authorize",
-        json={"mailbox_address": "pay@acme.com.ng"},
+        json={"mailbox_address": "pay@acme.com"},
         headers=h,
     ).json()
     assert "login.microsoftonline.com" in body["authorize_url"]
@@ -109,7 +109,7 @@ def test_unconfigured_provider_reports_503(client: TestClient) -> None:
     h = _admin(client)
     r = client.post(
         "/api/v1/connect/oauth/microsoft/authorize",
-        json={"mailbox_address": "pay@acme.com.ng"},
+        json={"mailbox_address": "pay@acme.com"},
         headers=h,
     )
     assert r.status_code == 503
@@ -124,7 +124,7 @@ def test_callback_exchanges_code_and_flips_mailbox_to_tier1(
         h = _admin(client)
         auth = client.post(
             "/api/v1/connect/oauth/microsoft/authorize",
-            json={"mailbox_address": "pay@acme.com.ng"},
+            json={"mailbox_address": "pay@acme.com"},
             headers=h,
         ).json()
 
@@ -175,7 +175,7 @@ def test_stored_oauth_token_is_encrypted_at_rest(
         h = _admin(client)
         auth = client.post(
             "/api/v1/connect/oauth/microsoft/authorize",
-            json={"mailbox_address": "pay@acme.com.ng"},
+            json={"mailbox_address": "pay@acme.com"},
             headers=h,
         ).json()
         client.get(

@@ -339,7 +339,7 @@ def test_trial_backfill_is_capped() -> None:
 
 
 def test_simulations_are_labelled_so_they_cannot_be_mistaken_for_real() -> None:
-    sims = simulations(protected_domain="acme.com.ng", vendor_domain="supplier.com")
+    sims = simulations(protected_domain="acme.com", vendor_domain="supplier.com")
     assert len(sims) >= 4
     for sim in sims:
         assert "X-Envelock-Simulation: true" in sim.raw_message
@@ -356,7 +356,7 @@ async def test_in_app_always_delivers_and_sms_is_gated() -> None:
     results = await dispatcher.dispatch(
         notification,
         rungs=(Rung.L0_IN_APP, Rung.L3_SMS),
-        destinations={Rung.L0_IN_APP: "user-1", Rung.L3_SMS: "+2348030000000"},
+        destinations={Rung.L0_IN_APP: "user-1", Rung.L3_SMS: "+18030000000"},
     )
     by_rung = {r.rung: r for r in results}
     assert by_rung[Rung.L0_IN_APP].delivered

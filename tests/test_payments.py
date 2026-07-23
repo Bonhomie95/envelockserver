@@ -1,8 +1,7 @@
 """Payment gate and trial ledger (PRD §12.7, §17.1).
 
 Exercised end to end against a fake payment transport, so the funnel is proven
-without a live Stripe/Paystack account. Only the final HTTP call differs in
-production.
+without a live processor account. Only the final HTTP call differs in production.
 """
 
 from __future__ import annotations
@@ -57,7 +56,7 @@ def client() -> Iterator[TestClient]:
 
 
 def _owner(client: TestClient, email: str) -> dict[str, str]:
-    pw = "a-long-enough-password"
+    pw = "a-long-enough-passphrase"
     client.post(
         "/api/v1/auth/register",
         json={"email": email, "password": pw, "tenant_name": "Acme"},
@@ -74,7 +73,7 @@ def _owner(client: TestClient, email: str) -> dict[str, str]:
     h = {"Authorization": f"Bearer {tokens['access_token']}"}
     client.post(
         "/api/v1/tenants/bootstrap",
-        json={"name": "Acme", "domain": "acme.com.ng"},
+        json={"name": "Acme", "domain": "acme.com"},
         headers=h,
     )
     return h
@@ -85,10 +84,10 @@ def test_confirm_opens_the_gate_and_starts_the_trial(
 ) -> None:
     payments.set_default_transport(_FakeStripe())
     try:
-        h = _owner(client, "owner@acme.com.ng")
+        h = _owner(client, "owner@acme.com")
         body = client.post(
             "/api/v1/billing/confirm",
-            json={"provider": "stripe", "reference": "pm_123", "identifier": "acme.com.ng"},
+            json={"provider": "stripe", "reference": "pm_123", "identifier": "acme.com"},
             headers=h,
         ).json()
 
@@ -109,17 +108,17 @@ def test_second_trial_for_same_domain_is_refused(
     """The ledger is permanent — a domain gets one trial, ever (PRD §12.7)."""
     payments.set_default_transport(_FakeStripe())
     try:
-        h1 = _owner(client, "first@acme.com.ng")
+        h1 = _owner(client, "first@acme.com")
         client.post(
             "/api/v1/billing/confirm",
-            json={"provider": "stripe", "reference": "pm_1", "identifier": "acme.com.ng"},
+            json={"provider": "stripe", "reference": "pm_1", "identifier": "acme.com"},
             headers=h1,
         )
         # A different tenant tries the same registrable domain later.
-        h2 = _owner(client, "second@acme.com.ng")
+        h2 = _owner(client, "second@acme.com")
         body = client.post(
             "/api/v1/billing/confirm",
-            json={"provider": "stripe", "reference": "pm_2", "identifier": "acme.com.ng"},
+            json={"provider": "stripe", "reference": "pm_2", "identifier": "acme.com"},
             headers=h2,
         ).json()
 
@@ -134,10 +133,10 @@ def test_unconfigured_provider_reports_503(client: TestClient) -> None:
     from envelock.config import get_settings
 
     get_settings.cache_clear()
-    h = _owner(client, "owner@acme.com.ng")
+    h = _owner(client, "owner@acme.com")
     r = client.post(
         "/api/v1/billing/confirm",
-        json={"provider": "stripe", "reference": "pm_1", "identifier": "acme.com.ng"},
+        json={"provider": "stripe", "reference": "pm_1", "identifier": "acme.com"},
         headers=h,
     )
     assert r.status_code == 503
@@ -151,16 +150,16 @@ def test_ledger_entry_is_persisted(client: TestClient, configured_stripe: None) 
 
     payments.set_default_transport(_FakeStripe())
     try:
-        h = _owner(client, "owner@acme.com.ng")
+        h = _owner(client, "owner@acme.com")
         client.post(
             "/api/v1/billing/confirm",
-            json={"provider": "stripe", "reference": "pm_1", "identifier": "acme.com.ng"},
+            json={"provider": "stripe", "reference": "pm_1", "identifier": "acme.com"},
             headers=h,
         )
 
         async def _read() -> DomainTrialLedger | None:
             async with get_sessionmaker()() as s:
-                return await s.get(DomainTrialLedger, "acme.com.ng")
+                return await s.get(DomainTrialLedger, "acme.com")
 
         row = asyncio.run(_read())
         assert row is not None
@@ -168,3 +167,33 @@ def test_ledger_entry_is_persisted(client: TestClient, configured_stripe: None) 
         assert row.payment_fingerprint == "fp_reused"
     finally:
         payments.set_default_transport(None)
+
+
+# ── Regional acquirers behind the same interface ─────────────────────────────
+class _FakeAcquirer:
+    """A regional processor returning a stored-card token as the fingerprint."""
+
+    async def request(self, method: str, url: str, *, headers: dict, json=None) -> dict:
+        if "storedPaymentMethods" in url:  # Adyen
+            return {"id": "sp_1", "networkToken": "ntok_abc", "brand": "mc", "lastFour": "1111"}
+        return {"pspReference": "psp_1", "resultCode": "Authorised"}
+
+
+@pytest.mark.asyncio
+async def test_regional_provider_verifies_through_the_same_interface() -> None:
+    """Adyen (Europe) must satisfy the PaymentProvider contract exactly like
+    Stripe — one region per rail, no branching in the funnel (PRD §12.8)."""
+    adyen = payments.provider_for("adyen")
+    assert adyen is not None
+    instrument = await adyen.verify_instrument("sp_1", transport=_FakeAcquirer())
+    assert instrument.provider == "adyen"
+    assert instrument.fingerprint == "ntok_abc"
+    assert instrument.last4 == "1111"
+
+
+def test_configured_providers_span_the_americas_europe_and_asia() -> None:
+    """The rails are Stripe (North America + global) plus one acquirer each for
+    Europe, Latin America and Asia."""
+    from envelock.billing.payments import _PROVIDERS
+
+    assert set(_PROVIDERS) == {"stripe", "adyen", "mercadopago", "razorpay"}

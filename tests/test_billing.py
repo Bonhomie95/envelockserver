@@ -69,7 +69,7 @@ def test_term_discounts() -> None:
 # ── Trial ────────────────────────────────────────────────────────────────────
 def test_trial_locks_on_registrable_domain() -> None:
     """Subdomain evasion must not earn a second trial."""
-    assert trial.trial_key("acme.com.ng") == trial.trial_key("emea.acme.com.ng")
+    assert trial.trial_key("acme.com") == trial.trial_key("emea.acme.com")
 
 
 def test_free_mail_is_not_domain_locked() -> None:
@@ -81,23 +81,23 @@ def test_free_mail_is_not_domain_locked() -> None:
 
 def test_second_trial_refused() -> None:
     entry = trial.LedgerEntry(
-        registrable_domain="acme.com.ng",
+        registrable_domain="acme.com",
         first_trial_at=datetime(2026, 1, 1, tzinfo=UTC),
         outcome="lapsed",
     )
-    decision = trial.evaluate(identifier="acme.com.ng", existing=entry)
+    decision = trial.evaluate(identifier="acme.com", existing=entry)
     assert decision.eligibility is trial.Eligibility.ALREADY_USED
     assert not decision.allowed
 
 
 def test_sales_override_allows_retrial() -> None:
     entry = trial.LedgerEntry(
-        registrable_domain="acme.com.ng",
+        registrable_domain="acme.com",
         first_trial_at=datetime(2024, 1, 1, tzinfo=UTC),
         outcome="lapsed",
         override_by="sales-1",
     )
-    assert trial.evaluate(identifier="acme.com.ng", existing=entry).allowed
+    assert trial.evaluate(identifier="acme.com", existing=entry).allowed
 
 
 def test_related_domain_is_flagged_not_blocked() -> None:

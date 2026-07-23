@@ -23,7 +23,7 @@ from envelock.models import (
 from envelock.platform import alerts as alert_svc
 from envelock.platform.pipeline import analyse_event
 
-OWNED = frozenset({"acme.com.ng"})
+OWNED = frozenset({"acme.com"})
 
 pytestmark = pytest.mark.asyncio
 
@@ -33,7 +33,7 @@ async def _mailbox(session, tenant_id, *, sources=None, cls=MailboxClass.PROTECT
     await session.flush()
     mailbox = Mailbox(
         tenant_id=tenant_id,
-        address="pay@acme.com.ng",
+        address="pay@acme.com",
         mailbox_class=cls.value,
         sources=[s.value for s in (sources or [SourceMechanism.IMAP_IDLE])],
     )
@@ -45,7 +45,7 @@ async def _mailbox(session, tenant_id, *, sources=None, cls=MailboxClass.PROTECT
 def _msg(body: str, *, sender="billing@gemini.com", subject="Invoice 4471", extra=""):
     return (
         f'From: "Gemini Accounts" <{sender}>\n'
-        f"To: pay@acme.com.ng\n"
+        f"To: pay@acme.com\n"
         f"Subject: {subject}\n"
         f"{extra}"
         f"Content-Type: text/plain\n\n{body}"

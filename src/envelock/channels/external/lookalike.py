@@ -18,7 +18,8 @@ from envelock.util.domains import classify_lookalike, label, registrable_domain
 
 _TLD_SWAPS = (
     "com", "net", "org", "co", "io", "biz", "info", "online", "site", "shop",
-    "ng", "com.ng", "tw", "com.tw", "sg", "com.sg", "co.uk", "us", "cn", "com.cn",
+    "us", "co.uk", "de", "fr", "eu", "ca", "com.mx", "com.br", "com.au",
+    "tw", "com.tw", "sg", "com.sg", "co.jp", "cn", "com.cn", "in",
 )
 
 #: The founding brief's a→e, l→I, g→q space, plus the rest that matter.

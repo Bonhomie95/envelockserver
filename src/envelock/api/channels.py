@@ -31,8 +31,12 @@ from envelock.models import (
     LookalikeDomain,
     Mailbox,
     MailboxCredential,
+    PushSubscription,
     SensorSession,
+    User,
 )
+from envelock.notify.dispatch import deliver_pending
+from envelock.notify.ladder import Recipient
 from envelock.notify.senders import Dispatcher
 from envelock.platform.graph import GRAPH, SimulationRun, plan_backfill, simulations
 from envelock.platform.pipeline import analyse_event
@@ -537,6 +541,36 @@ async def simulate(req: SimulationRequest, principal: AdminUser, session: Sessio
     }
 
 
+async def _tenant_recipients(session: Session, tenant_id: UUID) -> list[Recipient]:
+    """Everyone who should hear about an alert on this tenant. The IT admins
+    always receive it (E4/E6); that independent channel is the safety net that
+    makes delaying the paid rung defensible (PRD §8.2)."""
+    users = (
+        await session.execute(select(User).where(User.tenant_id == tenant_id))
+    ).scalars().all()
+    push_user_ids = {
+        uid
+        for (uid,) in (
+            await session.execute(
+                select(PushSubscription.user_id).where(
+                    PushSubscription.tenant_id == tenant_id
+                )
+            )
+        ).all()
+    }
+    return [
+        Recipient(
+            user_id=str(u.id),
+            is_admin=u.is_admin,
+            has_push_subscription=u.id in push_user_ids,
+            out_of_band_email=u.out_of_band_email,
+            phone=u.phone,
+            has_sensor=u.id in push_user_ids,
+        )
+        for u in users
+    ]
+
+
 # ── Tier 4 ingest over HTTP ──────────────────────────────────────────────────
 class IngestRequest(BaseModel):
     raw_message: str
@@ -587,18 +621,26 @@ async def ingest_message(
         owned_domains=frozenset(domains),
         remediable=True,
     )
+    recipients = await _tenant_recipients(session, principal.tenant_id)
     result = await analyse_event(
         session,
         event,
         tenant_id=principal.tenant_id,
         owned_domains=frozenset(domains),
+        recipients=recipients,
     )
+    # Actually deliver the free ladder rungs the alert just queued (PRD §8.1).
+    delivered = 0
+    if result.alert_id is not None:
+        touched = await deliver_pending(session, alert_id=result.alert_id)
+        delivered = sum(1 for d in touched if d.status == "sent")
     await session.commit()
 
     return {
         "alerted": result.alerted,
         "alert_id": str(result.alert_id) if result.alert_id else None,
         "tier": result.assessment.tier.value if result.assessment else None,
+        "notifications_sent": delivered,
         "findings": [
             {"service": f.service, "tier": f.tier.value, "summary": f.summary}
             for f in result.findings

@@ -41,7 +41,7 @@ async def client():
         yield c
 
 
-def sign_in(client: TestClient, email="it@acme.com.ng") -> str:
+def sign_in(client: TestClient, email="it@acme.com") -> str:
     client.post(
         "/api/v1/auth/register",
         json={"email": email, "password": "a-long-enough-pw", "tenant_name": "Acme"},
@@ -64,12 +64,12 @@ def auth(token: str) -> dict:
 
 
 LEGIT = (
-    "From: <billing@gemini.com>\nTo: pay@acme.com.ng\nSubject: Invoice 9001\n"
+    "From: <billing@gemini.com>\nTo: pay@acme.com\nSubject: Invoice 9001\n"
     "Content-Type: text/plain\n\n"
     "Invoice for March. Our bank account IBAN GB94BARC10201530093459 is unchanged."
 )
 FRAUD = (
-    "From: <billing@gemini.com>\nTo: pay@acme.com.ng\nSubject: Re: Invoice 9001\n"
+    "From: <billing@gemini.com>\nTo: pay@acme.com\nSubject: Re: Invoice 9001\n"
     "In-Reply-To: <old@gemini.com>\nContent-Type: text/plain\n\n"
     "Our bank account has changed. Remit to IBAN GB33BUKB20201555555555. "
     "Urgent, today please."
@@ -83,16 +83,16 @@ async def test_whole_journey_signup_to_acknowledged_alert(client: TestClient) ->
     # Tenant and mailbox
     boot = client.post(
         "/api/v1/tenants/bootstrap",
-        json={"name": "Acme Freight", "domain": "acme.com.ng"},
+        json={"name": "Acme Freight", "domain": "acme.com"},
         headers=h,
     ).json()
-    assert boot["domain"] == "acme.com.ng"
+    assert boot["domain"] == "acme.com"
     assert boot["ingest_address"].endswith("in.envelock.io")
 
     mailbox = client.post(
         "/api/v1/mailboxes",
         json={
-            "address": "pay@acme.com.ng",
+            "address": "pay@acme.com",
             "mailbox_class": "protected",
             "sources": ["imap_idle", "client_sensor"],
         },
@@ -108,21 +108,21 @@ async def test_whole_journey_signup_to_acknowledged_alert(client: TestClient) ->
             "/api/v1/ingest",
             json={
                 "raw_message": LEGIT.replace("9001", f"900{i}"),
-                "mailbox_address": "pay@acme.com.ng",
+                "mailbox_address": "pay@acme.com",
             },
             headers=h,
         )
 
     client.post(
         "/api/v1/counterparties/gemini.com/phone",
-        params={"phone": "+234 803 000 0000"},
+        params={"phone": "+1 803 000 0000"},
         headers=h,
     )
 
     # The fraud
     result = client.post(
         "/api/v1/ingest",
-        json={"raw_message": FRAUD, "mailbox_address": "pay@acme.com.ng"},
+        json={"raw_message": FRAUD, "mailbox_address": "pay@acme.com"},
         headers=h,
     ).json()
     assert result["alerted"]
@@ -134,7 +134,7 @@ async def test_whole_journey_signup_to_acknowledged_alert(client: TestClient) ->
     critical = [a for a in alerts["alerts"] if a["tier"] == "critical"]
     assert len(critical) == 1
     assert critical[0]["requires_callback"]
-    assert critical[0]["callback_phone"] == "+234 803 000 0000"
+    assert critical[0]["callback_phone"] == "+1 803 000 0000"
     # The headline is not repeated inside the body.
     assert critical[0]["title"] not in critical[0]["body"]
 
@@ -159,11 +159,11 @@ async def test_simulation_detects_every_scenario(client: TestClient) -> None:
     h = auth(sign_in(client))
     client.post(
         "/api/v1/tenants/bootstrap",
-        json={"name": "Acme", "domain": "acme.com.ng"},
+        json={"name": "Acme", "domain": "acme.com"},
         headers=h,
     )
     result = client.post(
-        "/api/v1/simulate", json={"protected_domain": "acme.com.ng"}, headers=h
+        "/api/v1/simulate", json={"protected_domain": "acme.com"}, headers=h
     ).json()
     assert result["passed"] == result["total"], result["runs"]
 
@@ -174,13 +174,13 @@ async def test_quarantine_refuses_on_forwarding_connected_mailbox(
     h = auth(sign_in(client))
     client.post(
         "/api/v1/tenants/bootstrap",
-        json={"name": "Acme", "domain": "acme.com.ng"},
+        json={"name": "Acme", "domain": "acme.com"},
         headers=h,
     )
     client.post(
         "/api/v1/mailboxes",
         json={
-            "address": "warehouse@acme.com.ng",
+            "address": "warehouse@acme.com",
             "mailbox_class": "monitored",
             "sources": ["forward_ingest"],
         },
@@ -193,7 +193,7 @@ async def test_quarantine_refuses_on_forwarding_connected_mailbox(
                 "raw_message": LEGIT.replace("9001", f"800{i}").replace(
                     "pay@", "warehouse@"
                 ),
-                "mailbox_address": "warehouse@acme.com.ng",
+                "mailbox_address": "warehouse@acme.com",
             },
             headers=h,
         )
@@ -201,7 +201,7 @@ async def test_quarantine_refuses_on_forwarding_connected_mailbox(
         "/api/v1/ingest",
         json={
             "raw_message": FRAUD.replace("pay@", "warehouse@"),
-            "mailbox_address": "warehouse@acme.com.ng",
+            "mailbox_address": "warehouse@acme.com",
         },
         headers=h,
     )
@@ -230,7 +230,7 @@ async def test_tenants_cannot_see_each_others_alerts(client: TestClient) -> None
         client.post(
             "/api/v1/ingest",
             json={
-                "raw_message": LEGIT.replace("9001", f"700{i}").replace("acme.com.ng", "one.com"),
+                "raw_message": LEGIT.replace("9001", f"700{i}").replace("acme.com", "one.com"),
                 "mailbox_address": "pay@one.com",
             },
             headers=first,
@@ -238,7 +238,7 @@ async def test_tenants_cannot_see_each_others_alerts(client: TestClient) -> None
     client.post(
         "/api/v1/ingest",
         json={
-            "raw_message": FRAUD.replace("acme.com.ng", "one.com"),
+            "raw_message": FRAUD.replace("acme.com", "one.com"),
             "mailbox_address": "pay@one.com",
         },
         headers=first,
@@ -252,11 +252,11 @@ async def test_tenants_cannot_see_each_others_alerts(client: TestClient) -> None
 async def test_ingest_requires_a_known_mailbox(client: TestClient) -> None:
     h = auth(sign_in(client))
     client.post(
-        "/api/v1/tenants/bootstrap", json={"name": "Acme", "domain": "acme.com.ng"}, headers=h
+        "/api/v1/tenants/bootstrap", json={"name": "Acme", "domain": "acme.com"}, headers=h
     )
     response = client.post(
         "/api/v1/ingest",
-        json={"raw_message": FRAUD, "mailbox_address": "nobody@acme.com.ng"},
+        json={"raw_message": FRAUD, "mailbox_address": "nobody@acme.com"},
         headers=h,
     )
     assert response.status_code == 404

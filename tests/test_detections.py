@@ -16,7 +16,7 @@ from envelock.risk.engine import assess
 from envelock.util.domains import classify_lookalike, registrable_domain, skeleton
 from envelock.util.payments import extract_bank_identifiers, valid_iban
 
-OWNED = frozenset({"acme.com.ng"})
+OWNED = frozenset({"acme.com"})
 KNOWN = frozenset({"gemini.com"})
 
 
@@ -41,7 +41,7 @@ def build(raw: str, source=SourceMechanism.IMAP_IDLE, counterparty=None):
 
 BANK_CHANGE = """\
 From: "Gemini Accounts" <billing@gemini.com>
-To: pay@acme.com.ng
+To: pay@acme.com
 Subject: Re: Invoice 4471
 Message-ID: <a@gemini.com>
 In-Reply-To: <old@gemini.com>
@@ -58,7 +58,7 @@ def test_a1_fires_critical_on_bank_change() -> None:
         registrable_domain="gemini.com",
         message_count=40,
         known_bank_ids=frozenset({"GB94BARC10201530093459"}),
-        verified_phone="+2348030000000",
+        verified_phone="+18030000000",
     )
     findings = run_all(build(BANK_CHANGE, counterparty=cp))
     services = {f.service for f in findings}
@@ -67,7 +67,7 @@ def test_a1_fires_critical_on_bank_change() -> None:
     a1 = next(f for f in findings if f.service == "A1")
     assert a1.tier is AlertTier.CRITICAL
     # E3 — the number on file with us, never the one in the email.
-    assert a1.evidence["callback_phone"] == "+2348030000000"
+    assert a1.evidence["callback_phone"] == "+18030000000"
 
 
 def test_a1_silent_when_account_already_known() -> None:
@@ -88,7 +88,7 @@ def test_a1_silent_on_first_contact() -> None:
 
 LOOKALIKE = """\
 From: "Gemini Ltd" <billing@gemini-invoices.com>
-To: pay@acme.com.ng
+To: pay@acme.com
 Subject: Updated payment instructions
 Reply-To: finance@gemini-pay.net
 Content-Type: text/plain
@@ -123,7 +123,7 @@ def test_combination_promotes_tier() -> None:
 
 THREAD_HIJACK = """\
 From: <accounts@gemini.com>
-To: pay@acme.com.ng
+To: pay@acme.com
 Subject: Re: Purchase Order 8891
 Content-Type: text/plain
 
@@ -152,7 +152,7 @@ def test_low_findings_are_not_alertable() -> None:
     """Noisy alerts burn margin directly as well as trust (PRD P5)."""
     clean = """\
 From: <someone@gemini.com>
-To: pay@acme.com.ng
+To: pay@acme.com
 Subject: Lunch
 Content-Type: text/plain
 
@@ -184,7 +184,7 @@ def test_rn_m_confusion_collapses() -> None:
 
 def test_registrable_domain_handles_multipart_suffixes() -> None:
     """Naive splitting here would break our actual markets."""
-    assert registrable_domain("mail.acme.com.ng") == "acme.com.ng"
+    assert registrable_domain("mail.acme.com") == "acme.com"
     assert registrable_domain("emea.acme.co.uk") == "acme.co.uk"
     assert registrable_domain("acme.com.tw") == "acme.com.tw"
 

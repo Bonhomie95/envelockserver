@@ -40,7 +40,7 @@ def _alert(title: str = "t", detail: str = "d", service: str = "A1") -> ex.Alert
         tier=AlertTier.CRITICAL,
         service=service,
         title=title,
-        mailbox="pay@acme.com.ng",
+        mailbox="pay@acme.com",
         detail=detail,
         raised_at=datetime(2026, 7, 18, 9, 42, tzinfo=UTC),
         state="open",
@@ -139,10 +139,10 @@ def test_lockout_backs_off_but_never_permanently() -> None:
     lock = AccountLockout()
     now = 1000.0
     for _ in range(AccountLockout.THRESHOLD):
-        lock.record_failure("victim@acme.com.ng", now=now)
-    locked, retry = lock.is_locked("victim@acme.com.ng", now=now)
+        lock.record_failure("victim@acme.com", now=now)
+    locked, retry = lock.is_locked("victim@acme.com", now=now)
     assert locked and retry <= AccountLockout.BACKOFFS[-1] + 1
-    assert not lock.is_locked("victim@acme.com.ng", now=now + 4000)[0]
+    assert not lock.is_locked("victim@acme.com", now=now + 4000)[0]
 
 
 def test_successful_login_clears_lockout() -> None:
@@ -182,7 +182,7 @@ def test_invalid_domains_never_reach_a_resolver(bad: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "good", ["acme.com", "acme.com.ng", "sub.acme.co.uk", "xn--80ak6aa92e.com"]
+    "good", ["acme.com", "acme.com", "sub.acme.co.uk", "xn--80ak6aa92e.com"]
 )
 def test_legitimate_domains_still_pass(good: str) -> None:
     assert valid_domain(good)
@@ -203,15 +203,15 @@ def test_security_headers_present_on_every_response(client: TestClient) -> None:
 
 
 def test_login_is_rate_limited(client: TestClient) -> None:
-    body = {"email": "nobody@acme.com.ng", "password": "wrong-password-here"}
+    body = {"email": "nobody@acme.com", "password": "wrong-password-here"}
     codes = [client.post("/api/v1/auth/login", json=body).status_code for _ in range(8)]
     assert 429 in codes, "login must throttle — otherwise it is a brute-force oracle"
 
 
 def test_registration_does_not_leak_existing_accounts(client: TestClient) -> None:
     body = {
-        "email": "dup@acme.com.ng",
-        "password": "a-long-enough-password",
+        "email": "dup@acme.com",
+        "password": "a-long-enough-passphrase",
         "tenant_name": "Acme",
     }
     first = client.post("/api/v1/auth/register", json=body)
@@ -226,18 +226,18 @@ def test_login_failure_is_indistinguishable_for_unknown_vs_wrong_password(
     client.post(
         "/api/v1/auth/register",
         json={
-            "email": "real@acme.com.ng",
-            "password": "a-long-enough-password",
+            "email": "real@acme.com",
+            "password": "a-long-enough-passphrase",
             "tenant_name": "Acme",
         },
     )
     unknown = client.post(
         "/api/v1/auth/login",
-        json={"email": "ghost@acme.com.ng", "password": "some-wrong-password"},
+        json={"email": "ghost@acme.com", "password": "some-wrong-password"},
     )
     wrong = client.post(
         "/api/v1/auth/login",
-        json={"email": "real@acme.com.ng", "password": "some-wrong-password"},
+        json={"email": "real@acme.com", "password": "some-wrong-password"},
     )
     assert unknown.status_code == wrong.status_code == 401
     assert unknown.json() == wrong.json()
@@ -271,8 +271,8 @@ def test_mfa_code_cannot_be_replayed(client: TestClient) -> None:
         return f"{(struct.unpack('>I', d[o:o + 4])[0] & 0x7FFFFFFF) % 1_000_000:06d}"
 
     creds = {
-        "email": "replay@acme.com.ng",
-        "password": "a-long-enough-password",
+        "email": "replay@acme.com",
+        "password": "a-long-enough-passphrase",
         "tenant_name": "Acme",
     }
     client.post("/api/v1/auth/register", json=creds)
@@ -313,8 +313,8 @@ def test_refresh_reuse_revokes_every_session(client: TestClient) -> None:
         return f"{(struct.unpack('>I', d[o:o + 4])[0] & 0x7FFFFFFF) % 1_000_000:06d}"
 
     creds = {
-        "email": "rot@acme.com.ng",
-        "password": "a-long-enough-password",
+        "email": "rot@acme.com",
+        "password": "a-long-enough-passphrase",
         "tenant_name": "Acme",
     }
     client.post("/api/v1/auth/register", json=creds)

@@ -33,15 +33,15 @@ Session = Annotated[AsyncSession, Depends(get_session)]
 
 @router.get("/providers")
 async def payment_providers(principal: CurrentUser) -> dict:
-    """Which payment rails are wired. Paystack/Flutterwave matter more than price
-    for conversion in our markets (PRD §12.8)."""
+    """Which payment rails are wired. One acquirer per region keeps conversion
+    independent of geography (PRD §12.8)."""
     return {"configured": payments.configured_providers()}
 
 
 class ConfirmRequest(BaseModel):
     provider: str
-    #: Instrument reference collected client-side (Stripe pm_…, Paystack/
-    #: Flutterwave transaction reference).
+    #: Instrument reference collected client-side (a Stripe pm_…, or the acquirer's
+    #: stored-payment-method / transaction reference).
     reference: str = Field(min_length=1, max_length=256)
     #: The mail-carrying domain the trial locks to. Free-mail addresses lock on
     #: mailbox + instrument instead (PRD §12.6).

@@ -194,7 +194,9 @@ class EmailSender(Sender):
 
 
 # ── L3: SMS ──────────────────────────────────────────────────────────────────
-_SMS_COST_MICROS = {"termii": 8000, "africastalking": 10000, "twilio": 40000}
+#: Per-message cost by provider, micros. Twilio (global/US), Vonage and
+#: MessageBird (Europe/global), and AWS SNS as the low-cost default.
+_SMS_COST_MICROS = {"sns": 6000, "messagebird": 8000, "vonage": 9000, "twilio": 40000}
 
 
 class SmsSender(Sender):

@@ -8,11 +8,11 @@ Three principles:
 
 * **One interface, thin providers.** `PaymentProvider` defines the two operations
   the funnel needs — collect and verify an instrument, then create a subscription.
-  Stripe, Paystack and Flutterwave are separate implementations; the funnel never
-  branches on which one.
-* **Payment rails, not price, drive conversion in our markets.** Stripe alone
-  loses a large share of Nigerian signups, so Paystack and Flutterwave are
-  first-class, not afterthoughts.
+  Stripe, Adyen, Mercado Pago and Razorpay are separate implementations; the
+  funnel never branches on which one.
+* **One rail per region, so conversion never depends on geography.** Stripe is the
+  primary processor for North America and most of the world; Adyen covers Europe,
+  Mercado Pago covers Latin America, and Razorpay covers South and Southeast Asia.
 * **Injectable transport.** The network call sits behind a `Transport` so the flow
   is tested against a fake; only the live HTTP call differs in production.
 """
@@ -173,41 +173,37 @@ class _Stripe:
         )
 
 
-# ── Paystack (Nigeria / Africa) ──────────────────────────────────────────────
+# ── Adyen (Europe / global enterprise) ───────────────────────────────────────
 @dataclass(frozen=True, slots=True)
-class _Paystack:
-    id: str = "paystack"
+class _Adyen:
+    id: str = "adyen"
 
     def _key(self) -> str | None:
-        s = get_settings().paystack_secret_key
+        s = get_settings().adyen_api_key
         return s.get_secret_value() if s else None
 
     def is_configured(self) -> bool:
-        return bool(self._key())
+        return bool(self._key() and get_settings().adyen_merchant_account)
 
     def _headers(self) -> dict:
-        return {"Authorization": f"Bearer {self._key()}"}
+        return {"X-API-Key": self._key() or ""}
 
     async def verify_instrument(
         self, reference: str, *, transport: Transport | None = None
     ) -> Instrument:
-        # `reference` is a transaction reference; verifying it returns the
-        # authorization object whose `authorization_code`/`signature` is reusable.
+        # `reference` is a stored-payment-method id; its details carry the
+        # network token Adyen keeps stable across a shopper's transactions.
         body = await _transport(transport).request(
             "GET",
-            f"https://api.paystack.co/transaction/verify/{reference}",
+            f"https://checkout-test.adyen.com/v71/storedPaymentMethods/{reference}",
             headers=self._headers(),
         )
-        data = (body or {}).get("data") or {}
-        auth = data.get("authorization") or {}
         return Instrument(
             provider=self.id,
             reference=reference,
-            # Paystack's `signature` is stable per card across transactions.
-            fingerprint=auth.get("signature"),
-            brand=auth.get("brand") or auth.get("card_type"),
-            last4=auth.get("last4"),
-            reusable=bool(auth.get("reusable", True)),
+            fingerprint=body.get("networkToken") or body.get("id"),
+            brand=body.get("brand"),
+            last4=body.get("lastFour"),
         )
 
     async def create_subscription(
@@ -221,58 +217,57 @@ class _Paystack:
     ) -> Subscription:
         body = await _transport(transport).request(
             "POST",
-            "https://api.paystack.co/subscription",
+            "https://checkout-test.adyen.com/v71/payments",
             headers=self._headers(),
             json={
-                "customer": customer_email,
-                "amount": amount_cents,
-                "currency": currency.upper(),
-                "interval": interval,
+                "merchantAccount": get_settings().adyen_merchant_account,
+                "shopperEmail": customer_email,
+                "amount": {"value": amount_cents, "currency": currency.upper()},
+                "recurringProcessingModel": "Subscription",
+                "shopperInteraction": "ContAuth",
             },
         )
-        data = (body or {}).get("data") or {}
         return Subscription(
             provider=self.id,
-            reference=data.get("subscription_code", ""),
-            status=data.get("status", "unknown"),
+            reference=body.get("pspReference", ""),
+            status=body.get("resultCode", "unknown"),
             amount_cents=amount_cents,
             currency=currency,
             raw=body,
         )
 
 
-# ── Flutterwave (Nigeria / Africa) ───────────────────────────────────────────
+# ── Mercado Pago (Latin America) ─────────────────────────────────────────────
 @dataclass(frozen=True, slots=True)
-class _Flutterwave:
-    id: str = "flutterwave"
+class _MercadoPago:
+    id: str = "mercadopago"
 
-    def _key(self) -> str | None:
-        s = get_settings().flutterwave_secret_key
+    def _token(self) -> str | None:
+        s = get_settings().mercadopago_access_token
         return s.get_secret_value() if s else None
 
     def is_configured(self) -> bool:
-        return bool(self._key())
+        return bool(self._token())
 
     def _headers(self) -> dict:
-        return {"Authorization": f"Bearer {self._key()}"}
+        return {"Authorization": f"Bearer {self._token()}"}
 
     async def verify_instrument(
         self, reference: str, *, transport: Transport | None = None
     ) -> Instrument:
         body = await _transport(transport).request(
             "GET",
-            f"https://api.flutterwave.com/v3/transactions/{reference}/verify",
+            f"https://api.mercadopago.com/v1/payments/{reference}",
             headers=self._headers(),
         )
-        data = (body or {}).get("data") or {}
-        card = data.get("card") or {}
+        card = (body or {}).get("card") or {}
         return Instrument(
             provider=self.id,
             reference=reference,
-            # Flutterwave hashes the card into a stable token.
-            fingerprint=card.get("token") or card.get("first_6digits"),
-            brand=card.get("type"),
-            last4=card.get("last_4digits"),
+            # The saved-card id is stable per card for the customer.
+            fingerprint=str(card.get("id")) if card.get("id") else None,
+            brand=(body.get("payment_method_id") or None),
+            last4=card.get("last_four_digits"),
         )
 
     async def create_subscription(
@@ -286,20 +281,90 @@ class _Flutterwave:
     ) -> Subscription:
         body = await _transport(transport).request(
             "POST",
-            "https://api.flutterwave.com/v3/payment-plans",
+            "https://api.mercadopago.com/preapproval",
             headers=self._headers(),
             json={
-                "amount": amount_cents / 100,
-                "interval": interval,
-                "currency": currency.upper(),
-                "name": f"Envelock {interval}",
+                "payer_email": customer_email,
+                "auto_recurring": {
+                    "frequency": 1,
+                    "frequency_type": "months" if interval == "monthly" else interval,
+                    "transaction_amount": amount_cents / 100,
+                    "currency_id": currency.upper(),
+                },
+                "reason": "Envelock subscription",
             },
         )
-        data = (body or {}).get("data") or {}
         return Subscription(
             provider=self.id,
-            reference=str(data.get("id", "")),
-            status=data.get("status", "unknown"),
+            reference=str((body or {}).get("id", "")),
+            status=(body or {}).get("status", "unknown"),
+            amount_cents=amount_cents,
+            currency=currency,
+            raw=body,
+        )
+
+
+# ── Razorpay (South and Southeast Asia) ──────────────────────────────────────
+@dataclass(frozen=True, slots=True)
+class _Razorpay:
+    id: str = "razorpay"
+
+    def _auth(self) -> tuple[str, str] | None:
+        s = get_settings()
+        secret = s.razorpay_key_secret.get_secret_value() if s.razorpay_key_secret else None
+        return (s.razorpay_key_id, secret) if (s.razorpay_key_id and secret) else None
+
+    def is_configured(self) -> bool:
+        return self._auth() is not None
+
+    def _headers(self) -> dict:
+        import base64
+
+        pair = self._auth() or ("", "")
+        token = base64.b64encode(f"{pair[0]}:{pair[1]}".encode()).decode()
+        return {"Authorization": f"Basic {token}"}
+
+    async def verify_instrument(
+        self, reference: str, *, transport: Transport | None = None
+    ) -> Instrument:
+        body = await _transport(transport).request(
+            "GET",
+            f"https://api.razorpay.com/v1/payments/{reference}",
+            headers=self._headers(),
+        )
+        card = (body or {}).get("card") or {}
+        return Instrument(
+            provider=self.id,
+            reference=reference,
+            # Razorpay's token id is stable for a saved card.
+            fingerprint=body.get("token_id") or card.get("id"),
+            brand=card.get("network"),
+            last4=card.get("last4"),
+        )
+
+    async def create_subscription(
+        self,
+        *,
+        customer_email: str,
+        amount_cents: int,
+        currency: str,
+        interval: str,
+        transport: Transport | None = None,
+    ) -> Subscription:
+        body = await _transport(transport).request(
+            "POST",
+            "https://api.razorpay.com/v1/subscriptions",
+            headers=self._headers(),
+            json={
+                "total_count": 12,
+                "customer_notify": 1,
+                "notes": {"email": customer_email, "interval": interval},
+            },
+        )
+        return Subscription(
+            provider=self.id,
+            reference=(body or {}).get("id", ""),
+            status=(body or {}).get("status", "unknown"),
             amount_cents=amount_cents,
             currency=currency,
             raw=body,
@@ -307,7 +372,7 @@ class _Flutterwave:
 
 
 _PROVIDERS: dict[str, PaymentProvider] = {
-    p.id: p for p in (_Stripe(), _Paystack(), _Flutterwave())
+    p.id: p for p in (_Stripe(), _Adyen(), _MercadoPago(), _Razorpay())
 }
 
 

@@ -1,7 +1,7 @@
 """Domain normalisation and similarity.
 
 Public Suffix List handling matters more here than anywhere else in the codebase:
-naive splitting would break every `.co.uk`, `.com.tw`, `.com.ng` and `.co.za`
+naive splitting would break every `.co.uk`, `.com.tw`, `.com.au` and `.co.jp`
 customer — i.e. exactly our target markets (PRD §12.7).
 """
 

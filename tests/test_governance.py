@@ -91,14 +91,14 @@ def test_mfa_is_mandatory_before_a_session_exists(client: TestClient) -> None:
     client.post(
         "/api/v1/auth/register",
         json={
-            "email": "owner@acme.com.ng",
-            "password": "a-long-enough-password",
+            "email": "owner@acme.com",
+            "password": "a-long-enough-passphrase",
             "tenant_name": "Acme",
         },
     )
     body = client.post(
         "/api/v1/auth/login",
-        json={"email": "owner@acme.com.ng", "password": "a-long-enough-password"},
+        json={"email": "owner@acme.com", "password": "a-long-enough-passphrase"},
     ).json()
 
     assert body["mfa_setup_required"] is True
@@ -110,14 +110,14 @@ def test_full_login_flow_issues_tokens_and_recovery_codes(client: TestClient) ->
     client.post(
         "/api/v1/auth/register",
         json={
-            "email": "owner@acme.com.ng",
-            "password": "a-long-enough-password",
+            "email": "owner@acme.com",
+            "password": "a-long-enough-passphrase",
             "tenant_name": "Acme",
         },
     )
     login = client.post(
         "/api/v1/auth/login",
-        json={"email": "owner@acme.com.ng", "password": "a-long-enough-password"},
+        json={"email": "owner@acme.com", "password": "a-long-enough-passphrase"},
     ).json()
 
     setup = client.post(
@@ -138,7 +138,7 @@ def test_full_login_flow_issues_tokens_and_recovery_codes(client: TestClient) ->
         "/api/v1/auth/me",
         headers={"Authorization": f"Bearer {tokens['access_token']}"},
     ).json()
-    assert me["email"] == "owner@acme.com.ng"
+    assert me["email"] == "owner@acme.com"
     assert me["mfa_enabled"] is True
 
 
@@ -155,8 +155,8 @@ def test_registered_account_is_persisted_to_the_database(client: TestClient) -> 
     client.post(
         "/api/v1/auth/register",
         json={
-            "email": "durable@acme.com.ng",
-            "password": "a-long-enough-password",
+            "email": "durable@acme.com",
+            "password": "a-long-enough-passphrase",
             "tenant_name": "Durable Co",
         },
     )
@@ -164,7 +164,7 @@ def test_registered_account_is_persisted_to_the_database(client: TestClient) -> 
     async def _read() -> tuple[User | None, Tenant | None]:
         async with get_sessionmaker()() as s:
             user = (
-                await s.execute(select(User).where(User.email == "durable@acme.com.ng"))
+                await s.execute(select(User).where(User.email == "durable@acme.com"))
             ).scalar_one_or_none()
             tenant = (
                 await s.execute(select(Tenant).where(Tenant.name == "Durable Co"))
@@ -264,7 +264,7 @@ def _alert() -> ex.AlertRecord:
         tier=AlertTier.CRITICAL,
         service="A1",
         title="Payment details changed",
-        mailbox="pay@acme.com.ng",
+        mailbox="pay@acme.com",
         detail="Invoice 4471 | new IBAN",
         raised_at=datetime(2026, 7, 18, 9, 42, tzinfo=UTC),
         state="open",

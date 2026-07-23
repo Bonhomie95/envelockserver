@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import secrets
 import time
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -29,10 +30,13 @@ from envelock.auth.security import (
     SENSITIVE_ACTIONS,
     Role,
     TokenError,
+    assess_passphrase,
     decode_token,
     dummy_hash,
+    generate_numeric_otp,
     generate_recovery_codes,
     generate_totp_secret,
+    hash_otp,
     hash_password,
     hash_recovery_code,
     issue_pair,
@@ -168,6 +172,7 @@ async def register(req: RegisterRequest, session: Session) -> dict:
     # turn signup into an account-enumeration endpoint.
     if await _user_by_email(session, email) is None:
         try:
+            assess_passphrase(req.password)
             password_hash = hash_password(req.password)
         except ValueError as exc:
             raise HTTPException(
@@ -380,6 +385,8 @@ async def me(principal: CurrentUser, session: Session) -> dict:
         "email": user.email,
         "role": user.role,
         "mfa_enabled": user.mfa_enabled,
+        "phone": user.phone,
+        "phone_verified": user.phone_verified,
         "is_admin": principal.is_admin,
         "recovery_codes_remaining": len(user.recovery_hashes or []),
     }
@@ -389,6 +396,98 @@ async def me(principal: CurrentUser, session: Session) -> dict:
 async def sensitive_actions(principal: CurrentUser) -> dict:
     """Actions that force a fresh password re-entry regardless of session age."""
     return {"actions": sorted(SENSITIVE_ACTIONS), "role": principal.role.value}
+
+
+# ── Phone verification (out-of-band + SMS-escalation channel) ─────────────────
+class PhoneStartRequest(BaseModel):
+    phone: str = Field(min_length=8, max_length=32, pattern=r"^\+?[0-9 ()-]{7,31}$")
+
+
+class PhoneVerifyRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+_PHONE_OTP_TTL = timedelta(minutes=10)
+
+
+@router.post("/phone/start")
+async def phone_start(
+    req: PhoneStartRequest, principal: CurrentUser, session: Session
+) -> dict:
+    """Begin proving possession of a phone number. A one-time code is sent by SMS;
+    the phone is only trusted for out-of-band alerts and SMS escalation once
+    verified (PRD §8.1/§8.2)."""
+    from envelock.config import get_settings
+    from envelock.core.enums import AlertTier
+    from envelock.notify.senders import Notification, SmsSender
+
+    locked, retry_after = lockout.is_locked(f"phone:{principal.user_id}")
+    if locked:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "too many attempts",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    user = await _user_by_id(session, principal.user_id)
+    code = generate_numeric_otp()
+    user.phone = req.phone.strip()
+    user.phone_verified = False
+    user.phone_otp_hash = hash_otp(code)
+    user.phone_otp_expires_at = datetime.now(UTC) + _PHONE_OTP_TTL
+    await session.commit()
+
+    sender = SmsSender()
+    delivered = await sender.send(
+        Notification(
+            alert_id=uuid4(),
+            tenant_id=principal.tenant_id,
+            tier=AlertTier.LOW,
+            title=f"Your Envelock verification code is {code}",
+            body="",
+        ),
+        to=user.phone,
+    )
+
+    out: dict = {"status": "code_sent", "delivered": delivered.delivered}
+    # Outside production the SMS provider is usually unconfigured; surfacing the
+    # code keeps local dev and tests usable, exactly as MFA setup returns its
+    # secret. Never in production.
+    if not get_settings().is_production:
+        out["dev_code"] = code
+    return out
+
+
+@router.post("/phone/verify")
+async def phone_verify(
+    req: PhoneVerifyRequest, principal: CurrentUser, session: Session
+) -> dict:
+    """Confirm the code and mark the phone verified."""
+    locked, retry_after = lockout.is_locked(f"phone:{principal.user_id}")
+    if locked:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "too many attempts",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    user = await _user_by_id(session, principal.user_id)
+    expires = user.phone_otp_expires_at
+    if expires is not None and expires.tzinfo is None:
+        expires = expires.replace(tzinfo=UTC)
+    if not user.phone_otp_hash or expires is None or expires < datetime.now(UTC):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "no active code — start again")
+
+    if not secrets.compare_digest(user.phone_otp_hash, hash_otp(req.code)):
+        lockout.record_failure(f"phone:{principal.user_id}")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid code")
+
+    user.phone_verified = True
+    user.phone_otp_hash = None
+    user.phone_otp_expires_at = None
+    lockout.record_success(f"phone:{principal.user_id}")
+    await session.commit()
+    return {"phone_verified": True, "phone": user.phone}
 
 
 @router.get("/admin/users")

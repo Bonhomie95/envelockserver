@@ -66,6 +66,7 @@ async def raise_alert(
     findings: list[FindingResult],
     message_id: UUID | None = None,
     recipients: list[Recipient] | None = None,
+    counterparty_domain: str | None = None,
 ) -> Alert:
     """Persist an alert plus its evidence, and fan out the free ladder rungs."""
     alert = Alert(
@@ -75,6 +76,7 @@ async def raise_alert(
         tier=assessment.tier.value,
         title=assessment.title[:255],
         body=assessment.body,
+        counterparty_domain=counterparty_domain,
         requires_callback=assessment.requires_callback,
         callback_phone=assessment.callback_phone,
         state="open",
@@ -145,6 +147,11 @@ async def acknowledge(
     return alert
 
 
+#: Tiers whose confirmation is a strong enough fraud signal to share on the E8
+#: graph. Resolving a Medium/Low as "handled" is not a fraud confirmation.
+_GRAPH_FEED_TIERS = frozenset({AlertTier.CRITICAL.value, AlertTier.HIGH.value})
+
+
 async def resolve(
     session: AsyncSession,
     *,
@@ -158,6 +165,30 @@ async def resolve(
         return None
     alert.state = "dismissed" if dismissed else "resolved"
     alert.resolved_at = datetime.now(UTC)
+
+    # Closing the moat loop (E8): a human confirming a real High/Critical is the
+    # strongest fraud signal we get — stronger than a manual lookalike report.
+    # Feed the counterparty to the cross-tenant graph so every other tenant is
+    # protected. Dismissal (a false positive) deliberately does not feed it.
+    propagated = False
+    if (
+        not dismissed
+        and alert.counterparty_domain
+        and alert.tier in _GRAPH_FEED_TIERS
+    ):
+        from envelock.platform import graph_store
+        from envelock.platform.graph import GRAPH, Verdict
+
+        entry = GRAPH.report(
+            domain=alert.counterparty_domain,
+            verdict=Verdict.FRAUDULENT,
+            tenant_id=tenant_id,
+        )
+        await graph_store.persist_report(
+            session, entry, GRAPH.reporters_of(alert.counterparty_domain)
+        )
+        propagated = entry.actionable
+
     await record_audit(
         session,
         tenant_id=tenant_id,
@@ -165,6 +196,7 @@ async def resolve(
         action=AuditAction.ALERT_DISMISSED if dismissed else AuditAction.ALERT_RESOLVED,
         target_type="alert",
         target_id=alert.id,
+        detail={"graph_propagated": propagated} if not dismissed else None,
     )
     return alert
 
@@ -178,20 +210,21 @@ class EscalationStep:
 
 
 async def due_escalations(
-    session: AsyncSession, *, now: datetime | None = None
+    session: AsyncSession, *, tenant_id: UUID | None = None, now: datetime | None = None
 ) -> list[EscalationStep]:
     """E6 — IT learns when a user ignores a Critical.
 
     This free safety net is what makes it defensible to delay the paid SMS rung.
+    Pass `tenant_id` to scope an on-demand run to one tenant; the background job
+    leaves it unset to sweep every tenant.
     """
     now = now or datetime.now(UTC)
-    rows = (
-        await session.execute(
-            select(Alert).where(
-                Alert.state == "open", Alert.tier == AlertTier.CRITICAL.value
-            )
-        )
-    ).scalars()
+    query = select(Alert).where(
+        Alert.state == "open", Alert.tier == AlertTier.CRITICAL.value
+    )
+    if tenant_id is not None:
+        query = query.where(Alert.tenant_id == tenant_id)
+    rows = (await session.execute(query)).scalars()
 
     steps: list[EscalationStep] = []
     for alert in rows:

@@ -74,6 +74,11 @@ class User(Base, UUIDMixin, TimestampMixin):
     #: PRD §8.2 — alerts must reach somewhere the attacker does not control.
     out_of_band_email: Mapped[str | None] = mapped_column(String(320))
     phone: Mapped[str | None] = mapped_column(String(32))
+    #: A phone is only trusted as an SMS-escalation target or recovery channel
+    #: once its owner has proven possession via a one-time code.
+    phone_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    phone_otp_hash: Mapped[str | None] = mapped_column(String(64))
+    phone_otp_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,6 +328,9 @@ class Alert(Base, UUIDMixin, TimestampMixin):
     tier: Mapped[str] = mapped_column(String(16), index=True)
     title: Mapped[str] = mapped_column(String(255))
     body: Mapped[str] = mapped_column(Text)
+    #: The counterparty this alert is about (eTLD+1). Captured at raise time so
+    #: that resolving the alert as real fraud can feed the E8 graph automatically.
+    counterparty_domain: Mapped[str | None] = mapped_column(String(253), index=True)
     #: Guided out-of-band verification (E3) — the step that stops the loss.
     requires_callback: Mapped[bool] = mapped_column(Boolean, default=False)
     callback_phone: Mapped[str | None] = mapped_column(String(32))

@@ -170,6 +170,7 @@ def _alert_payload(a: Alert) -> dict:
         "body": a.body,
         "state": a.state,
         "mailbox_id": str(a.mailbox_id) if a.mailbox_id else None,
+        "counterparty_domain": a.counterparty_domain,
         "requires_callback": a.requires_callback,
         "callback_phone": a.callback_phone,
         "created_at": a.created_at.isoformat(),
@@ -311,20 +312,31 @@ async def audit_trail(principal: AdminUser, session: Session, limit: int = 100) 
 
 @router.get("/escalations")
 async def escalations(principal: AdminUser, session: Session) -> dict:
-    steps = await alert_svc.due_escalations(session)
-    mine = []
-    for step in steps:
-        alert = await session.get(Alert, step.alert_id)
-        if alert and alert.tenant_id == principal.tenant_id:
-            mine.append(
-                {
-                    "alert_id": str(step.alert_id),
-                    "to": step.to,
-                    "minutes_open": step.minutes_open,
-                    "tier": step.tier.value,
-                }
-            )
-    return {"due": mine, "count": len(mine)}
+    steps = await alert_svc.due_escalations(session, tenant_id=principal.tenant_id)
+    return {
+        "due": [
+            {
+                "alert_id": str(step.alert_id),
+                "to": step.to,
+                "minutes_open": step.minutes_open,
+                "tier": step.tier.value,
+            }
+            for step in steps
+        ],
+        "count": len(steps),
+    }
+
+
+@router.post("/escalations/run")
+async def run_escalations(principal: AdminUser, session: Session) -> dict:
+    """Run the E6 escalation cycle for this tenant now: mark unacknowledged
+    Criticals escalated to IT, and fire the paid SMS rung only where the ladder
+    allows. An ops scheduler calls the same code path tenant-wide."""
+    from envelock.notify.dispatch import run_escalation_cycle
+
+    done = await run_escalation_cycle(session, tenant_id=principal.tenant_id)
+    await session.commit()
+    return {"escalated": done, "count": len(done)}
 
 
 # ── Counterparties (E10) ─────────────────────────────────────────────────────

@@ -144,6 +144,57 @@ def verify_totp(secret: str, code: str, *, window: int = 1, now: int | None = No
     )
 
 
+#: A short blocklist of obviously weak secrets. A production deployment layers a
+#: breached-password check (e.g. HaveIBeenPwned k-anonymity) on top; this catches
+#: the worst offenders without a network call.
+_WEAK_PASSWORDS = frozenset(
+    {
+        "password", "passphrase", "letmein", "welcome", "changeme",
+        "administrator", "qwertyuiop", "111111111111", "123456789012",
+        "correct horse battery staple", "iloveyou1234",
+    }
+)
+
+#: Guessed-first tokens; any password containing one is rejected outright.
+_WEAK_TOKENS = ("password", "qwerty", "letmein", "admin", "123456", "iloveyou")
+
+
+def assess_passphrase(password: str) -> None:
+    """Reject weak secrets beyond a bare length check (PRD §15.1).
+
+    A security company's own accounts must not be one guess from compromise, so
+    we push toward passphrases: length is the strongest single factor, and we
+    refuse the small set of secrets that get guessed first. Raises ValueError with
+    a user-safe message on rejection.
+    """
+    if len(password) < 12:
+        raise ValueError("use at least 12 characters — a passphrase is ideal")
+    lowered = password.strip().lower()
+    if lowered in _WEAK_PASSWORDS:
+        raise ValueError("that is one of the most common passwords — choose another")
+    # Reject anything built around a guessed-first token, e.g. "password1234".
+    if any(token in lowered for token in _WEAK_TOKENS):
+        raise ValueError("contains a very common word or pattern — choose another")
+    if len(set(password)) < 5:
+        raise ValueError("too repetitive — mix in more distinct characters")
+    # A short-but-dense password or a long passphrase both pass; a long string of
+    # one repeated word does not.
+    if len(password) < 16 and not any(c.isdigit() for c in password) and password.islower():
+        raise ValueError(
+            "add a number, a capital, or make it a longer passphrase (16+ characters)"
+        )
+
+
+def generate_numeric_otp(digits: int = 6) -> str:
+    """A one-time code for phone verification. Numeric so it is easy to key in
+    from an SMS."""
+    return "".join(str(secrets.randbelow(10)) for _ in range(digits))
+
+
+def hash_otp(code: str) -> str:
+    return hashlib.sha256(code.strip().encode()).hexdigest()
+
+
 def generate_recovery_codes(count: int = 10) -> list[str]:
     """Shown once. Only hashes are stored."""
     return [

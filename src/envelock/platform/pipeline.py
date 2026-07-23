@@ -347,6 +347,11 @@ async def analyse_event(
 
     alert_id: UUID | None = None
     if persist and assessment is not None and assessment.is_alertable:
+        # The counterparty is the inbound sender's registrable domain — captured
+        # so that confirming the alert can feed the E8 graph (see alerts.resolve).
+        counterparty_domain = None
+        if isinstance(event, MailEvent):
+            counterparty_domain = registrable_domain(event.sender.domain) or None
         alert = await raise_alert(
             session,
             tenant_id=tenant_id,
@@ -355,6 +360,7 @@ async def analyse_event(
             findings=findings,
             message_id=message_id,
             recipients=recipients or [],
+            counterparty_domain=counterparty_domain,
         )
         alert_id = alert.id
 

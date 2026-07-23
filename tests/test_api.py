@@ -23,10 +23,10 @@ def client() -> Iterator[TestClient]:
     _reset_store()
 
 
-def _auth_header(client: TestClient, email: str = "analyst@acme.com.ng") -> dict[str, str]:
+def _auth_header(client: TestClient, email: str = "analyst@acme.com") -> dict[str, str]:
     """Register → login → enrol MFA, returning an Authorization header. Signed-in
     callers see the full detection taxonomy that §16 redacts from anonymous ones."""
-    pw = "a-long-enough-password"
+    pw = "a-long-enough-passphrase"
     client.post(
         "/api/v1/auth/register",
         json={"email": email, "password": pw, "tenant_name": "Acme"},
@@ -48,7 +48,7 @@ def _auth_header(client: TestClient, email: str = "analyst@acme.com.ng") -> dict
 
 
 BEC = """From: "Gemini Accounts" <billing@gemini.com>
-To: pay@acme.com.ng
+To: pay@acme.com
 Subject: Re: Invoice 4471
 In-Reply-To: <old@gemini.com>
 Content-Type: text/plain
@@ -64,11 +64,11 @@ def test_health(client: TestClient) -> None:
 
 _BANK_CHANGE = {
     "raw_message": BEC,
-    "owned_domains": ["acme.com.ng"],
+    "owned_domains": ["acme.com"],
     "known_counterparties": ["gemini.com"],
     "counterparty_known_bank_ids": ["GB94BARC10201530093459"],
     "counterparty_message_count": 47,
-    "counterparty_phone": "+234 803 000 0000",
+    "counterparty_phone": "+1 803 000 0000",
     "source": "imap_idle",
 }
 
@@ -83,7 +83,7 @@ def test_analyse_flags_bank_change_critical_for_authenticated_caller(
     assert body["assessment"]["tier"] == "critical"
     assert "A1" in body["assessment"]["services"]
     assert body["assessment"]["requires_callback"] is True
-    assert body["assessment"]["callback_phone"] == "+234 803 000 0000"
+    assert body["assessment"]["callback_phone"] == "+1 803 000 0000"
     assert body["findings"][0]["service"] is not None
 
 
@@ -186,9 +186,9 @@ def test_ordinary_email_produces_no_alert(client: TestClient) -> None:
     body = client.post(
         "/api/v1/analyse",
         json={
-            "raw_message": "From: <sara@gemini.com>\nTo: pay@acme.com.ng\n"
+            "raw_message": "From: <sara@gemini.com>\nTo: pay@acme.com\n"
             "Subject: Lunch\nContent-Type: text/plain\n\nThursday at 1?\n",
-            "owned_domains": ["acme.com.ng"],
+            "owned_domains": ["acme.com"],
             "known_counterparties": ["gemini.com"],
             "counterparty_message_count": 47,
         },

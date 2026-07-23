@@ -33,8 +33,8 @@ def client() -> Iterator[TestClient]:
     _reset_store()
 
 
-def _admin(client: TestClient, email: str = "admin@acme.com.ng") -> tuple[dict, UUID]:
-    pw = "a-long-enough-password"
+def _admin(client: TestClient, email: str = "admin@acme.com") -> tuple[dict, UUID]:
+    pw = "a-long-enough-passphrase"
     client.post(
         "/api/v1/auth/register",
         json={"email": email, "password": pw, "tenant_name": "Acme"},
@@ -177,7 +177,7 @@ def test_live_quality_metrics_compute_from_real_alerts(client: TestClient) -> No
 
 def test_metrics_are_honest_with_no_data(client: TestClient) -> None:
     """No alerts yet must read as unknown, never a false green."""
-    h, _ = _admin(client, email="fresh@acme.com.ng")
+    h, _ = _admin(client, email="fresh@acme.com")
     body = client.get("/api/v1/metrics/quality", headers=h).json()
     fp = next(m for m in body["metrics"] if m["id"] == "critical_fp_rate")
     assert fp["observed"] is None

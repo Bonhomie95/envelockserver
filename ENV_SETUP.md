@@ -185,26 +185,28 @@ small by design.
 
 | Provider | Best for | Where |
 |---|---|---|
-| **Termii** | Nigeria / West Africa | <https://termii.com> |
-| **Africa's Talking** | Pan-African | <https://africastalking.com> |
-| **Twilio** | Global | <https://twilio.com> |
+| **Twilio** | Global / North America | <https://twilio.com> |
+| **Vonage** | Europe / global | <https://developer.vonage.com> |
+| **MessageBird** | Europe / global | <https://messagebird.com> |
+| **AWS SNS** | Low-cost default | <https://aws.amazon.com/sns> |
 
 Set `ENVELOCK_SMS_ENABLED=true`, `ENVELOCK_SMS_PROVIDER`, `ENVELOCK_SMS_API_KEY`.
-Sender IDs need pre-registration in Nigeria and several Asian markets — **allow
-one to two weeks**.
+Sender IDs need pre-registration in several markets (parts of Asia and Europe) —
+**allow one to two weeks**.
 
 ---
 
 ## 9. Payments — 🟡 needed to charge anyone
 
-**Payment rails matter more than price level for conversion in our markets**
-(PRD §12.8). Stripe alone will lose a large share of Nigerian signups.
+**One acquirer per region keeps conversion independent of geography** (PRD §12.8).
+Stripe is primary; the regional rails cover markets it serves less well.
 
 | Provider | Market | Where | Fee |
 |---|---|---|---|
-| **Stripe** | Global cards | <https://dashboard.stripe.com/apikeys> | 2.9% + 30¢ |
-| **Paystack** | Nigeria, Ghana, SA — cards, transfer, USSD | <https://dashboard.paystack.com> | 1.5% + ₦100 |
-| **Flutterwave** | Pan-African | <https://app.flutterwave.com> | ~1.4% |
+| **Stripe** | North America + global cards | <https://dashboard.stripe.com/apikeys> | 2.9% + 30¢ |
+| **Adyen** | Europe / global enterprise | <https://ca-test.adyen.com> | interchange++ |
+| **Mercado Pago** | Latin America | <https://mercadopago.com/developers> | ~3.5% |
+| **Razorpay** | Asia (India + neighbours) | <https://dashboard.razorpay.com> | ~2% |
 | **PayPal** | Global fallback | <https://developer.paypal.com> | ~3.5% |
 
 Each requires business verification — company registration, bank account, and
@@ -232,5 +234,5 @@ These have lead times measured in weeks and will gate launch if left late:
 - [ ] **CZDS access** — per-registry approval
 - [ ] **Google OAuth verification** — restricted scopes, security assessment
 - [ ] **Payment provider verification** — business documents
-- [ ] **SMS sender ID registration** — Nigeria, Asian markets
+- [ ] **SMS sender ID registration** — several Asian and European markets
 - [ ] **SOC 2 Type II observation window** — 6–12 months *before* the report exists (PRD §11.2)
