@@ -8,7 +8,7 @@ from fastapi import Request, Response, status
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from envelock.security.limits import MAX_RAW_MESSAGE_BYTES, limiter
+from envelock.security.limits import MAX_RAW_MESSAGE_BYTES, active_limiter
 
 #: Route prefix → rate-limit bucket. Most specific match wins.
 _BUCKETS: tuple[tuple[str, str], ...] = (
@@ -93,7 +93,9 @@ class RequestGuardMiddleware(BaseHTTPMiddleware):
 
         if request.url.path.startswith("/api/"):
             bucket = _bucket_for(request.url.path)
-            allowed, retry_after = limiter.check(bucket, client_identity(request))
+            allowed, retry_after = await active_limiter().acheck(
+                bucket, client_identity(request)
+            )
             if not allowed:
                 return JSONResponse(
                     {"detail": "rate limit exceeded", "retry_after": retry_after},

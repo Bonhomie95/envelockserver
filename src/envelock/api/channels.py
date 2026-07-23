@@ -17,18 +17,26 @@ from envelock.channels.external.brand import (
     check_posture,
     probe_domain,
 )
+from envelock.channels.mail import oauth
 from envelock.channels.mail.broker import ImapBroker
 from envelock.channels.mail.providers import provider_status
 from envelock.core.capabilities import capabilities_for
-from envelock.core.enums import IdentityEventKind, SourceMechanism
+from envelock.core.enums import IdentityEventKind, IntegrationTier, SourceMechanism
 from envelock.core.events import DeviceContext, IdentityEvent, NetworkContext
 from envelock.db import get_session
 from envelock.detections.base import CounterpartyState, DetectionContext, run_all
 from envelock.detections.cascade import AttachmentCascade, UrlCascade
-from envelock.models import Domain, LookalikeDomain, Mailbox, SensorSession
+from envelock.models import (
+    Domain,
+    LookalikeDomain,
+    Mailbox,
+    MailboxCredential,
+    SensorSession,
+)
 from envelock.notify.senders import Dispatcher
 from envelock.platform.graph import GRAPH, SimulationRun, plan_backfill, simulations
 from envelock.platform.pipeline import analyse_event
+from envelock.security.crypto import seal
 from envelock.util.domains import registrable_domain
 from envelock.workers.watchers import (
     CertTransparencyWatcher,
@@ -122,6 +130,170 @@ async def takedown(candidate: str, principal: AdminUser, session: Session) -> di
         "body": packet.body,
         "registrar": (registration or {}).get("registrar"),
         "evidence": packet.evidence,
+    }
+
+
+# ── Tier 1 — OAuth connection (PRD §17.1) ────────────────────────────────────
+#: Which normalised sources a completed OAuth grant unlocks for the mailbox.
+_OAUTH_SOURCES: dict[str, list[SourceMechanism]] = {
+    "microsoft": [SourceMechanism.GRAPH_API, SourceMechanism.ENTRA_LOGS],
+    "google": [SourceMechanism.GMAIL_API, SourceMechanism.GOOGLE_REPORTS],
+}
+
+
+class OAuthAuthorizeRequest(BaseModel):
+    mailbox_address: str
+
+
+@router.get("/connect/oauth/providers")
+async def oauth_providers(principal: CurrentUser) -> dict:
+    """Which Tier-1 providers are wired and ready for a consent click."""
+    return {
+        "configured": oauth.configured_providers(),
+        "supported": sorted(_OAUTH_SOURCES),
+    }
+
+
+@router.post("/connect/oauth/{provider}/authorize")
+async def oauth_authorize(
+    provider: str,
+    req: OAuthAuthorizeRequest,
+    principal: AdminUser,
+    session: Session,
+) -> dict:
+    """Return the tenant-consent URL for the admin's browser (PRD S1/S2).
+
+    The mailbox must already exist and belong to the caller's tenant; the signed
+    `state` binds this grant to that tenant, mailbox and provider so the callback
+    cannot be forged or replayed.
+    """
+    prov = oauth.provider_for(provider)
+    if prov is None or provider not in _OAUTH_SOURCES:
+        raise HTTPException(404, "unknown provider")
+    if not oauth.is_configured(prov):
+        raise HTTPException(
+            503,
+            f"{provider} OAuth is not configured on this deployment — the app "
+            "registration credentials are unset",
+        )
+
+    mailbox = (
+        await session.execute(
+            select(Mailbox).where(
+                Mailbox.tenant_id == principal.tenant_id,
+                Mailbox.address == req.mailbox_address.lower(),
+            )
+        )
+    ).scalar_one_or_none()
+    if mailbox is None:
+        raise HTTPException(404, "mailbox not found")
+
+    state = oauth.issue_state(
+        tenant_id=str(principal.tenant_id),
+        mailbox=mailbox.address,
+        provider=provider,
+    )
+    return {
+        "provider": provider,
+        "authorize_url": oauth.authorization_url(prov, state=state),
+        "state": state,
+        "expires_in": 600,
+    }
+
+
+@router.get("/connect/oauth/{provider}/callback")
+async def oauth_callback(
+    provider: str,
+    session: Session,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+) -> dict:
+    """Consent redirect target. Exchanges the code and seals the tokens.
+
+    No bearer token here — this is a browser redirect from the provider, so the
+    HMAC-signed `state` is the authorisation. Tokens are envelope-encrypted
+    (PRD §5.2) and never returned to the caller.
+    """
+    if error:
+        raise HTTPException(400, f"consent was not granted: {error}")
+    if not code or not state:
+        raise HTTPException(400, "missing code or state")
+
+    prov = oauth.provider_for(provider)
+    if prov is None or provider not in _OAUTH_SOURCES:
+        raise HTTPException(404, "unknown provider")
+
+    try:
+        claims = oauth.verify_state(state, provider=provider)
+    except oauth.OAuthError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    tenant_id = UUID(claims["t"])
+    mailbox = (
+        await session.execute(
+            select(Mailbox).where(
+                Mailbox.tenant_id == tenant_id,
+                Mailbox.address == claims["m"],
+            )
+        )
+    ).scalar_one_or_none()
+    if mailbox is None:
+        raise HTTPException(404, "mailbox not found")
+
+    try:
+        tokens = await oauth.exchange_code(prov, code=code)
+    except oauth.OAuthError as exc:
+        raise HTTPException(502, f"token exchange failed: {exc}") from exc
+
+    # Seal the refresh token (the durable secret) bound to this mailbox.
+    import json as _json
+
+    payload = _json.dumps(
+        {
+            "access_token": tokens.access_token,
+            "refresh_token": tokens.refresh_token,
+            "scope": tokens.scope,
+        }
+    ).encode()
+    sealed = seal(payload, aad=str(mailbox.id).encode())
+
+    existing = (
+        await session.execute(
+            select(MailboxCredential).where(MailboxCredential.mailbox_id == mailbox.id)
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        session.add(
+            MailboxCredential(
+                mailbox_id=mailbox.id,
+                tenant_id=tenant_id,
+                kind="oauth_token",
+                ciphertext=sealed.ciphertext,
+                wrapped_dek=sealed.wrapped_dek,
+                key_id=sealed.key_id,
+            )
+        )
+    else:
+        existing.kind = "oauth_token"
+        existing.ciphertext = sealed.ciphertext
+        existing.wrapped_dek = sealed.wrapped_dek
+        existing.key_id = sealed.key_id
+
+    # The mailbox is now Tier-1: record the sources so coverage is derived, not
+    # declared (PRD P4). Preserve any existing sensor source.
+    unlocked = {s.value for s in _OAUTH_SOURCES[provider]}
+    mailbox.sources = sorted(set(mailbox.sources or []) | unlocked)
+    mailbox.integration_tier = int(IntegrationTier.FULL_API)
+    await session.commit()
+
+    return {
+        "connected": True,
+        "provider": provider,
+        "mailbox": mailbox.address,
+        "integration_tier": int(IntegrationTier.FULL_API),
+        "sources": mailbox.sources,
+        "has_refresh_token": tokens.refresh_token is not None,
     }
 
 

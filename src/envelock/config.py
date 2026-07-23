@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     # ── Datastores ───────────────────────────────────────────────────────────
     postgres_dsn: str = "postgresql+asyncpg://envelock:envelock@localhost:5432/envelock"
     redis_dsn: str = "redis://localhost:6379/0"
+    #: "memory" (single instance) or "redis" (shared across instances, PRD §17.3).
+    rate_limit_backend: Literal["memory", "redis"] = "memory"
     clickhouse_dsn: str = "clickhouse://envelock:envelock@localhost:8123/envelock"
     kafka_bootstrap: str = "localhost:19092"
     kafka_topic_events: str = "envelock.events"

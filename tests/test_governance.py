@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
@@ -27,9 +28,13 @@ from envelock.main import app
 
 
 @pytest.fixture
-def client() -> TestClient:
+def client() -> Iterator[TestClient]:
+    # Enter the app lifespan so the SQLite schema is bootstrapped — accounts are
+    # now persisted, so the users table must exist before any auth call.
     _reset_store()
-    return TestClient(app)
+    with TestClient(app) as c:
+        yield c
+    _reset_store()
 
 
 # ── §15.1 Auth ───────────────────────────────────────────────────────────────
@@ -135,6 +140,42 @@ def test_full_login_flow_issues_tokens_and_recovery_codes(client: TestClient) ->
     ).json()
     assert me["email"] == "owner@acme.com.ng"
     assert me["mfa_enabled"] is True
+
+
+def test_registered_account_is_persisted_to_the_database(client: TestClient) -> None:
+    """The account store is the database, not process memory — a registered user
+    and its owning tenant must be durable rows (PRD §15.1, §17.1)."""
+    import asyncio
+
+    from sqlalchemy import select
+
+    from envelock.db import get_sessionmaker
+    from envelock.models import Tenant, User
+
+    client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "durable@acme.com.ng",
+            "password": "a-long-enough-password",
+            "tenant_name": "Durable Co",
+        },
+    )
+
+    async def _read() -> tuple[User | None, Tenant | None]:
+        async with get_sessionmaker()() as s:
+            user = (
+                await s.execute(select(User).where(User.email == "durable@acme.com.ng"))
+            ).scalar_one_or_none()
+            tenant = (
+                await s.execute(select(Tenant).where(Tenant.name == "Durable Co"))
+            ).scalar_one_or_none()
+            return user, tenant
+
+    user, tenant = asyncio.run(_read())
+    assert user is not None, "the account must be a persisted row"
+    assert user.role == "owner"
+    assert user.password_hash and user.password_hash.startswith("scrypt$")
+    assert tenant is not None and user.tenant_id == tenant.id
 
 
 def test_protected_routes_reject_anonymous(client: TestClient) -> None:

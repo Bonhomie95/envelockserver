@@ -2,15 +2,49 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Iterator
+
 import pytest
 from fastapi.testclient import TestClient
 
+from envelock.api.auth import _reset_store
+from envelock.auth.security import _totp_at
 from envelock.main import app
 
 
 @pytest.fixture
-def client() -> TestClient:
-    return TestClient(app)
+def client() -> Iterator[TestClient]:
+    # Enter the lifespan so the SQLite schema exists — the authenticated paths
+    # below need the persisted users table (PRD §17.1).
+    _reset_store()
+    with TestClient(app) as c:
+        yield c
+    _reset_store()
+
+
+def _auth_header(client: TestClient, email: str = "analyst@acme.com.ng") -> dict[str, str]:
+    """Register → login → enrol MFA, returning an Authorization header. Signed-in
+    callers see the full detection taxonomy that §16 redacts from anonymous ones."""
+    pw = "a-long-enough-password"
+    client.post(
+        "/api/v1/auth/register",
+        json={"email": email, "password": pw, "tenant_name": "Acme"},
+    )
+    login = client.post(
+        "/api/v1/auth/login", json={"email": email, "password": pw}
+    ).json()
+    setup = client.post(
+        "/api/v1/auth/mfa/setup", json={"token": login["mfa_token"]}
+    ).json()
+    tokens = client.post(
+        "/api/v1/auth/mfa/verify",
+        json={
+            "mfa_token": login["mfa_token"],
+            "code": _totp_at(setup["secret"], int(time.time()) // 30),
+        },
+    ).json()
+    return {"Authorization": f"Bearer {tokens['access_token']}"}
 
 
 BEC = """From: "Gemini Accounts" <billing@gemini.com>
@@ -28,24 +62,47 @@ def test_health(client: TestClient) -> None:
     assert client.get("/health").json()["status"] == "ok"
 
 
-def test_analyse_flags_bank_change_critical(client: TestClient) -> None:
+_BANK_CHANGE = {
+    "raw_message": BEC,
+    "owned_domains": ["acme.com.ng"],
+    "known_counterparties": ["gemini.com"],
+    "counterparty_known_bank_ids": ["GB94BARC10201530093459"],
+    "counterparty_message_count": 47,
+    "counterparty_phone": "+234 803 000 0000",
+    "source": "imap_idle",
+}
+
+
+def test_analyse_flags_bank_change_critical_for_authenticated_caller(
+    client: TestClient,
+) -> None:
     body = client.post(
-        "/api/v1/analyse",
-        json={
-            "raw_message": BEC,
-            "owned_domains": ["acme.com.ng"],
-            "known_counterparties": ["gemini.com"],
-            "counterparty_known_bank_ids": ["GB94BARC10201530093459"],
-            "counterparty_message_count": 47,
-            "counterparty_phone": "+234 803 000 0000",
-            "source": "imap_idle",
-        },
+        "/api/v1/analyse", json=_BANK_CHANGE, headers=_auth_header(client)
     ).json()
 
     assert body["assessment"]["tier"] == "critical"
     assert "A1" in body["assessment"]["services"]
     assert body["assessment"]["requires_callback"] is True
     assert body["assessment"]["callback_phone"] == "+234 803 000 0000"
+    assert body["findings"][0]["service"] is not None
+
+
+def test_analyse_redacts_detection_taxonomy_for_anonymous_caller(
+    client: TestClient,
+) -> None:
+    """PRD §16 — the public sandbox shows the outcome and severity, never the
+    internal detection code, score, evidence or the service list."""
+    body = client.post("/api/v1/analyse", json=_BANK_CHANGE).json()
+
+    assert body["assessment"]["tier"] == "critical"  # outcome still visible
+    assert body["assessment"]["requires_callback"] is True
+    assert body["assessment"]["services"] is None  # taxonomy withheld
+    for finding in body["findings"]:
+        assert finding["service"] is None
+        assert "evidence" not in finding
+        assert "score" not in finding
+        assert finding["category"]  # plain-English category is fine
+        assert finding["summary"]
 
 
 def test_remediable_is_derived_from_source(client: TestClient) -> None:
@@ -66,16 +123,37 @@ def test_remediable_is_derived_from_source(client: TestClient) -> None:
     assert remediable("journal") is False
 
 
-def test_coverage_names_inactive_detections(client: TestClient) -> None:
-    """PRD E7/P4 — inactive detections are named, never silently dropped."""
+def test_coverage_names_inactive_detections_for_authenticated_caller(
+    client: TestClient,
+) -> None:
+    """PRD E7/P4 — inactive detections are named to the customer, never silently
+    dropped. §16 keeps those names behind a session."""
     body = client.get(
-        "/api/v1/coverage", params={"sources": "imap_idle,client_sensor"}
+        "/api/v1/coverage",
+        params={"sources": "imap_idle,client_sensor"},
+        headers=_auth_header(client),
     ).json()
 
     assert body["protection_level"] == "standard"
     # Server-side rules are unavailable over IMAP.
     assert {"C1", "C2", "C4"} <= set(body["inactive_detections"])
     assert "A1" in body["active_detections"]
+
+
+def test_coverage_redacts_detection_codes_for_anonymous_caller(
+    client: TestClient,
+) -> None:
+    """PRD §16 — anonymous callers get the protection level and counts, never the
+    per-detection codes."""
+    body = client.get(
+        "/api/v1/coverage", params={"sources": "imap_idle,client_sensor"}
+    ).json()
+
+    assert body["protection_level"] == "standard"
+    assert body["active_count"] > 0
+    assert body["inactive_count"] > 0
+    assert "active_detections" not in body
+    assert "inactive_detections" not in body
 
 
 def test_coverage_rejects_unknown_source(client: TestClient) -> None:

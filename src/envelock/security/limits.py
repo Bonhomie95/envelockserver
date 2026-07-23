@@ -1,16 +1,24 @@
 """Rate limiting, lockout and request hardening.
 
 A security product with an unthrottled login endpoint is not a security product.
-Everything here is in-process; swap the backing store for Redis when running
-more than one instance (the interface is deliberately narrow).
+The default limiter is in-process; a Redis-backed limiter (`RedisRateLimiter`)
+shares one sliding window across instances so a multi-instance deployment throttles
+correctly instead of allowing `limit × instances` (PRD §17.3). The interface is a
+single async `acheck`, so the middleware does not care which backend is active, and
+a Redis outage fails over to per-instance limiting rather than locking everyone out.
 """
 
 from __future__ import annotations
 
+import logging
+import secrets
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from threading import Lock
+from typing import Protocol
+
+logger = logging.getLogger(__name__)
 
 # ── Input size ceilings ──────────────────────────────────────────────────────
 # Unbounded input is the cheapest denial of service there is. These apply before
@@ -47,7 +55,16 @@ RULES: dict[str, Rule] = {
 }
 
 
+class RateLimiterBackend(Protocol):
+    async def acheck(
+        self, bucket: str, identity: str, *, now: float | None = None
+    ) -> tuple[bool, int]: ...
+
+
 class RateLimiter:
+    """In-process sliding window. Correct for a single instance and the fallback
+    when Redis is unreachable."""
+
     def __init__(self) -> None:
         self._hits: dict[str, deque[float]] = defaultdict(deque)
         self._lock = Lock()
@@ -68,12 +85,90 @@ class RateLimiter:
             hits.append(current)
             return True, 0
 
+    async def acheck(
+        self, bucket: str, identity: str, *, now: float | None = None
+    ) -> tuple[bool, int]:
+        # No IO — the sync path is already non-blocking.
+        return self.check(bucket, identity, now=now)
+
     def reset(self, bucket: str | None = None, identity: str | None = None) -> None:
         with self._lock:
             if bucket is None:
                 self._hits.clear()
             else:
                 self._hits.pop(f"{bucket}:{identity}", None)
+
+
+#: Atomic sliding-window in one round-trip: drop expired hits, count, and admit
+#: only if under the limit. Doing this in Lua avoids a check-then-add race that
+#: would let concurrent requests across instances slip past the limit.
+_REDIS_SLIDING_WINDOW = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
+local count = redis.call('ZCARD', key)
+if count >= limit then
+  local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+  local retry = 1
+  if oldest[2] then retry = math.ceil((tonumber(oldest[2]) + window - now) / 1000) end
+  return {0, retry}
+end
+redis.call('ZADD', key, now, ARGV[4])
+redis.call('PEXPIRE', key, window)
+return {1, 0}
+"""
+
+
+class RedisRateLimiter:
+    """Cross-instance sliding window backed by a Redis sorted set per key.
+
+    A Redis error fails over to the in-process limiter (`fallback`) so a cache blip
+    degrades to per-instance throttling rather than denying every login.
+    """
+
+    def __init__(self, client, *, fallback: RateLimiter | None = None) -> None:
+        self._client = client
+        self._fallback = fallback or RateLimiter()
+
+    async def acheck(
+        self, bucket: str, identity: str, *, now: float | None = None
+    ) -> tuple[bool, int]:
+        rule = RULES.get(bucket, RULES["default"])
+        current = now if now is not None else time.time()
+        now_ms = int(current * 1000)
+        key = f"rl:{bucket}:{identity}"
+        member = f"{now_ms}-{secrets.token_hex(4)}"
+        try:
+            allowed, retry = await self._client.eval(
+                _REDIS_SLIDING_WINDOW,
+                1,
+                key,
+                now_ms,
+                rule.window * 1000,
+                rule.limit,
+                member,
+            )
+            return bool(int(allowed)), int(retry)
+        except Exception:  # redis down, timeout, script error
+            logger.warning("redis rate limiter unavailable — failing over to in-process")
+            return self._fallback.check(bucket, identity, now=now)
+
+
+# The active backend the middleware consults. Swapped at startup when Redis is
+# configured (see `use_backend`); defaults to in-process so tests and single-node
+# deployments need no Redis.
+_active_limiter: RateLimiterBackend
+
+
+def use_backend(backend: RateLimiterBackend) -> None:
+    global _active_limiter
+    _active_limiter = backend
+
+
+def active_limiter() -> RateLimiterBackend:
+    return _active_limiter
 
 
 @dataclass
@@ -191,6 +286,7 @@ class TokenRevocations:
 
 
 limiter = RateLimiter()
+_active_limiter = limiter  # in-process by default
 lockout = AccountLockout()
 totp_replay = ReplayGuard()
 revocations = TokenRevocations()
@@ -199,6 +295,7 @@ revocations = TokenRevocations()
 def reset_all() -> None:
     """Test hook."""
     limiter.reset()
+    use_backend(limiter)  # never leave a test on a swapped backend
     lockout.reset()
     totp_replay.reset()
     revocations.reset()

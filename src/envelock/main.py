@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from envelock.api import auth, channels, governance, health, tenants, v1
+from envelock.api import auth, billing, channels, governance, health, tenants, v1
 from envelock.config import get_settings
 from envelock.detections import (  # noqa: F401  (registers detections)
     content,
@@ -37,6 +37,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         from envelock.db import create_all
 
         await create_all()
+
+    # Hydrate the E8 counterparty graph from its durable store so the moat — one
+    # tenant's confirmation protecting every other tenant — survives restarts and
+    # is shared across instances, not reset on every deploy.
+    try:
+        from envelock.db import get_sessionmaker
+        from envelock.platform import graph_store
+
+        async with get_sessionmaker()() as session:
+            loaded = await graph_store.hydrate(session)
+        logger.info("counterparty graph hydrated", extra={"verdicts": loaded})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("counterparty graph hydrate skipped: %s", exc)
+
+    # Cross-instance rate limiting (PRD §17.3). A single instance stays on the
+    # in-process limiter; a redis-backed deployment shares one window. A failed
+    # connection is logged and falls back rather than blocking startup.
+    if settings.rate_limit_backend == "redis":
+        try:
+            import redis.asyncio as aioredis
+
+            from envelock.security import limits
+
+            client = aioredis.from_url(settings.redis_dsn, socket_timeout=2)
+            await client.ping()
+            limits.use_backend(limits.RedisRateLimiter(client, fallback=limits.limiter))
+            logger.info("rate limiter: redis backend active")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("rate limiter: redis unavailable (%s) — using in-process", exc)
 
     # Connection pools, the IMAP broker and channel subscribers attach here as
     # they land. Keep startup ordered: datastores, then channels, then workers.
@@ -76,6 +105,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router, tags=["health"])
     app.include_router(v1.router, tags=["v1"])
     app.include_router(auth.router)
+    app.include_router(billing.router)
     app.include_router(governance.router)
     app.include_router(tenants.router)
     app.include_router(channels.router)

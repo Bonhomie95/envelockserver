@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from envelock.auth.deps import AdminUser, CurrentUser, OwnerUser
 from envelock.core.enums import AlertTier
+from envelock.db import get_session
 from envelock.governance import export as ex
 from envelock.governance import quality, retention
+from envelock.models import Alert, UsageMeter
 
 router = APIRouter(prefix="/api/v1", tags=["governance"])
+Session = Annotated[AsyncSession, Depends(get_session)]
 
 
 # ── Retention (§15.2) ────────────────────────────────────────────────────────
@@ -52,6 +58,97 @@ class ConfusionInput(BaseModel):
     false_positive: int = Field(default=0, ge=0)
     false_negative: int = Field(default=0, ge=0)
     true_negative: int = Field(default=0, ge=0)
+
+
+def _target(target_id: str) -> quality.Target | None:
+    return next((t for t in quality.TARGETS if t.id == target_id), None)
+
+
+def _measure(target_id: str, observed: float | None, *, sample: int) -> dict:
+    """Compare a live number against its PRD §15.4 target."""
+    target = _target(target_id)
+    out: dict = {
+        "id": target_id,
+        "name": target.name if target else target_id,
+        "observed": observed,
+        "target": target.target if target else None,
+        "unit": target.unit if target else None,
+        "sample_size": sample,
+    }
+    # With no data yet, "meets" is unknowable rather than falsely green.
+    out["meets"] = (
+        None if observed is None or sample == 0 or target is None else target.meets(observed)
+    )
+    return out
+
+
+@router.get("/metrics/quality")
+async def live_quality_metrics(principal: AdminUser, session: Session) -> dict:
+    """The two numbers that actually govern the product, measured from live data
+    (PRD §15.4): the Critical false-positive rate and the detonation fall-through
+    rate. Instrumented from day one — a security tool that cannot see its own
+    noise floor will be muted before anyone tunes it.
+    """
+    tid = principal.tenant_id
+
+    # Critical false-positive rate — a Critical dismissed as not-real is a false
+    # positive; every one of them spent a human interrupt and maybe quarantined
+    # real mail, so this is the number P5 is really about.
+    total_crit = (
+        await session.execute(
+            select(func.count())
+            .select_from(Alert)
+            .where(Alert.tenant_id == tid, Alert.tier == AlertTier.CRITICAL.value)
+        )
+    ).scalar_one()
+    dismissed_crit = (
+        await session.execute(
+            select(func.count())
+            .select_from(Alert)
+            .where(
+                Alert.tenant_id == tid,
+                Alert.tier == AlertTier.CRITICAL.value,
+                Alert.state == "dismissed",
+            )
+        )
+    ).scalar_one()
+    fp_rate = (dismissed_crit / total_crit) if total_crit else None
+
+    # Criticals in the trailing quarter — above the target the channel gets muted.
+    since = datetime.now(UTC) - timedelta(days=90)
+    crit_quarter = (
+        await session.execute(
+            select(func.count())
+            .select_from(Alert)
+            .where(
+                Alert.tenant_id == tid,
+                Alert.tier == AlertTier.CRITICAL.value,
+                Alert.created_at >= since,
+            )
+        )
+    ).scalar_one()
+
+    # Detonation fall-through — the single number that predicts COGS (§12.12D).
+    seen, detonated = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(UsageMeter.attachments_seen), 0),
+                func.coalesce(func.sum(UsageMeter.attachments_detonated), 0),
+            ).where(UsageMeter.tenant_id == tid)
+        )
+    ).one()
+    fallthrough = (detonated / seen) if seen else None
+
+    return {
+        "tenant_id": str(tid),
+        "metrics": [
+            _measure("critical_fp_rate", fp_rate, sample=int(total_crit)),
+            _measure(
+                "criticals_per_tenant_quarter", float(crit_quarter), sample=int(crit_quarter)
+            ),
+            _measure("detonation_fallthrough", fallthrough, sample=int(seen)),
+        ],
+    }
 
 
 @router.post("/quality/evaluate")

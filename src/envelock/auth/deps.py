@@ -47,6 +47,25 @@ async def current_principal(
     return Principal(user_id=claims.sub, tenant_id=claims.tenant, role=claims.role)
 
 
+async def optional_principal(
+    authorization: Annotated[str | None, Header()] = None,
+) -> Principal | None:
+    """Like `current_principal`, but returns `None` instead of raising when no
+    valid bearer token is present.
+
+    Used by endpoints that are public but must redact the internal detection
+    taxonomy for anonymous callers (PRD §16) while returning full detail to a
+    signed-in session.
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    try:
+        claims = decode_token(authorization.split(" ", 1)[1].strip(), expect="access")
+    except TokenError:
+        return None
+    return Principal(user_id=claims.sub, tenant_id=claims.tenant, role=claims.role)
+
+
 def require_role(minimum: Role):
     """Route dependency enforcing a minimum role."""
 
@@ -64,5 +83,6 @@ def require_role(minimum: Role):
 
 
 CurrentUser = Annotated[Principal, Depends(current_principal)]
+OptionalUser = Annotated[Principal | None, Depends(optional_principal)]
 AdminUser = Annotated[Principal, Depends(require_role(Role.ADMIN))]
 OwnerUser = Annotated[Principal, Depends(require_role(Role.OWNER))]

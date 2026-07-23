@@ -103,6 +103,24 @@ class CounterpartyGraph:
     def known_bad(self) -> frozenset[str]:
         return frozenset(d for d, e in self._entries.items() if e.actionable)
 
+    def reporters_of(self, domain: str) -> set[str]:
+        """Tenant ids that have reported a domain — persisted so a restart cannot
+        reset a confirmation count and let one tenant re-inflate it."""
+        return set(self._reporters.get(registrable_domain(domain) or domain, set()))
+
+    def load(self, entry: GraphEntry, reporters: set[str]) -> None:
+        """Hydrate one durable verdict into the in-memory projection at startup.
+
+        The DB is the source of truth across restarts and instances; this keeps the
+        hot lookup path a plain dict so the detection pipeline stays synchronous.
+        """
+        self._entries[entry.registrable_domain] = entry
+        self._reporters[entry.registrable_domain] = set(reporters)
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._reporters.clear()
+
     def __len__(self) -> int:
         return len(self._entries)
 

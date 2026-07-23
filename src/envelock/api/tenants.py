@@ -32,6 +32,7 @@ from envelock.models import (
     Tenant,
 )
 from envelock.platform import alerts as alert_svc
+from envelock.platform import graph_store
 from envelock.platform.graph import GRAPH, RiskProfile, Verdict
 from envelock.platform.remediation import (
     RemediationAction,
@@ -469,6 +470,10 @@ async def report_lookalike(
         domain=candidate,
         verdict=Verdict.FRAUDULENT if fraudulent else Verdict.LEGITIMATE,
         tenant_id=principal.tenant_id,
+    )
+    # Write through so the moat survives a restart and is shared across instances.
+    await graph_store.persist_report(
+        session, entry, GRAPH.reporters_of(candidate)
     )
     await alert_svc.record_audit(
         session,

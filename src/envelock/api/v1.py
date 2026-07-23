@@ -13,6 +13,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from envelock.auth.deps import CurrentUser, OptionalUser
 from envelock.billing import pricing, trial
 from envelock.channels.external.lookalike import permutations, score_candidate
 from envelock.channels.mail.parser import parse_message
@@ -43,6 +44,26 @@ from envelock.security.limits import (
 from envelock.util.domains import registrable_domain
 
 router = APIRouter(prefix="/api/v1")
+
+
+# ── Taxonomy protection (PRD §16) ────────────────────────────────────────────
+# We publish *what* we protect against, never *how*. Anonymous callers get the
+# plain-English outcome and severity; the internal detection code, its required
+# capabilities and the per-signal evidence are shown only to a signed-in session.
+# Without this, the `/analyse`, `/coverage` and `/catalogue` responses are a
+# scrapable map of our entire detection taxonomy — a build manual for a competitor
+# and a tuning guide for an attacker.
+_PUBLIC_CATEGORY = {
+    "A": "Counterparty fraud & impersonation",
+    "B": "Content safety",
+    "C": "Mailbox & identity integrity",
+    "D": "Brand & domain protection",
+    "E": "Response & governance",
+}
+
+
+def _public_category(service: str) -> str:
+    return _PUBLIC_CATEGORY.get(service[:1], "Other")
 
 
 # ── Pricing ──────────────────────────────────────────────────────────────────
@@ -186,23 +207,36 @@ async def domain_permutations(domain: str, limit: int = 200) -> dict:
 
 # ── Coverage ─────────────────────────────────────────────────────────────────
 @router.get("/coverage")
-async def coverage(sources: str) -> dict:
-    """Derived protection level and the *named* inactive detections (PRD E7)."""
+async def coverage(sources: str, principal: OptionalUser) -> dict:
+    """Derived protection level and the *named* inactive detections (PRD E7).
+
+    E7 names inactive detections to the *customer* (a signed-in session). To an
+    anonymous caller we return the protection level and category counts only —
+    never the detection codes, which are the taxonomy §16 protects.
+    """
     try:
         parsed = frozenset(SourceMechanism(s.strip()) for s in sources.split(",") if s.strip())
     except ValueError as exc:
         raise HTTPException(422, f"unknown source mechanism: {exc}") from exc
 
     caps = capabilities_for(parsed)
-    return {
+    active = sorted(d.service for d in registry().values() if d.requires <= caps)
+    inactive = inactive_for(caps)
+
+    base = {
         "sources": sorted(parsed),
-        "capabilities": sorted(caps),
         "protection_level": protection_level(caps),
-        "active_detections": sorted(
-            d.service for d in registry().values() if d.requires <= caps
-        ),
-        "inactive_detections": inactive_for(caps),
     }
+    if principal is None:
+        base["active_count"] = len(active)
+        base["inactive_count"] = len(inactive)
+        base["note"] = "Sign in to see per-detection coverage."
+        return base
+
+    base["capabilities"] = sorted(caps)
+    base["active_detections"] = active
+    base["inactive_detections"] = inactive
+    return base
 
 
 # ── Analysis ─────────────────────────────────────────────────────────────────
@@ -218,8 +252,13 @@ class AnalyseRequest(BaseModel):
 
 
 @router.post("/analyse")
-async def analyse(req: AnalyseRequest) -> dict:
-    """Run the detection suite over a raw RFC822 message."""
+async def analyse(req: AnalyseRequest, principal: OptionalUser) -> dict:
+    """Run the detection suite over a raw RFC822 message.
+
+    The public sandbox shows the plain-English finding and severity; the internal
+    detection code and per-signal evidence are returned only to a signed-in
+    session (PRD §16).
+    """
     tenant_id, mailbox_id = uuid4(), uuid4()
     owned = frozenset(registrable_domain(d) for d in req.owned_domains)
     known = frozenset(registrable_domain(d) for d in req.known_counterparties)
@@ -259,6 +298,47 @@ async def analyse(req: AnalyseRequest) -> dict:
 
     findings = run_all(ctx)
     assessment = assess(findings)
+    authed = principal is not None
+
+    if authed:
+        findings_out = [
+            {
+                "service": f.service,
+                "category": _public_category(f.service),
+                "tier": f.tier,
+                "score": f.score,
+                "summary": f.summary,
+                "evidence": f.evidence,
+            }
+            for f in findings
+        ]
+    else:
+        # Redacted: outcome language only. No code, no score, no evidence — the
+        # score and evidence would leak thresholds and the signals we weigh.
+        findings_out = [
+            {
+                "service": None,
+                "category": _public_category(f.service),
+                "tier": f.tier,
+                "summary": f.summary,
+            }
+            for f in findings
+        ]
+
+    assessment_out = None
+    if assessment is not None:
+        assessment_out = {
+            "tier": assessment.tier,
+            "score": assessment.score,
+            "title": assessment.title,
+            "body": assessment.body,
+            "requires_callback": assessment.requires_callback,
+            "callback_phone": assessment.callback_phone,
+            "rationale": list(assessment.rationale),
+            "alertable": assessment.is_alertable,
+            # The service list is the taxonomy; expose it only to a session.
+            "services": list(assessment.services) if authed else None,
+        }
 
     return {
         "message": {
@@ -270,35 +350,18 @@ async def analyse(req: AnalyseRequest) -> dict:
             "urls": list(event.urls),
             "remediable": event.remediable,
         },
-        "findings": [
-            {
-                "service": f.service,
-                "tier": f.tier,
-                "score": f.score,
-                "summary": f.summary,
-                "evidence": f.evidence,
-            }
-            for f in findings
-        ],
-        "assessment": None
-        if assessment is None
-        else {
-            "tier": assessment.tier,
-            "score": assessment.score,
-            "title": assessment.title,
-            "body": assessment.body,
-            "services": list(assessment.services),
-            "requires_callback": assessment.requires_callback,
-            "callback_phone": assessment.callback_phone,
-            "rationale": list(assessment.rationale),
-            "alertable": assessment.is_alertable,
-        },
+        "findings": findings_out,
+        "assessment": assessment_out,
     }
 
 
 @router.get("/catalogue")
-async def catalogue() -> dict:
-    """Every registered detection and what it needs to run."""
+async def catalogue(principal: CurrentUser) -> dict:
+    """Every registered detection and what it needs to run.
+
+    This is the raw taxonomy, so it sits behind a session (PRD §16) — anonymous
+    callers would otherwise scrape the full detection map.
+    """
     return {
         "services": sorted(
             (

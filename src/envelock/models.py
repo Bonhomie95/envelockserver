@@ -60,7 +60,17 @@ class User(Base, UUIDMixin, TimestampMixin):
     email: Mapped[str] = mapped_column(String(320), unique=True)
     name: Mapped[str | None] = mapped_column(String(255))
     password_hash: Mapped[str | None] = mapped_column(String(255))
+    #: PRD §15.1 three-role model: owner|admin|member. `is_admin` is kept in
+    #: sync (admin or owner) for the notification recipient model (E4/E6).
+    role: Mapped[str] = mapped_column(String(16), default="member")
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: MFA is mandatory before a session can be held (PRD §15.1). The secret is
+    #: provisioned at enrolment and confirmed at first verify.
+    totp_secret: Mapped[str | None] = mapped_column(String(64))
+    mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: SHA-256 hashes of single-use recovery codes; the codes themselves are
+    #: shown exactly once at enrolment and never stored.
+    recovery_hashes: Mapped[list[str]] = mapped_column(StringList, default=list)
     #: PRD §8.2 — alerts must reach somewhere the attacker does not control.
     out_of_band_email: Mapped[str | None] = mapped_column(String(320))
     phone: Mapped[str | None] = mapped_column(String(32))
@@ -106,6 +116,28 @@ class DomainTrialLedger(Base, TimestampMixin):
     payment_fingerprint: Mapped[str | None] = mapped_column(String(128), index=True)
     override_by: Mapped[UUID | None] = mapped_column(Uuid)
     override_reason: Mapped[str | None] = mapped_column(Text)
+
+
+class GraphVerdict(Base, TimestampMixin):
+    """E8 — the cross-tenant counterparty graph, made durable.
+
+    The moat is that one tenant's confirmation protects every other tenant. If it
+    lives only in process memory it evaporates on every deploy, so verdicts are
+    persisted here and hydrated at startup. Only a domain, a verdict and a
+    confirmation count are stored — never a message, an address, or content. The
+    reporting tenant ids are kept solely to stop one tenant inflating a count;
+    they never cross the tenant boundary in any response.
+    """
+
+    __tablename__ = "graph_verdicts"
+
+    registrable_domain: Mapped[str] = mapped_column(String(253), primary_key=True)
+    verdict: Mapped[str] = mapped_column(String(16))  # fraudulent|suspicious|legitimate
+    confirmations: Mapped[int] = mapped_column(Integer, default=1)
+    first_reported: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_reported: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    techniques: Mapped[list[str]] = mapped_column(StringList, default=list)
+    reporter_tenant_ids: Mapped[list[str]] = mapped_column(StringList, default=list)
 
 
 class LookalikeDomain(Base, UUIDMixin, TimestampMixin):
@@ -420,6 +452,7 @@ __all__ = [
     "Domain",
     "DomainTrialLedger",
     "Finding",
+    "GraphVerdict",
     "Invoice",
     "LookalikeDomain",
     "Mailbox",
