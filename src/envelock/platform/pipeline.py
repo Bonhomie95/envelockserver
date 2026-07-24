@@ -347,11 +347,16 @@ async def analyse_event(
 
     alert_id: UUID | None = None
     if persist and assessment is not None and assessment.is_alertable:
-        # The counterparty is the inbound sender's registrable domain — captured
-        # so that confirming the alert can feed the E8 graph (see alerts.resolve).
+        # The counterparty is the sender's registrable domain — captured so that
+        # confirming the alert can feed the E8 graph (see alerts.resolve). Only an
+        # *external* sender is a counterparty: never record the tenant's own
+        # domain, or resolving an internal-mail alert would report a legitimate
+        # customer domain to the cross-tenant graph as fraudulent.
         counterparty_domain = None
         if isinstance(event, MailEvent):
-            counterparty_domain = registrable_domain(event.sender.domain) or None
+            sender_reg = registrable_domain(event.sender.domain)
+            if sender_reg and sender_reg not in owned_domains:
+                counterparty_domain = sender_reg
         alert = await raise_alert(
             session,
             tenant_id=tenant_id,

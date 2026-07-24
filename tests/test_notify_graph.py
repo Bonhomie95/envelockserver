@@ -198,3 +198,46 @@ async def test_unverified_phone_is_never_an_sms_destination(session) -> None:
     assert "+1 415 555 0142" in phones  # verified survives
     assert "+1 415 555 0199" not in phones  # unverified is dropped
     assert None in phones
+
+
+@pytest.mark.asyncio
+async def test_resolving_internal_mail_never_poisons_the_graph(session) -> None:
+    """If the sender is the tenant's OWN domain (internal / compromised insider),
+    resolving must NOT report that domain to the cross-tenant graph — that would
+    brand a legitimate customer domain fraudulent for everyone."""
+    from envelock.channels.mail.parser import parse_message
+    from envelock.core.enums import SourceMechanism
+    from envelock.models import Mailbox
+    from envelock.platform.pipeline import analyse_event
+
+    GRAPH.clear()
+    tenant = Tenant(id=uuid4(), name="Acme")
+    session.add(tenant)
+    await session.flush()
+    mailbox = Mailbox(id=uuid4(), tenant_id=tenant.id, address="pay@acme.com")
+    session.add(mailbox)
+    await session.flush()
+
+    # Mail from an internal address on the tenant's own domain.
+    raw = (
+        "From: <ceo@acme.com>\nTo: pay@acme.com\nSubject: urgent wire\n"
+        "Content-Type: text/plain\n\nWire today to IBAN GB94BARC10201530093459. "
+        "Keep this confidential.\n"
+    )
+    event = parse_message(
+        raw.encode(), tenant_id=tenant.id, mailbox_id=mailbox.id,
+        source=SourceMechanism.IMAP_IDLE, owned_domains=frozenset({"acme.com"}),
+        remediable=True,
+    )
+    result = await analyse_event(
+        session, event, tenant_id=tenant.id, owned_domains=frozenset({"acme.com"})
+    )
+
+    if result.alert_id is not None:
+        alert = await session.get(Alert, result.alert_id)
+        # The counterparty must never be the tenant's own domain.
+        assert alert.counterparty_domain != "acme.com"
+        await alert_svc.resolve(
+            session, alert_id=alert.id, tenant_id=tenant.id, actor_id=uuid4(), dismissed=False
+        )
+    assert GRAPH.lookup("acme.com") is None  # own domain never on the graph
