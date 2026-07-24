@@ -450,10 +450,10 @@ async def phone_start(
     )
 
     out: dict = {"status": "code_sent", "delivered": delivered.delivered}
-    # Outside production the SMS provider is usually unconfigured; surfacing the
-    # code keeps local dev and tests usable, exactly as MFA setup returns its
-    # secret. Never in production.
-    if not get_settings().is_production:
+    # Local dev only: surface the code so tests and localhost work without an SMS
+    # provider. Never in staging or production — a shared staging box must not
+    # hand an OTP to anyone who can call the endpoint.
+    if get_settings().env == "development":
         out["dev_code"] = code
     return out
 

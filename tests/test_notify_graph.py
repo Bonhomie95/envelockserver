@@ -169,3 +169,32 @@ async def test_escalation_cycle_marks_old_criticals(session) -> None:
 
     refreshed = await session.get(Alert, alert.id)
     assert refreshed.escalated_at is not None
+
+
+@pytest.mark.asyncio
+async def test_unverified_phone_is_never_an_sms_destination(session) -> None:
+    """A Critical fraud alert must not be SMS'd to an unproven number an attacker
+    could have set — only verified phones are ladder destinations."""
+    from envelock.api.channels import _tenant_recipients
+
+    tenant = Tenant(id=uuid4(), name="Acme")
+    session.add(tenant)
+    session.add(
+        User(
+            id=uuid4(), tenant_id=tenant.id, email="unverified@acme.com",
+            role="owner", is_admin=True, phone="+1 415 555 0199", phone_verified=False,
+        )
+    )
+    session.add(
+        User(
+            id=uuid4(), tenant_id=tenant.id, email="verified@acme.com",
+            role="member", is_admin=False, phone="+1 415 555 0142", phone_verified=True,
+        )
+    )
+    await session.flush()
+
+    recipients = await _tenant_recipients(session, tenant.id)
+    phones = {r.phone for r in recipients}
+    assert "+1 415 555 0142" in phones  # verified survives
+    assert "+1 415 555 0199" not in phones  # unverified is dropped
+    assert None in phones

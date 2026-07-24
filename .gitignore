@@ -21,3 +21,9 @@ rules/yara/*.yar
 !rules/yara/.gitkeep
 
 .DS_Store
+
+# Local SQLite databases (never commit test data)
+*.db
+*.sqlite
+*.sqlite3
+smoke.db

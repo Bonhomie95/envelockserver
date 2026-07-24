@@ -564,7 +564,9 @@ async def _tenant_recipients(session: Session, tenant_id: UUID) -> list[Recipien
             is_admin=u.is_admin,
             has_push_subscription=u.id in push_user_ids,
             out_of_band_email=u.out_of_band_email,
-            phone=u.phone,
+            # Only a verified phone is an SMS destination — never send a Critical
+            # fraud alert to an unproven number an attacker could have set.
+            phone=u.phone if u.phone_verified else None,
             has_sensor=u.id in push_user_ids,
         )
         for u in users
