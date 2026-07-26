@@ -24,6 +24,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from envelock.auth.deps import AdminUser, CurrentUser
+from envelock.auth.email_policy import is_disposable_email
 from envelock.auth.security import (
     MFA_PENDING_TTL,
     REFRESH_TTL,
@@ -46,8 +47,13 @@ from envelock.auth.security import (
     verify_totp,
 )
 from envelock.db import get_session
-from envelock.models import Tenant, User
-from envelock.security.limits import lockout, revocations, totp_replay
+from envelock.models import Domain, Tenant, User
+from envelock.security.limits import (
+    active_lockout,
+    active_replay,
+    active_revocations,
+)
+from envelock.util.domains import is_free_mail, registrable_domain
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
@@ -55,32 +61,39 @@ Session = Annotated[AsyncSession, Depends(get_session)]
 
 
 def _reset_store() -> None:
-    """Test hook: clear persisted accounts between tests.
-
-    Uses a plain synchronous SQLite connection so it can run at fixture
-    setup/teardown without an event loop. A no-op on any other backend and when
-    the schema has not been created yet.
-    """
-    import sqlite3
+    """Test hook: clear persisted accounts (and their tenant-scoped rows) between
+    tests. Runs a TRUNCATE on the configured Postgres in a dedicated thread with
+    its own event loop, so it works whether or not the caller is already inside a
+    running loop. A no-op when the schema has not been created yet."""
+    import threading
 
     from envelock.config import get_settings
 
-    dsn = get_settings().postgres_dsn
-    if "sqlite" not in dsn:
+    pg = get_settings().postgres_dsn.replace("postgresql+asyncpg://", "postgresql://")
+    if not pg.startswith("postgresql://"):
         return
-    path = dsn.rsplit(":///", 1)[-1] if ":///" in dsn else dsn.rsplit("://", 1)[-1]
-    if not path or path == ":memory:":
-        return
-    try:
-        conn = sqlite3.connect(path)
-        try:
-            conn.execute("DELETE FROM users")
-            conn.execute("DELETE FROM tenants")
-            conn.commit()
-        finally:
-            conn.close()
-    except sqlite3.OperationalError:
-        pass  # schema not yet created
+
+    def _run() -> None:
+        import asyncio
+        import contextlib
+
+        import asyncpg
+
+        async def _clear() -> None:
+            conn = await asyncpg.connect(pg)
+            try:
+                # CASCADE clears every tenant-scoped table that references these.
+                await conn.execute("TRUNCATE users, tenants RESTART IDENTITY CASCADE")
+            finally:
+                await conn.close()
+
+        # Schema may not exist yet, or the DB may be unavailable — best effort.
+        with contextlib.suppress(Exception):
+            asyncio.run(_clear())
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    thread.join()
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -150,7 +163,7 @@ def _issue_mfa_challenge(user: User) -> str:
 async def _complete_login(
     session: AsyncSession, user: User, *, first_time: bool = False
 ) -> dict:
-    lockout.record_success(user.email)
+    await active_lockout().arecord_success(user.email)
     tokens = issue_pair(
         user_id=user.id, tenant_id=user.tenant_id, role=_role_of(user)
     )
@@ -162,11 +175,49 @@ async def _complete_login(
     return tokens
 
 
+async def _existing_tenant_for_domain(session: AsyncSession, email: str) -> UUID | None:
+    """If a corporate email domain already has a tenant, return its id so a
+    colleague JOINS it rather than spinning up a second workspace — and a second
+    trial — for the same company (PRD §12.7). Free-mail domains (gmail, outlook…)
+    have many unrelated users, so they never share a tenant.
+    """
+    domain_part = email.rsplit("@", 1)[-1] if "@" in email else ""
+    reg = registrable_domain(domain_part)
+    if not reg or is_free_mail(reg):
+        return None
+    # Strongest signal: a domain already registered to a tenant.
+    domain = (
+        await session.execute(
+            select(Domain).where(Domain.registrable_domain == reg).limit(1)
+        )
+    ).scalar_one_or_none()
+    if domain is not None:
+        return domain.tenant_id
+    # Fallback for the window before the first user finishes onboarding: a
+    # colleague already registered with the same email domain.
+    like = "%@" + domain_part.replace("%", r"\%").replace("_", r"\_")
+    colleague = (
+        await session.execute(select(User).where(User.email.ilike(like)).limit(1))
+    ).scalar_one_or_none()
+    return colleague.tenant_id if colleague is not None else None
+
+
 # ── Endpoints ────────────────────────────────────────────────────────────────
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 async def register(req: RegisterRequest, session: Session) -> dict:
-    """First user of a tenant becomes its owner."""
+    """First user of a corporate domain becomes its owner; later colleagues from
+    the same domain join that tenant as members — one company, one tenant, one
+    trial. Free-mail signups each get their own tenant."""
     email = req.email.lower().strip()
+
+    # Reject throwaway inboxes: alerts, recovery and billing all need a real one,
+    # and disposable addresses are a trial-abuse vector. This is a format policy
+    # independent of whether the account exists, so it leaks no enumeration signal.
+    if is_disposable_email(email):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "disposable email addresses are not allowed — use a permanent inbox",
+        )
 
     # Identical response whether or not the address exists — a 409 here would
     # turn signup into an account-enumeration endpoint.
@@ -178,18 +229,35 @@ async def register(req: RegisterRequest, session: Session) -> dict:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)
             ) from exc
-        tenant = Tenant(id=uuid4(), name=req.tenant_name)
-        session.add(tenant)
-        session.add(
-            User(
-                id=uuid4(),
-                tenant_id=tenant.id,
-                email=email,
-                password_hash=password_hash,
-                role=Role.OWNER.value,
-                is_admin=True,  # owner has admin oversight (PRD §15.1)
+
+        existing_tenant_id = await _existing_tenant_for_domain(session, email)
+        if existing_tenant_id is not None:
+            # A colleague — join the company's existing tenant as a member. No new
+            # tenant, and therefore no second trial for the same domain.
+            session.add(
+                User(
+                    id=uuid4(),
+                    tenant_id=existing_tenant_id,
+                    email=email,
+                    password_hash=password_hash,
+                    role=Role.MEMBER.value,
+                    is_admin=False,
+                )
             )
-        )
+        else:
+            # First from this domain (or a free-mail signup) → new owner tenant.
+            tenant = Tenant(id=uuid4(), name=req.tenant_name)
+            session.add(tenant)
+            session.add(
+                User(
+                    id=uuid4(),
+                    tenant_id=tenant.id,
+                    email=email,
+                    password_hash=password_hash,
+                    role=Role.OWNER.value,
+                    is_admin=True,  # owner has admin oversight (PRD §15.1)
+                )
+            )
         try:
             await session.commit()
         except IntegrityError:
@@ -209,7 +277,7 @@ async def register(req: RegisterRequest, session: Session) -> dict:
 async def login(req: LoginRequest, session: Session) -> dict:
     email = req.email.lower().strip()
 
-    locked, retry_after = lockout.is_locked(email)
+    locked, retry_after = await active_lockout().ais_locked(email)
     if locked:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
@@ -224,7 +292,7 @@ async def login(req: LoginRequest, session: Session) -> dict:
     password_ok = verify_password(req.password, stored)
 
     if user is None or not password_ok:
-        lockout.record_failure(email)
+        await active_lockout().arecord_failure(email)
         raise _generic_401()
 
     return {
@@ -267,7 +335,7 @@ async def mfa_verify(req: MfaVerifyRequest, session: Session) -> dict:
 
     user = await _user_by_id(session, claims.sub)
 
-    locked, retry_after = lockout.is_locked(f"mfa:{user.email}")
+    locked, retry_after = await active_lockout().ais_locked(f"mfa:{user.email}")
     if locked:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
@@ -279,18 +347,18 @@ async def mfa_verify(req: MfaVerifyRequest, session: Session) -> dict:
         raise HTTPException(status.HTTP_409_CONFLICT, "MFA not set up")
 
     if not verify_totp(user.totp_secret, req.code):
-        lockout.record_failure(f"mfa:{user.email}")
+        await active_lockout().arecord_failure(f"mfa:{user.email}")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid code")
 
     # A TOTP code stays valid for its whole window, so without this an observed
     # code (phishing proxy, shoulder-surf, malware) can be replayed.
-    if not totp_replay.check_and_record(f"{user.id}:{req.code}"):
-        lockout.record_failure(f"mfa:{user.email}")
+    if not await active_replay().acheck_and_record(f"{user.id}:{req.code}"):
+        await active_lockout().arecord_failure(f"mfa:{user.email}")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "code already used")
 
     first_time = not user.mfa_enabled
     user.mfa_enabled = True
-    lockout.record_success(f"mfa:{user.email}")
+    await active_lockout().arecord_success(f"mfa:{user.email}")
     return await _complete_login(session, user, first_time=first_time)
 
 
@@ -308,7 +376,7 @@ async def recovery(req: RecoveryRequest, session: Session) -> dict:
 
     user = await _user_by_id(session, claims.sub)
 
-    locked, retry_after = lockout.is_locked(f"rec:{user.email}")
+    locked, retry_after = await active_lockout().ais_locked(f"rec:{user.email}")
     if locked:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
@@ -323,12 +391,12 @@ async def recovery(req: RecoveryRequest, session: Session) -> dict:
         if secrets.compare_digest(stored, candidate):
             matched = stored
     if matched is None:
-        lockout.record_failure(f"rec:{user.email}")
+        await active_lockout().arecord_failure(f"rec:{user.email}")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid recovery code")
 
     # Reassign (not mutate in place) so SQLAlchemy tracks the change.
     user.recovery_hashes = [h for h in user.recovery_hashes if h != matched]
-    lockout.record_success(f"rec:{user.email}")
+    await active_lockout().arecord_success(f"rec:{user.email}")
 
     tokens = await _complete_login(session, user)
     tokens["recovery_codes_remaining"] = len(user.recovery_hashes)
@@ -351,8 +419,8 @@ async def refresh(req: TokenRequest, session: Session) -> dict:
     except TokenError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
 
-    if revocations.is_revoked(claims.jti, str(claims.sub)):
-        revocations.revoke_user(
+    if await active_revocations().ais_revoked(claims.jti, str(claims.sub)):
+        await active_revocations().arevoke_user(
             str(claims.sub), until=time.time() + REFRESH_TTL.total_seconds()
         )
         raise HTTPException(
@@ -360,7 +428,7 @@ async def refresh(req: TokenRequest, session: Session) -> dict:
             "refresh token reuse detected — all sessions revoked",
         )
 
-    revocations.revoke_jti(claims.jti, expires_at=float(claims.exp))
+    await active_revocations().arevoke_jti(claims.jti, expires_at=float(claims.exp))
     user = await _user_by_id(session, claims.sub)
     return issue_pair(
         user_id=user.id, tenant_id=user.tenant_id, role=_role_of(user)
@@ -370,7 +438,7 @@ async def refresh(req: TokenRequest, session: Session) -> dict:
 @router.post("/logout")
 async def logout(principal: CurrentUser) -> dict:
     """Revokes every refresh token for the caller."""
-    revocations.revoke_user(
+    await active_revocations().arevoke_user(
         str(principal.user_id), until=time.time() + REFRESH_TTL.total_seconds()
     )
     return {"status": "logged_out"}
@@ -421,7 +489,7 @@ async def phone_start(
     from envelock.core.enums import AlertTier
     from envelock.notify.senders import Notification, SmsSender
 
-    locked, retry_after = lockout.is_locked(f"phone:{principal.user_id}")
+    locked, retry_after = await active_lockout().ais_locked(f"phone:{principal.user_id}")
     if locked:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
@@ -463,7 +531,7 @@ async def phone_verify(
     req: PhoneVerifyRequest, principal: CurrentUser, session: Session
 ) -> dict:
     """Confirm the code and mark the phone verified."""
-    locked, retry_after = lockout.is_locked(f"phone:{principal.user_id}")
+    locked, retry_after = await active_lockout().ais_locked(f"phone:{principal.user_id}")
     if locked:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
@@ -479,13 +547,13 @@ async def phone_verify(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no active code — start again")
 
     if not secrets.compare_digest(user.phone_otp_hash, hash_otp(req.code)):
-        lockout.record_failure(f"phone:{principal.user_id}")
+        await active_lockout().arecord_failure(f"phone:{principal.user_id}")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid code")
 
     user.phone_verified = True
     user.phone_otp_hash = None
     user.phone_otp_expires_at = None
-    lockout.record_success(f"phone:{principal.user_id}")
+    await active_lockout().arecord_success(f"phone:{principal.user_id}")
     await session.commit()
     return {"phone_verified": True, "phone": user.phone}
 

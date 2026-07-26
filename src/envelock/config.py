@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     api_host: str = "0.0.0.0"  # noqa: S104
     api_port: int = 8010
+    #: Trust the client IP in `X-Forwarded-For`. Enable ONLY when the app sits
+    #: behind a proxy you control (nginx, a load balancer, Cloudflare) — otherwise
+    #: every client shares the proxy's single IP and rate limits apply globally.
+    #: Off by default because a spoofable header would otherwise bypass throttling.
+    trust_forwarded_for: bool = False
 
     secret_key: SecretStr = SecretStr("")
     credential_master_key: SecretStr = SecretStr("")
@@ -35,6 +40,10 @@ class Settings(BaseSettings):
 
     # ── Datastores ───────────────────────────────────────────────────────────
     postgres_dsn: str = "postgresql+asyncpg://envelock:envelock@localhost:5432/envelock"
+    #: Disable connection pooling — set only for the test suite, where many short
+    #: event loops would otherwise reuse a connection across loops. Production
+    #: keeps pooling for performance.
+    db_nullpool: bool = False
     redis_dsn: str = "redis://localhost:6379/0"
     #: "memory" (single instance) or "redis" (shared across instances, PRD §17.3).
     rate_limit_backend: Literal["memory", "redis"] = "memory"

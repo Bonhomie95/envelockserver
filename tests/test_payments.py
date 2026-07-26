@@ -102,29 +102,40 @@ def test_confirm_opens_the_gate_and_starts_the_trial(
         payments.set_default_transport(None)
 
 
-def test_second_trial_for_same_domain_is_refused(
+def test_colleagues_share_one_tenant_and_one_trial(
     client: TestClient, configured_stripe: None
 ) -> None:
-    """The ledger is permanent — a domain gets one trial, ever (PRD §12.7)."""
+    """A company gets ONE tenant and ONE trial. A second person from the same
+    corporate domain joins the existing tenant as a member — they cannot spin up a
+    second workspace or a second trial (PRD §12.7)."""
+    # A domain unique to this test — the trial ledger is permanent (never cleared),
+    # so a shared domain would carry a prior test's trial entry.
+    dom = "teamco-share-uniq.com"
     payments.set_default_transport(_FakeStripe())
     try:
-        h1 = _owner(client, "first@acme.com")
-        client.post(
+        h1 = _owner(client, f"first@{dom}")
+        me1 = client.get("/api/v1/auth/me", headers=h1).json()
+        assert me1["role"] == "owner"
+        first = client.post(
             "/api/v1/billing/confirm",
-            json={"provider": "stripe", "reference": "pm_1", "identifier": "acme.com"},
+            json={"provider": "stripe", "reference": "pm_1", "identifier": dom},
             headers=h1,
-        )
-        # A different tenant tries the same registrable domain later.
-        h2 = _owner(client, "second@acme.com")
-        body = client.post(
-            "/api/v1/billing/confirm",
-            json={"provider": "stripe", "reference": "pm_2", "identifier": "acme.com"},
-            headers=h2,
         ).json()
+        assert first["trial_started"] is True
 
-        assert body["gate_passed"] is True  # they can still subscribe
-        assert body["trial_allowed"] is False  # but no fresh trial
-        assert body["eligibility"] == "already_used"
+        # A colleague on the same domain signs up.
+        h2 = _owner(client, f"second@{dom}")
+        me2 = client.get("/api/v1/auth/me", headers=h2).json()
+        assert me2["tenant_id"] == me1["tenant_id"]  # same company, same tenant
+        assert me2["role"] == "member"  # not a second owner
+
+        # Billing is owner-only, so a member cannot open a second trial.
+        r = client.post(
+            "/api/v1/billing/confirm",
+            json={"provider": "stripe", "reference": "pm_2", "identifier": dom},
+            headers=h2,
+        )
+        assert r.status_code == 403
     finally:
         payments.set_default_transport(None)
 

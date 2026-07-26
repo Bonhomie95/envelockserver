@@ -8,6 +8,7 @@ from fastapi import Request, Response, status
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from envelock.config import get_settings
 from envelock.security.limits import MAX_RAW_MESSAGE_BYTES, active_limiter
 
 #: Route prefix → rate-limit bucket. Most specific match wins.
@@ -15,6 +16,7 @@ _BUCKETS: tuple[tuple[str, str], ...] = (
     ("/api/v1/auth/login", "auth.login"),
     ("/api/v1/auth/register", "auth.register"),
     ("/api/v1/auth/mfa", "auth.mfa"),
+    ("/api/v1/auth/phone", "auth.phone"),
     ("/api/v1/auth/recovery", "auth.recovery"),
     ("/api/v1/auth/refresh", "auth.refresh"),
     ("/api/v1/analyse", "analyse"),
@@ -33,15 +35,23 @@ def _bucket_for(path: str) -> str:
 def client_identity(request: Request) -> str:
     """Prefer the authenticated subject; fall back to peer address.
 
-    `X-Forwarded-For` is deliberately NOT trusted by default — anyone can send
-    it, so honouring it hands an attacker a trivial rate-limit bypass. Enable it
-    only behind a proxy you control, via `trust_forwarded`.
+    `X-Forwarded-For` is NOT trusted unless `ENVELOCK_TRUST_FORWARDED_FOR` is set,
+    because anyone can send it and honouring it blindly hands an attacker a
+    trivial rate-limit bypass. Behind a proxy you control, enabling it is required
+    — otherwise every client shares the proxy's single IP and the limits apply
+    globally instead of per user.
     """
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         # Bucket by token identity without parsing it: a stable hash is enough
         # and avoids doing crypto work before the limiter has run.
         return f"tok:{hash(auth[7:60]) & 0xFFFFFFFF:08x}"
+
+    if get_settings().trust_forwarded_for:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            # The left-most entry is the original client the proxy saw.
+            return f"ip:{forwarded.split(',')[0].strip()}"
     if request.client:
         return f"ip:{request.client.host}"
     return "ip:unknown"

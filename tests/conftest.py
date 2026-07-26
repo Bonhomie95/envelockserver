@@ -3,21 +3,52 @@
 from __future__ import annotations
 
 import os
-import tempfile
 from collections.abc import AsyncIterator, Iterator
-from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
 
-# Point the whole suite at a throwaway SQLite file before anything imports
-# settings, so tests never touch a real database.
-_TMP_DB = Path(tempfile.gettempdir()) / f"envelock-test-{os.getpid()}.db"
-os.environ.setdefault("ENVELOCK_POSTGRES_DSN", f"sqlite+aiosqlite:///{_TMP_DB}")
+# The suite runs against a dedicated Postgres database (the same engine as
+# production — Postgres is the only supported backend). Override with
+# ENVELOCK_TEST_POSTGRES_DSN if your local role/DB differ.
+os.environ["ENVELOCK_POSTGRES_DSN"] = os.environ.get(
+    "ENVELOCK_TEST_POSTGRES_DSN",
+    "postgresql+asyncpg://envelock:envelock@localhost:5432/envelock_test",
+)
 os.environ.setdefault("ENVELOCK_SECRET_KEY", "test-secret-key-not-for-production")
 os.environ.setdefault("ENVELOCK_ENV", "development")
+# No connection pooling in tests: the suite runs many short event loops and a
+# pooled asyncpg connection must never be reused across a different loop.
+os.environ["ENVELOCK_DB_NULLPOOL"] = "true"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _schema() -> Iterator[None]:
+    """Create the schema once for the whole session so the client-fixture tests
+    (which don't use the per-test `db` fixture) have their tables."""
+    import asyncio
+    import contextlib
+
+    from envelock.db import Base, create_all, dispose, get_engine
+
+    async def _setup() -> None:
+        await create_all()
+        await dispose()
+
+    asyncio.run(_setup())
+    yield
+
+    # Best-effort teardown: drop everything so the next run starts clean.
+    async def _teardown() -> None:
+        engine = get_engine()
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+        await dispose()
+
+    with contextlib.suppress(Exception):
+        asyncio.run(_teardown())
 
 
 @pytest.fixture(autouse=True)

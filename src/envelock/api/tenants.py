@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from envelock.auth.deps import AdminUser, CurrentUser
 from envelock.channels.mail.ingest import ingest_address, new_ingest_token, onboarding_instructions
 from envelock.core.capabilities import capabilities_for, protection_level
-from envelock.core.enums import MailboxClass, SourceMechanism
+from envelock.core.enums import IntegrationTier, MailboxClass, SourceMechanism
 from envelock.db import get_session
 from envelock.detections.base import inactive_for
 from envelock.models import (
@@ -29,6 +29,7 @@ from envelock.models import (
     Domain,
     LookalikeDomain,
     Mailbox,
+    MailboxCredential,
     Tenant,
 )
 from envelock.platform import alerts as alert_svc
@@ -38,6 +39,7 @@ from envelock.platform.remediation import (
     RemediationAction,
     plan_remediation,
 )
+from envelock.security.crypto import seal
 from envelock.util.domains import registrable_domain
 
 router = APIRouter(prefix="/api/v1", tags=["tenant"])
@@ -101,6 +103,59 @@ async def bootstrap(req: BootstrapRequest, principal: CurrentUser, session: Sess
     }
 
 
+@router.get("/tenant")
+async def current_tenant(principal: CurrentUser, session: Session) -> dict:
+    """The signed-in user's tenant — its name, plan and registered domains.
+
+    The dashboard shows this instead of guessing the domain from a mailbox, so a
+    tenant with no mailbox connected yet still displays who they are."""
+    tenant = await session.get(Tenant, principal.tenant_id)
+    domains = (
+        (
+            await session.execute(
+                select(Domain)
+                .where(Domain.tenant_id == principal.tenant_id)
+                .order_by(Domain.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    now = datetime.now(UTC)
+    ends = tenant.trial_ends_at if tenant else None
+    if ends is not None and ends.tzinfo is None:
+        ends = ends.replace(tzinfo=UTC)
+    trial_days_left = (
+        max(0, (ends - now).days + (1 if (ends - now).seconds else 0))
+        if ends
+        else None
+    )
+    return {
+        "tenant_id": str(principal.tenant_id),
+        "name": tenant.name if tenant else None,
+        "plan": tenant.plan if tenant else "guard",
+        "trial": {
+            "started_at": tenant.trial_started_at.isoformat()
+            if tenant and tenant.trial_started_at
+            else None,
+            "ends_at": ends.isoformat() if ends else None,
+            "days_left": trial_days_left,
+            "active": bool(ends and ends > now),
+            "payment_method_ok": tenant.payment_method_ok if tenant else False,
+        },
+        "domains": [
+            {
+                "name": d.name,
+                "registrable_domain": d.registrable_domain,
+                "verified": d.verified_at is not None,
+                "is_defensive": d.is_defensive,
+            }
+            for d in domains
+        ],
+        "primary_domain": domains[0].registrable_domain if domains else None,
+    }
+
+
 # ── Mailboxes ────────────────────────────────────────────────────────────────
 class MailboxRequest(BaseModel):
     address: str
@@ -159,6 +214,110 @@ async def list_mailboxes(principal: CurrentUser, session: Session) -> dict:
         .all()
     )
     return {"mailboxes": [_mailbox_payload(m) for m in rows]}
+
+
+async def _mailbox_or_404(session: AsyncSession, mailbox_id: UUID, tenant_id: UUID) -> Mailbox:
+    mailbox = await session.get(Mailbox, mailbox_id)
+    if mailbox is None or mailbox.tenant_id != tenant_id:
+        raise HTTPException(404, "mailbox not found")
+    return mailbox
+
+
+class ImapConnectRequest(BaseModel):
+    imap_host: str = Field(min_length=3, max_length=253)
+    imap_port: int = Field(default=993, ge=1, le=65535)
+    #: The mailbox password, or (preferred) an app-specific password. Sealed with
+    #: envelope encryption and never returned or logged (PRD §5.2).
+    password: str = Field(min_length=1, max_length=1024)
+
+
+@router.post("/mailboxes/{mailbox_id}/connect/imap")
+async def connect_imap(
+    mailbox_id: UUID, req: ImapConnectRequest, principal: AdminUser, session: Session
+) -> dict:
+    """Connect a mailbox over IMAP by storing its credentials, envelope-encrypted.
+
+    This is the path for any provider without OAuth — most ISP and custom-domain
+    mail. Protected mailboxes hold an IDLE connection (quarantine latency is the
+    product); Monitored mailboxes poll (PRD §12.11D)."""
+    mailbox = await _mailbox_or_404(session, mailbox_id, principal.tenant_id)
+
+    sealed = seal(req.password.encode(), aad=str(mailbox.id).encode())
+    existing = (
+        await session.execute(
+            select(MailboxCredential).where(MailboxCredential.mailbox_id == mailbox.id)
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        session.add(
+            MailboxCredential(
+                mailbox_id=mailbox.id,
+                tenant_id=principal.tenant_id,
+                kind="imap_password",
+                imap_host=req.imap_host.strip().lower(),
+                imap_port=req.imap_port,
+                ciphertext=sealed.ciphertext,
+                wrapped_dek=sealed.wrapped_dek,
+                key_id=sealed.key_id,
+            )
+        )
+    else:
+        existing.kind = "imap_password"
+        existing.imap_host = req.imap_host.strip().lower()
+        existing.imap_port = req.imap_port
+        existing.ciphertext = sealed.ciphertext
+        existing.wrapped_dek = sealed.wrapped_dek
+        existing.key_id = sealed.key_id
+
+    # Protected → IDLE (real-time, can quarantine); Monitored → poll.
+    source = (
+        SourceMechanism.IMAP_IDLE
+        if mailbox.mailbox_class == MailboxClass.PROTECTED.value
+        else SourceMechanism.IMAP_POLL
+    )
+    mailbox.sources = sorted(set(mailbox.sources or []) | {source.value})
+    mailbox.integration_tier = int(IntegrationTier.IMAP)
+    caps = capabilities_for(frozenset(SourceMechanism(s) for s in mailbox.sources))
+    mailbox.protection_level = protection_level(caps).value
+    mailbox.inactive_detections = inactive_for(caps)
+
+    await alert_svc.record_audit(
+        session,
+        tenant_id=principal.tenant_id,
+        actor_id=principal.user_id,
+        action=alert_svc.AuditAction.MAILBOX_CONNECTED,
+        target_type="mailbox",
+        detail={"address": mailbox.address, "method": "imap", "host": req.imap_host},
+    )
+    await session.commit()
+    return _mailbox_payload(mailbox)
+
+
+@router.delete("/mailboxes/{mailbox_id}")
+async def remove_mailbox(
+    mailbox_id: UUID, principal: AdminUser, session: Session
+) -> dict:
+    """Disconnect and remove a mailbox and its stored credential."""
+    mailbox = await _mailbox_or_404(session, mailbox_id, principal.tenant_id)
+    address = mailbox.address
+    cred = (
+        await session.execute(
+            select(MailboxCredential).where(MailboxCredential.mailbox_id == mailbox.id)
+        )
+    ).scalar_one_or_none()
+    if cred is not None:
+        await session.delete(cred)
+    await session.delete(mailbox)
+    await alert_svc.record_audit(
+        session,
+        tenant_id=principal.tenant_id,
+        actor_id=principal.user_id,
+        action="mailbox.removed",
+        target_type="mailbox",
+        detail={"address": address},
+    )
+    await session.commit()
+    return {"removed": True, "address": address}
 
 
 # ── Alerts ───────────────────────────────────────────────────────────────────

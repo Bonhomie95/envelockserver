@@ -41,6 +41,7 @@ from envelock.notify.senders import Dispatcher
 from envelock.platform.graph import GRAPH, SimulationRun, plan_backfill, simulations
 from envelock.platform.pipeline import analyse_event
 from envelock.security.crypto import seal
+from envelock.security.limits import valid_domain
 from envelock.util.domains import registrable_domain
 from envelock.workers.watchers import (
     CertTransparencyWatcher,
@@ -62,6 +63,10 @@ _CT = CertTransparencyWatcher()
 @router.get("/brand/{domain}/posture")
 async def brand_posture(domain: str) -> dict:
     """Public: needs no mailbox access, so it works before signup."""
+    # Structural validation before this reaches a resolver: an IP literal, a
+    # single-label internal name, or a URL must never hit DNS from user input.
+    if not valid_domain(domain):
+        raise HTTPException(422, "invalid domain")
     reg = registrable_domain(domain)
     if not reg:
         raise HTTPException(422, "invalid domain")
@@ -83,6 +88,8 @@ async def brand_posture(domain: str) -> dict:
 @router.get("/brand/{domain}/probe")
 async def brand_probe(domain: str) -> dict:
     """D4 — a lookalike with MX configured is armed."""
+    if not valid_domain(domain):
+        raise HTTPException(422, "invalid domain")
     probe = await probe_domain(domain)
     return {
         "domain": probe.domain,
@@ -97,6 +104,9 @@ async def brand_probe(domain: str) -> dict:
 async def brand_registration(domain: str) -> dict:
     """RDAP. Registrant identity is usually redacted post-GDPR; creation date is
     the field we actually need."""
+    # Validate before an unauthenticated caller can drive an outbound HTTP lookup.
+    if not valid_domain(domain):
+        raise HTTPException(422, "invalid domain")
     data = await _RDAP.lookup(domain)
     if data is None:
         return {"domain": registrable_domain(domain), "available": False}

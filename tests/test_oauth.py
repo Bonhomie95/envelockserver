@@ -184,7 +184,7 @@ def test_stored_oauth_token_is_encrypted_at_rest(
         )
 
         async def _read() -> MailboxCredential | None:
-            # Other tests share the SQLite file, so take the row this test just
+            # Other tests share the database, so take the row this test just
             # sealed rather than assuming the table holds exactly one.
             async with get_sessionmaker()() as s:
                 return (

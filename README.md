@@ -24,7 +24,7 @@ cp .env.example .env
 
 docker compose up -d          # postgres, redis, clickhouse, redpanda, clamav
 
-uvicorn envelock.main:app --reload --app-dir src
+python -m uvicorn envelock.main:app --reload --app-dir src
 ```
 
 Then:
@@ -233,11 +233,13 @@ ruff check src tests
 alembic upgrade head                          # Postgres schema + RLS
 ```
 
-The system runs on SQLite with no Docker:
+The system runs on PostgreSQL — the only supported backend. Point it at any
+Postgres (local or your server); the schema is created automatically on first
+start. Moving to production is one change: the `ENVELOCK_POSTGRES_DSN` URL.
 
 ```bash
-ENVELOCK_POSTGRES_DSN="sqlite+aiosqlite:///./envelock.db" \
-  uvicorn envelock.main:app --app-dir src --port 8010
+ENVELOCK_POSTGRES_DSN="postgresql+asyncpg://envelock:envelock@localhost:5432/envelock" \
+  python -m uvicorn envelock.main:app --app-dir src --port 8010
 ```
 
 End-to-end, using only the HTTP API:

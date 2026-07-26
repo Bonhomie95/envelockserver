@@ -1,8 +1,8 @@
 """Database engine, session and base model.
 
-Postgres in production; SQLite is supported so the whole system runs and tests
-without Docker. Column types that differ (ARRAY, JSONB) are handled by the
-portable types in `models.py`.
+**Postgres only.** The same engine runs in local development, test and
+production — moving between them is one thing: the `ENVELOCK_POSTGRES_DSN` URL.
+Native Postgres column types (ARRAY, JSONB) are used directly (see `types.py`).
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, MetaData, event
+from sqlalchemy import DateTime, MetaData
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -54,28 +54,35 @@ _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 
 
 def _normalise_dsn(dsn: str) -> str:
-    if dsn.startswith("sqlite") and "+aiosqlite" not in dsn:
-        return dsn.replace("sqlite:", "sqlite+aiosqlite:", 1)
+    """Accept a plain Postgres URL and route it through the asyncpg driver.
+
+    Only Postgres is supported — a non-Postgres DSN is a configuration error we
+    fail on loudly rather than silently degrading to a different database.
+    """
+    if dsn.startswith("postgresql+asyncpg:"):
+        return dsn
     if dsn.startswith("postgresql:"):
         return dsn.replace("postgresql:", "postgresql+asyncpg:", 1)
-    return dsn
+    raise ValueError(
+        "ENVELOCK_POSTGRES_DSN must be a PostgreSQL URL "
+        "(postgresql://… or postgresql+asyncpg://…); "
+        f"got {dsn.split('://', 1)[0] if '://' in dsn else dsn!r}"
+    )
 
 
 def get_engine() -> AsyncEngine:
     global _engine
     if _engine is None:
-        dsn = _normalise_dsn(get_settings().postgres_dsn)
+        settings = get_settings()
+        dsn = _normalise_dsn(settings.postgres_dsn)
         kwargs: dict = {"pool_pre_ping": True}
-        if dsn.startswith("sqlite"):
-            kwargs = {}
+        if settings.db_nullpool:
+            from sqlalchemy.pool import NullPool
+
+            # No pooled connection outlives the loop that opened it — required for
+            # the test suite, which spins up many short-lived event loops.
+            kwargs = {"poolclass": NullPool}
         _engine = create_async_engine(dsn, **kwargs)
-
-        if dsn.startswith("sqlite"):
-            # Foreign keys are off by default in SQLite.
-            @event.listens_for(_engine.sync_engine, "connect")
-            def _fk_on(conn, _record):  # noqa: ANN001
-                conn.execute("PRAGMA foreign_keys=ON")
-
     return _engine
 
 
@@ -92,7 +99,9 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 
 async def create_all() -> None:
-    """Used by tests and first-run bootstrap. Alembic owns production schema."""
+    """Create any missing tables. Idempotent (checkfirst), so it is safe to run
+    on every startup — this is what makes "just point at a fresh Postgres" work.
+    Alembic remains available for managed migrations and row-level security."""
     from envelock import models  # noqa: F401  (register metadata)
 
     async with get_engine().begin() as conn:

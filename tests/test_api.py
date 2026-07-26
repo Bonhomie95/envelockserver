@@ -15,7 +15,7 @@ from envelock.main import app
 
 @pytest.fixture
 def client() -> Iterator[TestClient]:
-    # Enter the lifespan so the SQLite schema exists — the authenticated paths
+    # Enter the lifespan so the schema is bootstrapped — the authenticated paths
     # below need the persisted users table (PRD §17.1).
     _reset_store()
     with TestClient(app) as c:
@@ -220,3 +220,93 @@ def test_provider_registry_is_exposed(client: TestClient) -> None:
     names = {p["name"] for p in body["providers"]}
     assert {"Microsoft 365", "Google Workspace", "HiNet hiBox"} <= names
     assert body["count"] >= 20
+
+
+def test_tenant_endpoint_returns_the_registered_domain(client: TestClient) -> None:
+    """The dashboard shows the tenant's real domain, so /tenant must return it
+    after bootstrap — not leave the UI guessing from a mailbox."""
+    h = _auth_header(client, email="owner@globex.com")
+    # Before bootstrap there is a tenant but no domain.
+    empty = client.get("/api/v1/tenant", headers=h).json()
+    assert empty["name"] is not None
+    assert empty["primary_domain"] is None
+
+    client.post(
+        "/api/v1/tenants/bootstrap",
+        json={"name": "Globex Inc", "domain": "globex.com"},
+        headers=h,
+    )
+    body = client.get("/api/v1/tenant", headers=h).json()
+    assert body["primary_domain"] == "globex.com"
+    assert any(d["registrable_domain"] == "globex.com" for d in body["domains"])
+
+
+def test_imap_connect_seals_credentials_and_marks_connected(client: TestClient) -> None:
+    """A non-OAuth mailbox connects over IMAP; the password is envelope-encrypted
+    and the mailbox flips to connected with a real protection level."""
+    import asyncio
+
+    from sqlalchemy import select
+
+    from envelock.db import get_sessionmaker
+    from envelock.models import MailboxCredential
+
+    h = _auth_header(client, email="admin@custommail.dev")
+    client.post(
+        "/api/v1/tenants/bootstrap",
+        json={"name": "Custom", "domain": "custommail.dev"},
+        headers=h,
+    )
+    mb = client.post(
+        "/api/v1/mailboxes",
+        json={"address": "ceo@custommail.dev", "mailbox_class": "protected", "sources": []},
+        headers=h,
+    ).json()
+
+    out = client.post(
+        f"/api/v1/mailboxes/{mb['id']}/connect/imap",
+        json={"imap_host": "imap.custommail.dev", "imap_port": 993, "password": "s3cret-app-pw"},
+        headers=h,
+    )
+    assert out.status_code == 200
+    body = out.json()
+    assert "imap_idle" in body["sources"]  # Protected -> IDLE
+    assert body["protection_level"] in {"full", "standard"}
+
+    async def _read() -> MailboxCredential | None:
+        async with get_sessionmaker()() as s:
+            return (
+                await s.execute(
+                    select(MailboxCredential).order_by(MailboxCredential.created_at.desc())
+                )
+            ).scalars().first()
+
+    cred = asyncio.run(_read())
+    assert cred is not None and cred.kind == "imap_password"
+    assert b"s3cret-app-pw" not in cred.ciphertext  # sealed, not plaintext
+
+
+def test_remove_mailbox(client: TestClient) -> None:
+    h = _auth_header(client, email="admin@removeco.dev")
+    client.post(
+        "/api/v1/tenants/bootstrap",
+        json={"name": "RemoveCo", "domain": "removeco.dev"},
+        headers=h,
+    )
+    mb = client.post(
+        "/api/v1/mailboxes",
+        json={"address": "x@removeco.dev", "mailbox_class": "monitored", "sources": []},
+        headers=h,
+    ).json()
+    assert client.delete(f"/api/v1/mailboxes/{mb['id']}", headers=h).status_code == 200
+    remaining = client.get("/api/v1/mailboxes", headers=h).json()["mailboxes"]
+    assert all(m["id"] != mb["id"] for m in remaining)
+
+
+def test_tenant_reports_trial_state(client: TestClient) -> None:
+    h = _auth_header(client, email="owner@trialco.dev")
+    body = client.get("/api/v1/tenant", headers=h).json()
+    # A fresh Guard signup has no trial clock running yet.
+    assert body["plan"] == "guard"
+    assert body["trial"]["active"] is False
+    assert "days_left" in body["trial"]

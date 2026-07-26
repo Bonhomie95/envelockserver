@@ -29,7 +29,7 @@ from envelock.main import app
 
 @pytest.fixture
 def client() -> Iterator[TestClient]:
-    # Enter the app lifespan so the SQLite schema is bootstrapped — accounts are
+    # Enter the app lifespan so the schema is bootstrapped — accounts are
     # now persisted, so the users table must exist before any auth call.
     _reset_store()
     with TestClient(app) as c:

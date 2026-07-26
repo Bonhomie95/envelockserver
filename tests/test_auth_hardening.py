@@ -102,3 +102,72 @@ def test_phone_endpoints_require_a_session(client: TestClient) -> None:
         client.post("/api/v1/auth/phone/start", json={"phone": "+1 415 555 0100"}).status_code
         == 401
     )
+
+
+def test_phone_start_is_rate_limited_against_sms_bombing(client: TestClient) -> None:
+    """Sending an SMS is metered and abusable — the endpoint must throttle so a
+    signed-in caller cannot bomb a number or run up cost."""
+    h = _session(client, "spammer@acme.com")
+    codes = [
+        client.post(
+            "/api/v1/auth/phone/start", json={"phone": "+1 415 555 0180"}, headers=h
+        ).status_code
+        for _ in range(8)
+    ]
+    assert 429 in codes, "phone/start must throttle SMS sends"
+
+
+# ── Disposable email blocking ────────────────────────────────────────────────
+@pytest.mark.parametrize(
+    "bad", ["x@mailinator.com", "y@guerrillamail.com", "z@10minutemail.com"]
+)
+def test_register_rejects_disposable_email(client: TestClient, bad: str) -> None:
+    r = client.post(
+        "/api/v1/auth/register",
+        json={"email": bad, "password": "violet-Tractor-42-canyon", "tenant_name": "Acme"},
+    )
+    assert r.status_code == 422
+
+
+def test_register_accepts_a_real_email(client: TestClient) -> None:
+    r = client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "founder@acme.com",
+            "password": "violet-Tractor-42-canyon",
+            "tenant_name": "Acme",
+        },
+    )
+    assert r.status_code == 201
+
+
+def test_disposable_check_matches_subdomains() -> None:
+    from envelock.auth.email_policy import is_disposable_email
+
+    assert is_disposable_email("a@mailinator.com")
+    assert is_disposable_email("a@sub.mailinator.com")  # eTLD+1 match
+    assert not is_disposable_email("a@acme.com")
+
+
+# ── One company, one tenant (trial-abuse prevention) ─────────────────────────
+def test_same_corporate_domain_joins_one_tenant(client: TestClient) -> None:
+    """A second person from the same corporate domain joins the existing tenant as
+    a member — companies can't fragment into many tenants (or many trials)."""
+    h1 = _session(client, "alice@joinco-uniq.com")
+    me1 = client.get("/api/v1/auth/me", headers=h1).json()
+    h2 = _session(client, "bob@joinco-uniq.com")
+    me2 = client.get("/api/v1/auth/me", headers=h2).json()
+
+    assert me1["tenant_id"] == me2["tenant_id"]
+    assert me1["role"] == "owner"
+    assert me2["role"] == "member"
+
+
+def test_free_mail_users_get_separate_tenants(client: TestClient) -> None:
+    """gmail/outlook/etc. have many unrelated users, so each is its own tenant."""
+    h1 = _session(client, "a@gmail.com")
+    me1 = client.get("/api/v1/auth/me", headers=h1).json()
+    h2 = _session(client, "b@gmail.com")
+    me2 = client.get("/api/v1/auth/me", headers=h2).json()
+
+    assert me1["tenant_id"] != me2["tenant_id"]

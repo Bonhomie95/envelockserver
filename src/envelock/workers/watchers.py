@@ -245,6 +245,10 @@ class RdapClient:
 
     async def lookup(self, domain: str) -> dict | None:
         reg = registrable_domain(domain)
+        # Never issue an outbound request for a non-registrable input — the caller
+        # may be unauthenticated, so a bare label or IP must not reach the network.
+        if not reg:
+            return None
         if reg in self._cache:
             return self._cache[reg]
         try:
@@ -252,7 +256,12 @@ class RdapClient:
         except ImportError:
             return None
         try:
-            async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            # follow_redirects is required (rdap.org bootstraps to the registry's
+            # own RDAP server) but capped: an unbounded redirect chain from an
+            # externally-influenced host is the SSRF shape we refuse.
+            async with httpx.AsyncClient(
+                timeout=8.0, follow_redirects=True, max_redirects=4
+            ) as client:
                 response = await client.get(f"{self.bootstrap.rstrip('/')}/domain/{reg}")
             if response.status_code != 200:
                 return None

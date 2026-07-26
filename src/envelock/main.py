@@ -31,12 +31,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logging.basicConfig(level=settings.log_level)
     logger.info("envelock starting", extra={"env": settings.env})
 
-    # SQLite bootstraps its own schema so the system runs without Docker;
-    # Postgres schema is owned by Alembic.
-    if settings.postgres_dsn.startswith("sqlite"):
-        from envelock.db import create_all
+    # Ensure the schema exists on the configured Postgres. Idempotent, so moving
+    # from a local DB to a production one is only a change of ENVELOCK_POSTGRES_DSN.
+    from envelock.db import create_all
 
-        await create_all()
+    await create_all()
 
     # Hydrate the E8 counterparty graph from its durable store so the moat — one
     # tenant's confirmation protecting every other tenant — survives restarts and
@@ -51,9 +50,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("counterparty graph hydrate skipped: %s", exc)
 
-    # Cross-instance rate limiting (PRD §17.3). A single instance stays on the
-    # in-process limiter; a redis-backed deployment shares one window. A failed
-    # connection is logged and falls back rather than blocking startup.
+    # Cross-instance shared state (PRD §17.3). A single instance stays fully
+    # in-process; a redis-backed deployment shares the rate-limit window AND the
+    # auth-security stores (login lockout, TOTP replay guard, token revocations),
+    # so those protections hold across replicas. Any failure logs and falls back
+    # to per-instance rather than blocking startup.
     if settings.rate_limit_backend == "redis":
         try:
             import redis.asyncio as aioredis
@@ -63,9 +64,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             client = aioredis.from_url(settings.redis_dsn, socket_timeout=2)
             await client.ping()
             limits.use_backend(limits.RedisRateLimiter(client, fallback=limits.limiter))
-            logger.info("rate limiter: redis backend active")
+            limits.use_auth_backends(
+                lockout=limits.RedisAccountLockout(client, fallback=limits.lockout),
+                replay=limits.RedisReplayGuard(client, fallback=limits.totp_replay),
+                revocations=limits.RedisTokenRevocations(client, fallback=limits.revocations),
+            )
+            logger.info("shared state: redis backend active (rate limit + auth stores)")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("rate limiter: redis unavailable (%s) — using in-process", exc)
+            logger.warning("shared state: redis unavailable (%s) — using in-process", exc)
 
     # Connection pools, the IMAP broker and channel subscribers attach here as
     # they land. Keep startup ordered: datastores, then channels, then workers.

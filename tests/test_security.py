@@ -117,14 +117,17 @@ def test_dummy_hash_is_computed_once() -> None:
 
 # ── Rate limiting and lockout ────────────────────────────────────────────────
 def test_rate_limiter_blocks_then_recovers() -> None:
+    from envelock.security.limits import RULES
+
+    rule = RULES["auth.login"]
     limiter = RateLimiter()
     now = 1000.0
-    for _ in range(5):
+    for _ in range(rule.limit):
         assert limiter.check("auth.login", "ip:1.2.3.4", now=now)[0]
     allowed, retry_after = limiter.check("auth.login", "ip:1.2.3.4", now=now)
     assert not allowed and retry_after > 0
     # Window rolls over.
-    assert limiter.check("auth.login", "ip:1.2.3.4", now=now + 301)[0]
+    assert limiter.check("auth.login", "ip:1.2.3.4", now=now + rule.window + 1)[0]
 
 
 def test_rate_limiter_isolates_identities() -> None:
@@ -257,6 +260,18 @@ def test_scan_rejects_unresolvable_input(client: TestClient, bad: str) -> None:
     assert client.post("/api/v1/domains/scan", json={"domain": bad}).status_code == 422
 
 
+@pytest.mark.parametrize("bad", ["localhost", "127.0.0.1", "169.254.169.254", "internal"])
+@pytest.mark.parametrize("endpoint", ["posture", "probe", "registration"])
+def test_public_brand_endpoints_refuse_ssrf_targets(
+    client: TestClient, endpoint: str, bad: str
+) -> None:
+    """The unauthenticated brand endpoints drive DNS / outbound HTTP, so an IP
+    literal, cloud-metadata address or single-label internal name must be rejected
+    before it reaches a resolver or the network."""
+    r = client.get(f"/api/v1/brand/{bad}/{endpoint}")
+    assert r.status_code == 422
+
+
 def test_mfa_code_cannot_be_replayed(client: TestClient) -> None:
     """An observed code must not work twice inside its 30s window."""
     import base64
@@ -334,3 +349,46 @@ def test_refresh_reuse_revokes_every_session(client: TestClient) -> None:
     assert client.post("/api/v1/auth/refresh", json={"token": original}).status_code == 200
     # Second use of the same token = theft.
     assert client.post("/api/v1/auth/refresh", json={"token": original}).status_code == 401
+
+
+def test_forwarded_for_is_ignored_unless_trusted() -> None:
+    """A spoofable X-Forwarded-For must not split rate-limit buckets by default —
+    otherwise anyone bypasses throttling by rotating the header."""
+    from starlette.datastructures import Headers
+
+    from envelock.config import get_settings
+    from envelock.security.middleware import client_identity
+
+    def _req(xff: str):
+        class _R:
+            headers = Headers({"x-forwarded-for": xff})
+
+            class client:  # noqa: N801
+                host = "10.0.0.1"  # the proxy
+
+        return _R()
+
+    get_settings.cache_clear()  # trust_forwarded_for defaults False
+    a = client_identity(_req("1.2.3.4"))
+    b = client_identity(_req("5.6.7.8"))
+    assert a == b == "ip:10.0.0.1"  # both bucketed by the real peer, XFF ignored
+
+
+def test_forwarded_for_is_used_when_trusted(monkeypatch) -> None:  # noqa: ANN001
+    from starlette.datastructures import Headers
+
+    from envelock.config import get_settings
+    from envelock.security.middleware import client_identity
+
+    monkeypatch.setenv("ENVELOCK_TRUST_FORWARDED_FOR", "true")
+    get_settings.cache_clear()
+    try:
+        class _R:
+            headers = Headers({"x-forwarded-for": "1.2.3.4, 10.0.0.1"})
+
+            class client:  # noqa: N801
+                host = "10.0.0.1"
+
+        assert client_identity(_R()) == "ip:1.2.3.4"  # original client, not proxy
+    finally:
+        get_settings.cache_clear()

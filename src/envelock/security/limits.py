@@ -42,11 +42,17 @@ class Rule:
 
 #: Deliberately tight on anything that touches credentials.
 RULES: dict[str, Rule] = {
-    "auth.login": Rule(5, 300),
-    "auth.register": Rule(3, 3600),
-    "auth.mfa": Rule(6, 300),
+    "auth.login": Rule(10, 300),
+    # Account creation is low-harm (gated downstream by the payment/trial ledger)
+    # and legitimately bursts — a small office behind one IP, or onboarding. Keep
+    # it bounded against scripted farming, but not so tight that real signups fail.
+    "auth.register": Rule(20, 3600),
+    "auth.mfa": Rule(10, 300),
     "auth.refresh": Rule(30, 300),
     "auth.recovery": Rule(5, 3600),
+    # Phone verification sends an SMS (a metered, abusable channel), so it is
+    # capped hard — a few per hour is ample and stops SMS-bombing / cost abuse.
+    "auth.phone": Rule(5, 3600),
     "scan.domain": Rule(20, 60),
     "scan.connect": Rule(20, 60),
     "analyse": Rule(30, 60),
@@ -178,6 +184,13 @@ class _LockoutState:
     history: list[float] = field(default_factory=list)
 
 
+# Multi-instance backing: these three stores are process-local, but Redis-backed
+# variants below (`RedisAccountLockout`, `RedisReplayGuard`,
+# `RedisTokenRevocations`) share them across replicas — selected at startup when
+# `rate_limit_backend == "redis"`. So login lockout, TOTP replay protection and
+# refresh-token reuse detection all hold across instances, with a per-instance
+# fallback on a Redis outage. The in-process classes remain the single-instance
+# default and the fallback.
 class AccountLockout:
     """Progressive lockout keyed on the account, not the IP.
 
@@ -218,6 +231,17 @@ class AccountLockout:
         with self._lock:
             self._state.pop(identity, None)
 
+    # Async interface — no IO in-process, so these just wrap the sync path. The
+    # Redis backend overrides them with real awaits (same shape).
+    async def ais_locked(self, identity: str, *, now: float | None = None) -> tuple[bool, int]:
+        return self.is_locked(identity, now=now)
+
+    async def arecord_failure(self, identity: str, *, now: float | None = None) -> None:
+        self.record_failure(identity, now=now)
+
+    async def arecord_success(self, identity: str) -> None:
+        self.record_success(identity)
+
     def reset(self) -> None:
         with self._lock:
             self._state.clear()
@@ -246,6 +270,9 @@ class ReplayGuard:
                 return False
             self._seen[key] = current + self._ttl
             return True
+
+    async def acheck_and_record(self, key: str, *, now: float | None = None) -> bool:
+        return self.check_and_record(key, now=now)
 
     def reset(self) -> None:
         with self._lock:
@@ -279,10 +306,105 @@ class TokenRevocations:
                 return True
             return user_id in self._revoked_users
 
+    async def arevoke_jti(self, jti: str, *, expires_at: float) -> None:
+        self.revoke_jti(jti, expires_at=expires_at)
+
+    async def arevoke_user(self, user_id: str, *, until: float) -> None:
+        self.revoke_user(user_id, until=until)
+
+    async def ais_revoked(self, jti: str, user_id: str, *, now: float | None = None) -> bool:
+        return self.is_revoked(jti, user_id, now=now)
+
     def reset(self) -> None:
         with self._lock:
             self._revoked_jti.clear()
             self._revoked_users.clear()
+
+
+# ── Redis-backed auth stores (shared across instances) ───────────────────────
+# Same async interface as the in-process classes; a Redis error fails over to a
+# per-instance fallback so a cache blip degrades protection rather than locking
+# everyone out or throwing in the auth path.
+class RedisAccountLockout:
+    THRESHOLD = AccountLockout.THRESHOLD
+    BACKOFFS = AccountLockout.BACKOFFS
+
+    def __init__(self, client, *, fallback: AccountLockout | None = None) -> None:  # noqa: ANN001
+        self._c = client
+        self._fb = fallback or AccountLockout()
+
+    async def ais_locked(self, identity: str, *, now: float | None = None) -> tuple[bool, int]:
+        current = now if now is not None else time.time()
+        try:
+            v = await self._c.get(f"lk:until:{identity}")
+        except Exception:
+            return self._fb.is_locked(identity, now=now)
+        if v is None:
+            return False, 0
+        until = float(v)
+        return (True, int(until - current) + 1) if until > current else (False, 0)
+
+    async def arecord_failure(self, identity: str, *, now: float | None = None) -> None:
+        current = now if now is not None else time.time()
+        try:
+            fails = await self._c.incr(f"lk:fail:{identity}")
+            await self._c.expire(f"lk:fail:{identity}", self.BACKOFFS[-1])
+            if fails >= self.THRESHOLD:
+                tier = min((fails - self.THRESHOLD) // self.THRESHOLD, len(self.BACKOFFS) - 1)
+                backoff = self.BACKOFFS[tier]
+                await self._c.set(f"lk:until:{identity}", current + backoff, ex=backoff + 1)
+        except Exception:
+            logger.warning("redis lockout unavailable — using in-process fallback")
+            self._fb.record_failure(identity, now=now)
+
+    async def arecord_success(self, identity: str) -> None:
+        try:
+            await self._c.delete(f"lk:fail:{identity}", f"lk:until:{identity}")
+        except Exception:
+            self._fb.record_success(identity)
+
+
+class RedisReplayGuard:
+    def __init__(self, client, *, ttl: int = 120, fallback: ReplayGuard | None = None) -> None:  # noqa: ANN001
+        self._c = client
+        self._ttl = ttl
+        self._fb = fallback or ReplayGuard(ttl=ttl)
+
+    async def acheck_and_record(self, key: str, *, now: float | None = None) -> bool:
+        try:
+            # SET NX is atomic: it succeeds only on first use inside the TTL.
+            ok = await self._c.set(f"rp:{key}", "1", nx=True, ex=self._ttl)
+            return bool(ok)
+        except Exception:
+            logger.warning("redis replay guard unavailable — using in-process fallback")
+            return self._fb.check_and_record(key, now=now)
+
+
+class RedisTokenRevocations:
+    def __init__(self, client, *, fallback: TokenRevocations | None = None) -> None:  # noqa: ANN001
+        self._c = client
+        self._fb = fallback or TokenRevocations()
+
+    async def arevoke_jti(self, jti: str, *, expires_at: float) -> None:
+        ttl = max(1, int(expires_at - time.time()))
+        try:
+            await self._c.set(f"rev:jti:{jti}", "1", ex=ttl)
+        except Exception:
+            self._fb.revoke_jti(jti, expires_at=expires_at)
+
+    async def arevoke_user(self, user_id: str, *, until: float) -> None:
+        ttl = max(1, int(until - time.time()))
+        try:
+            await self._c.set(f"rev:user:{user_id}", "1", ex=ttl)
+        except Exception:
+            self._fb.revoke_user(user_id, until=until)
+
+    async def ais_revoked(self, jti: str, user_id: str, *, now: float | None = None) -> bool:
+        try:
+            hits = await self._c.exists(f"rev:jti:{jti}", f"rev:user:{user_id}")
+            return int(hits) > 0
+        except Exception:
+            return self._fb.is_revoked(jti, user_id, now=now)
 
 
 limiter = RateLimiter()
@@ -291,14 +413,45 @@ lockout = AccountLockout()
 totp_replay = ReplayGuard()
 revocations = TokenRevocations()
 
+# Active auth backends — swapped for the Redis variants at startup when a shared
+# store is configured; default to the in-process instances (and their fallbacks).
+_active_lockout: object = lockout
+_active_replay: object = totp_replay
+_active_revocations: object = revocations
+
+
+def use_auth_backends(*, lockout=None, replay=None, revocations=None) -> None:  # noqa: ANN001
+    global _active_lockout, _active_replay, _active_revocations
+    if lockout is not None:
+        _active_lockout = lockout
+    if replay is not None:
+        _active_replay = replay
+    if revocations is not None:
+        _active_revocations = revocations
+
+
+def active_lockout():  # noqa: ANN201
+    return _active_lockout
+
+
+def active_replay():  # noqa: ANN201
+    return _active_replay
+
+
+def active_revocations():  # noqa: ANN201
+    return _active_revocations
+
 
 def reset_all() -> None:
     """Test hook."""
+    global _active_lockout, _active_replay, _active_revocations
     limiter.reset()
     use_backend(limiter)  # never leave a test on a swapped backend
     lockout.reset()
     totp_replay.reset()
     revocations.reset()
+    # Restore in-process auth backends so a test that swapped in Redis is isolated.
+    _active_lockout, _active_replay, _active_revocations = lockout, totp_replay, revocations
 
 
 def clamp_text(text: str, limit: int = MAX_ANALYSED_TEXT_CHARS) -> str:
