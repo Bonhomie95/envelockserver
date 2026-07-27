@@ -48,47 +48,54 @@ def _session(client: TestClient, email: str, *, with_mfa: bool = False) -> dict:
     return {"Authorization": f"Bearer {skip['access_token']}"}
 
 
-# ── Password change ───────────────────────────────────────────────────────────
-def test_password_change_needs_the_current_password(client: TestClient) -> None:
-    h = _session(client, "user@acme.com")
-    bad = client.post(
-        "/api/v1/auth/password",
-        json={"current_password": "wrong-one-entirely", "new_password": "another-good-passphrase"},
-        headers=h,
-    )
-    assert bad.status_code == 401
-
-
-def test_password_change_succeeds_and_rejects_reuse(client: TestClient) -> None:
-    h = _session(client, "user2@acme.com")
-    same = client.post(
-        "/api/v1/auth/password",
-        json={"current_password": PW, "new_password": PW},
-        headers=h,
-    )
-    assert same.status_code == 400  # must differ
-
-    ok = client.post(
+# ── Sensitive changes require MFA to be enabled ───────────────────────────────
+def test_password_change_requires_mfa_enabled(client: TestClient) -> None:
+    """A user who deferred MFA cannot change the password until they enrol — the
+    account keys are gated behind a second factor even though basic use is not."""
+    h = _session(client, "nomfa@acme.com")  # MFA skipped at sign-up
+    r = client.post(
         "/api/v1/auth/password",
         json={"current_password": PW, "new_password": "a-brand-new-passphrase-9"},
         headers=h,
     )
-    assert ok.status_code == 200
-    assert ok.json()["sessions_revoked"] is True
-    # The new password now works at login.
-    assert (
-        client.post(
-            "/api/v1/auth/login",
-            json={"email": "user2@acme.com", "password": "a-brand-new-passphrase-9"},
-        ).status_code
-        == 200
-    )
+    assert r.status_code == 403  # "turn on two-factor first"
 
 
-def test_password_change_requires_totp_when_mfa_on(client: TestClient) -> None:
-    h = _session(client, "mfa@acme.com", with_mfa=True)
+def _step_code(secret: str) -> str:
+    # A window offset from the login code so the replay guard sees a fresh code.
+    return _totp_at(secret, int(time.time()) // 30 + 1)
+
+
+def test_password_change_rejects_wrong_password(client: TestClient) -> None:
+    h = _session(client, "mfa1@acme.com", with_mfa=True)
     headers = {"Authorization": h["Authorization"]}
-    # Right password, but no code → refused.
+    bad = client.post(
+        "/api/v1/auth/password",
+        json={
+            "current_password": "wrong-one-entirely",
+            "new_password": "a-brand-new-passphrase-9",
+            "mfa_code": _step_code(h["_secret"]),
+        },
+        headers=headers,
+    )
+    assert bad.status_code == 401
+
+
+def test_password_change_rejects_reuse(client: TestClient) -> None:
+    h = _session(client, "mfa2@acme.com", with_mfa=True)
+    headers = {"Authorization": h["Authorization"]}
+    same = client.post(
+        "/api/v1/auth/password",
+        json={"current_password": PW, "new_password": PW, "mfa_code": _step_code(h["_secret"])},
+        headers=headers,
+    )
+    assert same.status_code == 400  # must differ
+
+
+def test_password_change_succeeds_and_revokes_sessions(client: TestClient) -> None:
+    h = _session(client, "mfa3@acme.com", with_mfa=True)
+    headers = {"Authorization": h["Authorization"]}
+    # Right password, but no code → refused (MFA is on and required).
     no_code = client.post(
         "/api/v1/auth/password",
         json={"current_password": PW, "new_password": "a-brand-new-passphrase-9"},
@@ -96,16 +103,25 @@ def test_password_change_requires_totp_when_mfa_on(client: TestClient) -> None:
     )
     assert no_code.status_code == 401
 
-    with_code = client.post(
+    ok = client.post(
         "/api/v1/auth/password",
         json={
             "current_password": PW,
             "new_password": "a-brand-new-passphrase-9",
-            "mfa_code": _totp_at(h["_secret"], int(time.time()) // 30 + 1),
+            "mfa_code": _step_code(h["_secret"]),
         },
         headers=headers,
     )
-    assert with_code.status_code == 200
+    assert ok.status_code == 200
+    assert ok.json()["sessions_revoked"] is True
+    # The new password now works at login.
+    assert (
+        client.post(
+            "/api/v1/auth/login",
+            json={"email": "mfa3@acme.com", "password": "a-brand-new-passphrase-9"},
+        ).status_code
+        == 200
+    )
 
 
 # ── MFA disable ───────────────────────────────────────────────────────────────
@@ -129,22 +145,52 @@ def test_mfa_disable_requires_password_and_code(client: TestClient) -> None:
 
 
 # ── Phone change is a sensitive action ────────────────────────────────────────
-def test_changing_a_verified_phone_requires_reauth(client: TestClient) -> None:
-    h = _session(client, "phone@acme.com")
-    # First add is low-friction.
+def test_first_phone_add_is_low_friction(client: TestClient) -> None:
+    """Adding a first recovery phone needs no step-up (nothing trusted yet)."""
+    h = _session(client, "phone0@acme.com")
+    start = client.post(
+        "/api/v1/auth/phone/start", json={"phone": "+1 415 555 0100"}, headers=h
+    ).json()
+    r = client.post("/api/v1/auth/phone/verify", json={"code": start["dev_code"]}, headers=h)
+    assert r.status_code == 200
+
+
+def test_changing_verified_phone_requires_mfa(client: TestClient) -> None:
+    h = _session(client, "phone1@acme.com")  # MFA off
     start = client.post(
         "/api/v1/auth/phone/start", json={"phone": "+1 415 555 0100"}, headers=h
     ).json()
     client.post("/api/v1/auth/phone/verify", json={"code": start["dev_code"]}, headers=h)
 
-    # Now changing it without the password is refused.
+    # Changing a verified number is sensitive → MFA required.
     blocked = client.post("/api/v1/auth/phone/start", json={"phone": "+1 415 555 0199"}, headers=h)
+    assert blocked.status_code == 403
+
+
+def test_changing_verified_phone_with_mfa(client: TestClient) -> None:
+    h = _session(client, "phone2@acme.com", with_mfa=True)
+    headers = {"Authorization": h["Authorization"]}
+    start = client.post(
+        "/api/v1/auth/phone/start", json={"phone": "+1 415 555 0100"}, headers=headers
+    ).json()
+    client.post("/api/v1/auth/phone/verify", json={"code": start["dev_code"]}, headers=headers)
+
+    # Without the step-up code → refused; with password + code → allowed.
+    blocked = client.post(
+        "/api/v1/auth/phone/start",
+        json={"phone": "+1 415 555 0199", "current_password": PW},
+        headers=headers,
+    )
     assert blocked.status_code == 401
 
     allowed = client.post(
         "/api/v1/auth/phone/start",
-        json={"phone": "+1 415 555 0199", "current_password": PW},
-        headers=h,
+        json={
+            "phone": "+1 415 555 0199",
+            "current_password": PW,
+            "mfa_code": _step_code(h["_secret"]),
+        },
+        headers=headers,
     )
     assert allowed.status_code == 200
 

@@ -218,11 +218,23 @@ async def _verify_step_up(
 ) -> None:
     """Re-authenticate before a sensitive change (PRD §15.1 forced re-auth).
 
-    An open session is not enough to change the password, recovery phone or second
-    factor: we demand the current password and, when MFA is on, a fresh TOTP code.
-    So a walk-up attacker on an unlocked laptop — or a stolen access token — still
-    cannot take the account over. Rate-limited and TOTP-replay-guarded like a login.
+    Sensitive changes — the password, recovery phone or second factor itself —
+    require **two-factor to be enabled** and then both the current password and a
+    fresh TOTP code. MFA is optional to *use* the product (it can be deferred at
+    sign-up), but it is mandatory to *change the keys to the account*: so a
+    stolen password alone, or a walk-up attacker on an unlocked laptop, can never
+    lock the real owner out. Rate-limited and TOTP-replay-guarded like a login.
+
+    Raises 403 with a distinct message when MFA is off, so the client can send the
+    user to enrol first instead of showing a dead form.
     """
+    if not user.mfa_enabled:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "turn on two-factor authentication first — changing your password, "
+            "recovery phone or security settings requires it",
+        )
+
     scope = f"stepup:{user.id}"
     locked, retry_after = await active_lockout().ais_locked(scope)
     if locked:
@@ -233,7 +245,7 @@ async def _verify_step_up(
         )
 
     ok = verify_password(password, user.password_hash or dummy_hash())
-    if ok and user.mfa_enabled:
+    if ok:
         if not mfa_code or not verify_totp(user.totp_secret or "", mfa_code):
             ok = False
         elif not await active_replay().acheck_and_record(f"{user.id}:{mfa_code}"):
@@ -243,8 +255,7 @@ async def _verify_step_up(
         await active_lockout().arecord_failure(scope)
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
-            "re-authentication failed — check your password"
-            + (" and authenticator code" if user.mfa_enabled else ""),
+            "re-authentication failed — check your password and authenticator code",
         )
     await active_lockout().arecord_success(scope)
 
