@@ -175,6 +175,44 @@ async def _complete_login(
     return tokens
 
 
+async def _start_signup_trial(session: AsyncSession, tenant: Tenant, email: str) -> None:
+    """Give a brand-new tenant the full plan on a trial from minute one.
+
+    A dashboard that shows nothing until a card is entered has no chance to prove
+    itself. So signup starts the trial immediately on the top plan; the card is
+    only needed later, to keep it. When the trial lapses unpaid the tenant falls
+    back to Guard (free), it is never locked out.
+
+    One trial per registrable domain, ever (PRD §12.7) — recorded in the permanent
+    ledger so delete-and-re-register cannot farm fresh trials. Free-mail signups
+    have no lockable domain; the payment-fingerprint lock at billing/confirm is
+    what catches repeat abuse there.
+    """
+    from envelock.billing.pricing import Plan
+    from envelock.config import get_settings
+    from envelock.models import DomainTrialLedger
+
+    now = datetime.now(UTC)
+    domain_part = email.rsplit("@", 1)[-1] if "@" in email else ""
+    reg = registrable_domain(domain_part)
+
+    if reg and not is_free_mail(reg):
+        if await session.get(DomainTrialLedger, reg) is not None:
+            return  # this domain already used its one trial — stays on Guard
+        session.add(
+            DomainTrialLedger(
+                registrable_domain=reg,
+                first_trial_at=now,
+                first_tenant_id=tenant.id,
+                outcome="active",
+            )
+        )
+
+    tenant.plan = Plan.COMPLETE.value  # highest plan for the trial
+    tenant.trial_started_at = now
+    tenant.trial_ends_at = now + timedelta(days=get_settings().trial_days)
+
+
 async def _existing_tenant_for_domain(session: AsyncSession, email: str) -> UUID | None:
     """If a corporate email domain already has a tenant, return its id so a
     colleague JOINS it rather than spinning up a second workspace — and a second
@@ -250,6 +288,7 @@ async def register(req: RegisterRequest, session: Session) -> dict:
             # First from this domain (or a free-mail signup) → new owner tenant.
             tenant = Tenant(id=uuid4(), name=req.tenant_name)
             session.add(tenant)
+            await _start_signup_trial(session, tenant, email)
             session.add(
                 User(
                     id=uuid4(),

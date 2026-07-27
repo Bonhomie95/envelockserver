@@ -81,6 +81,7 @@ async def confirm_payment_method(
 
     existing = None
     related: list[trial.LedgerEntry] = []
+    row: DomainTrialLedger | None = None
     if is_domain_trial:
         row = await session.get(DomainTrialLedger, reg)
         if row is not None:
@@ -114,12 +115,19 @@ async def confirm_payment_method(
     # can still subscribe. Cost (backfill, analysis) is incurred only after this.
     tenant.payment_method_ok = True
 
+    # This tenant's own trial (started at signup) is not abuse — a customer adding
+    # a card mid-trial must never be told "already used".
+    own_trial = row is not None and row.first_tenant_id == tenant.id
+    eligibility = "active" if own_trial else decision.eligibility.value
+    trial_allowed = True if own_trial else decision.allowed
+
     now = datetime.now(UTC)
     started_trial = False
-    if decision.allowed and existing is None:
-        # First trial for this domain: record the permanent ledger entry and
-        # start the clock.
-        if is_domain_trial:
+    # The signup trial already set the dates and ledger row, so this is a no-op on
+    # the common path; it only fires for a tenant that reached billing without a
+    # trial yet (e.g. a domain whose trial was used before this tenant existed).
+    if decision.allowed and tenant.trial_started_at is None:
+        if is_domain_trial and row is None:
             session.add(
                 DomainTrialLedger(
                     registrable_domain=reg,
@@ -132,14 +140,18 @@ async def confirm_payment_method(
         tenant.trial_started_at = now
         tenant.trial_ends_at = now + timedelta(days=settings.trial_days)
         started_trial = True
+    elif own_trial and row is not None and instrument.fingerprint and not row.payment_fingerprint:
+        # Backfill the fingerprint now that we have one — keeps the anti-abuse lock
+        # meaningful for a trial that started before any card was on file.
+        row.payment_fingerprint = instrument.fingerprint
 
     await session.commit()
 
     return {
         "gate_passed": True,
         "trial_key": key,
-        "eligibility": decision.eligibility.value,
-        "trial_allowed": decision.allowed,
+        "eligibility": eligibility,
+        "trial_allowed": trial_allowed,
         "trial_started": started_trial,
         "trial_ends_at": tenant.trial_ends_at.isoformat()
         if tenant.trial_ends_at

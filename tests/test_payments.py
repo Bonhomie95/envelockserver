@@ -84,20 +84,28 @@ def test_confirm_opens_the_gate_and_starts_the_trial(
 ) -> None:
     payments.set_default_transport(_FakeStripe())
     try:
-        h = _owner(client, "owner@acme.com")
+        # Unique domain — the trial ledger is permanent and never cleared, so a
+        # shared domain would carry another test's entry.
+        dom = "confirmco-uniq.com"
+        h = _owner(client, f"owner@{dom}")
         body = client.post(
             "/api/v1/billing/confirm",
-            json={"provider": "stripe", "reference": "pm_123", "identifier": "acme.com"},
+            json={"provider": "stripe", "reference": "pm_123", "identifier": dom},
             headers=h,
         ).json()
 
         assert body["gate_passed"] is True
+        # The trial started at signup; adding a card mid-trial is this tenant's own
+        # trial, never "already used", and keeps the trial active.
         assert body["trial_allowed"] is True
-        assert body["trial_started"] is True
         assert body["trial_ends_at"]
         # The fingerprint is anti-abuse state and must never be returned.
         assert "fingerprint" not in body["instrument"]
         assert body["instrument"]["last4"] == "4242"
+        # The tenant is on the top plan with an active trial.
+        tenant = client.get("/api/v1/tenant", headers=h).json()
+        assert tenant["trial"]["active"] is True
+        assert tenant["trial"]["payment_method_ok"] is True
     finally:
         payments.set_default_transport(None)
 
@@ -121,7 +129,9 @@ def test_colleagues_share_one_tenant_and_one_trial(
             json={"provider": "stripe", "reference": "pm_1", "identifier": dom},
             headers=h1,
         ).json()
-        assert first["trial_started"] is True
+        # The trial began at signup; confirm attaches the card and keeps it active.
+        assert first["gate_passed"] is True
+        assert first["trial_allowed"] is True
 
         # A colleague on the same domain signs up.
         h2 = _owner(client, f"second@{dom}")
@@ -161,16 +171,21 @@ def test_ledger_entry_is_persisted(client: TestClient, configured_stripe: None) 
 
     payments.set_default_transport(_FakeStripe())
     try:
-        h = _owner(client, "owner@acme.com")
+        # Unique domain so this test owns its ledger row (the ledger is permanent
+        # and shared across the whole session).
+        dom = "ledgerco-uniq.com"
+        h = _owner(client, f"owner@{dom}")
+        # Signup already recorded the ledger row (trial started at signup). Confirm
+        # backfills the payment fingerprint that keeps the anti-abuse lock useful.
         client.post(
             "/api/v1/billing/confirm",
-            json={"provider": "stripe", "reference": "pm_1", "identifier": "acme.com"},
+            json={"provider": "stripe", "reference": "pm_1", "identifier": dom},
             headers=h,
         )
 
         async def _read() -> DomainTrialLedger | None:
             async with get_sessionmaker()() as s:
-                return await s.get(DomainTrialLedger, "acme.com")
+                return await s.get(DomainTrialLedger, dom)
 
         row = asyncio.run(_read())
         assert row is not None

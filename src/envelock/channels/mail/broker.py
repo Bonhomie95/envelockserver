@@ -249,3 +249,51 @@ class ImapBroker:
             "poll_seconds": self.poll_seconds,
             "measured_at": datetime.now(UTC).isoformat(),
         }
+
+
+# ── Credential verification (connect-time) ────────────────────────────────────
+@dataclass(frozen=True, slots=True)
+class ImapVerifyResult:
+    ok: bool
+    reason: str
+
+
+async def verify_imap_credentials(
+    *, host: str, port: int, username: str, password: str, timeout: float = 12.0  # noqa: ASYNC109
+) -> ImapVerifyResult:
+    """Prove the mailbox credentials actually work before we store them.
+
+    Connecting a mailbox must fail loudly on a wrong address/password rather than
+    reporting success and then silently ingesting nothing. We open a real TLS
+    IMAP session, attempt LOGIN, and immediately log out — we read no mail here.
+
+    An auth rejection and an unreachable host are both failures (either way we
+    cannot ingest), with a message specific enough for the user to fix it.
+    """
+    import aioimaplib
+
+    client = aioimaplib.IMAP4_SSL(host=host, port=port, timeout=timeout)
+    try:
+        await asyncio.wait_for(client.wait_hello_from_server(), timeout=timeout)
+        response = await asyncio.wait_for(
+            client.login(username, password), timeout=timeout
+        )
+    except TimeoutError:
+        return ImapVerifyResult(
+            False, "the IMAP server did not respond — check the host and port"
+        )
+    except Exception:  # noqa: BLE001 — any connect/TLS failure is a connect failure
+        return ImapVerifyResult(
+            False, "could not reach the IMAP server — check the host and port"
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(client.logout(), timeout=timeout)
+
+    if response.result == "OK":
+        return ImapVerifyResult(True, "signed in")
+    return ImapVerifyResult(
+        False,
+        "the server rejected the address or password — use an app-specific "
+        "password if your provider requires one",
+    )

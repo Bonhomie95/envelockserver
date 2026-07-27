@@ -241,15 +241,25 @@ def test_tenant_endpoint_returns_the_registered_domain(client: TestClient) -> No
     assert any(d["registrable_domain"] == "globex.com" for d in body["domains"])
 
 
-def test_imap_connect_seals_credentials_and_marks_connected(client: TestClient) -> None:
+def test_imap_connect_seals_credentials_and_marks_connected(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A non-OAuth mailbox connects over IMAP; the password is envelope-encrypted
     and the mailbox flips to connected with a real protection level."""
     import asyncio
 
     from sqlalchemy import select
 
+    from envelock.channels.mail import broker
     from envelock.db import get_sessionmaker
     from envelock.models import MailboxCredential
+
+    # No live IMAP server in the suite — stub the credential check as passing so
+    # this test covers storage/connect, not the network (see test_imap_verify).
+    async def _ok(**_: object) -> broker.ImapVerifyResult:
+        return broker.ImapVerifyResult(True, "signed in")
+
+    monkeypatch.setattr(broker, "verify_imap_credentials", _ok)
 
     h = _auth_header(client, email="admin@custommail.dev")
     client.post(
@@ -306,7 +316,7 @@ def test_remove_mailbox(client: TestClient) -> None:
 def test_tenant_reports_trial_state(client: TestClient) -> None:
     h = _auth_header(client, email="owner@trialco.dev")
     body = client.get("/api/v1/tenant", headers=h).json()
-    # A fresh Guard signup has no trial clock running yet.
-    assert body["plan"] == "guard"
-    assert body["trial"]["active"] is False
-    assert "days_left" in body["trial"]
+    # Signup now starts a trial on the top plan from minute one (issue 1).
+    assert body["plan"] == "complete"
+    assert body["trial"]["active"] is True
+    assert body["trial"]["days_left"] is not None and body["trial"]["days_left"] > 0

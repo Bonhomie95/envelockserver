@@ -131,10 +131,19 @@ async def current_tenant(principal: CurrentUser, session: Session) -> dict:
         if ends
         else None
     )
+    trial_active = bool(ends and ends > now)
+    paid = tenant.payment_method_ok if tenant else False
+    subscribed_plan = tenant.plan if tenant else "guard"
+    # Entitlement is the trial plan while the trial runs (or once a card is on
+    # file); when the trial lapses unpaid, the tenant is relegated to Guard (free)
+    # rather than losing access entirely (PRD §12.3 — Guard is free forever).
+    effective_plan = subscribed_plan if (trial_active or paid) else "guard"
     return {
         "tenant_id": str(principal.tenant_id),
         "name": tenant.name if tenant else None,
-        "plan": tenant.plan if tenant else "guard",
+        "plan": effective_plan,
+        "subscribed_plan": subscribed_plan,
+        "trial_ended": bool(ends and not trial_active and not paid),
         "trial": {
             "started_at": tenant.trial_started_at.isoformat()
             if tenant and tenant.trial_started_at
@@ -207,6 +216,76 @@ async def add_mailbox(req: MailboxRequest, principal: AdminUser, session: Sessio
     return _mailbox_payload(mailbox)
 
 
+class BulkMailboxRequest(BaseModel):
+    #: Paste a whole team at once — one call instead of adding 50 people by hand.
+    addresses: list[str] = Field(min_length=1, max_length=1000)
+    mailbox_class: MailboxClass = MailboxClass.MONITORED
+
+
+@router.post("/mailboxes/bulk", status_code=201)
+async def add_mailboxes_bulk(
+    req: BulkMailboxRequest, principal: AdminUser, session: Session
+) -> dict:
+    """Add many mailboxes in one request — the path for a whole finance team or a
+    50-seat domain, instead of adding each address by hand. Idempotent: addresses
+    that already exist (or repeat within the paste) are skipped, not duplicated."""
+    await _tenant_or_404(session, principal.tenant_id)
+
+    existing = {
+        addr.lower()
+        for (addr,) in (
+            await session.execute(
+                select(Mailbox.address).where(Mailbox.tenant_id == principal.tenant_id)
+            )
+        ).all()
+    }
+    caps = capabilities_for(frozenset())  # no source yet — added, then connected
+    level = protection_level(caps).value
+    inactive = inactive_for(caps)
+
+    created: list[Mailbox] = []
+    skipped: list[dict] = []
+    seen: set[str] = set()
+    for raw in req.addresses:
+        addr = raw.strip().lower()
+        if not addr:
+            continue
+        if "@" not in addr or "." not in addr.split("@")[-1]:
+            skipped.append({"address": raw.strip(), "reason": "not a valid email address"})
+            continue
+        if addr in existing or addr in seen:
+            skipped.append({"address": addr, "reason": "already added"})
+            continue
+        seen.add(addr)
+        mailbox = Mailbox(
+            tenant_id=principal.tenant_id,
+            address=addr,
+            mailbox_class=req.mailbox_class.value,
+            sources=[],
+            protection_level=level,
+            inactive_detections=inactive,
+        )
+        session.add(mailbox)
+        created.append(mailbox)
+
+    if created:
+        await alert_svc.record_audit(
+            session,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            action=alert_svc.AuditAction.MAILBOX_CONNECTED,
+            target_type="mailbox",
+            detail={"bulk_added": len(created), "class": req.mailbox_class.value},
+        )
+    await session.commit()
+    return {
+        "created": [_mailbox_payload(m) for m in created],
+        "skipped": skipped,
+        "created_count": len(created),
+        "skipped_count": len(skipped),
+    }
+
+
 async def _member_mailbox_ids(session: AsyncSession, actor) -> list[UUID]:  # noqa: ANN001
     """The mailbox ids a member may see — the ones addressed to them. Empty if
     they own none. Admins/owners are never restricted (caller checks is_member)."""
@@ -253,6 +332,19 @@ async def connect_imap(
     mail. Protected mailboxes hold an IDLE connection (quarantine latency is the
     product); Monitored mailboxes poll (PRD §12.11D)."""
     mailbox = await _mailbox_or_404(session, mailbox_id, principal.tenant_id)
+
+    # Prove the credentials work before storing them. Reporting "connected" on a
+    # wrong password (then silently ingesting nothing) is worse than an error.
+    from envelock.channels.mail import broker
+
+    check = await broker.verify_imap_credentials(
+        host=req.imap_host.strip().lower(),
+        port=req.imap_port,
+        username=mailbox.address,
+        password=req.password,
+    )
+    if not check.ok:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"could not connect — {check.reason}")
 
     sealed = seal(req.password.encode(), aad=str(mailbox.id).encode())
     existing = (
