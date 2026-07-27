@@ -98,14 +98,30 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         yield session
 
 
+#: Columns added to existing tables after their first release. `create_all` only
+#: creates missing *tables*, never new columns on an existing one, so a table that
+#: already exists on a long-running database would silently miss these. Each entry
+#: is an idempotent `ADD COLUMN IF NOT EXISTS`, applied on every startup.
+_RUNTIME_COLUMNS: tuple[str, ...] = (
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+    "status varchar(16) NOT NULL DEFAULT 'active'",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+    "must_change_password boolean NOT NULL DEFAULT false",
+)
+
+
 async def create_all() -> None:
-    """Create any missing tables. Idempotent (checkfirst), so it is safe to run
-    on every startup — this is what makes "just point at a fresh Postgres" work.
-    Alembic remains available for managed migrations and row-level security."""
+    """Create any missing tables, then backfill any newly added columns. Idempotent,
+    so it is safe to run on every startup — this is what makes "just point at a
+    fresh Postgres" work. Alembic remains available for managed migrations and RLS."""
+    from sqlalchemy import text
+
     from envelock import models  # noqa: F401  (register metadata)
 
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        for stmt in _RUNTIME_COLUMNS:
+            await conn.execute(text(stmt))
 
 
 async def dispose() -> None:

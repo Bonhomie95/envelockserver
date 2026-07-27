@@ -585,6 +585,37 @@ async def change_password(
     return {"status": "password_changed", "sessions_revoked": True}
 
 
+class InitialPasswordRequest(BaseModel):
+    new_password: str = Field(min_length=12, max_length=256)
+
+
+@router.post("/password/initial")
+async def set_initial_password(
+    req: InitialPasswordRequest, principal: CurrentUser, session: Session
+) -> dict:
+    """First-login password change for an owner-provisioned account.
+
+    A user the owner created signs in with a temporary password and must replace
+    it before doing anything else. This needs neither the temporary password again
+    nor MFA (they have none yet) — it only works while the one-time
+    `must_change_password` flag is set, and clears it on success.
+    """
+    user = await _user_by_id(session, principal.user_id)
+    if not user.must_change_password:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "no initial password change is pending"
+        )
+    try:
+        assess_passphrase(req.new_password)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    user.password_hash = hash_password(req.new_password)
+    user.must_change_password = False
+    await session.commit()
+    return {"status": "password_set"}
+
+
 class MfaDisableRequest(BaseModel):
     password: str = Field(max_length=256)
     mfa_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
@@ -699,6 +730,7 @@ async def me(principal: CurrentUser, session: Session) -> dict:
         "email": user.email,
         "role": user.role,
         "status": user.status,
+        "must_change_password": user.must_change_password,
         "mfa_enabled": user.mfa_enabled,
         "phone": user.phone,
         "phone_verified": user.phone_verified,

@@ -6,17 +6,25 @@ tenant on every access. Tenant isolation is verified, never assumed.
 
 from __future__ import annotations
 
+import secrets
 from datetime import UTC, datetime
-from typing import Annotated
-from uuid import UUID
+from typing import Annotated, Literal
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from envelock.auth.deps import ActiveUser, AdminUser, CurrentUser, OwnerUser
-from envelock.auth.security import dummy_hash, verify_password, verify_totp
+from envelock.auth.email_policy import is_disposable_email
+from envelock.auth.security import (
+    Role,
+    dummy_hash,
+    hash_password,
+    verify_password,
+    verify_totp,
+)
 from envelock.channels.mail.ingest import ingest_address, new_ingest_token, onboarding_instructions
 from envelock.core.capabilities import capabilities_for, protection_level
 from envelock.core.enums import IntegrationTier, MailboxClass, SourceMechanism
@@ -628,9 +636,108 @@ async def remove_mailbox(
 
 
 # ── Team / membership (PRD §15.1) ────────────────────────────────────────────
+async def _seat_usage(session: AsyncSession, tenant: Tenant) -> dict:
+    """Guard (free) is owner-only. On a trial or paid plan, team logins (everyone
+    except the owner) are capped at the number of protected mailboxes — one login
+    per protected seat."""
+    protected = (
+        await session.execute(
+            select(func.count())
+            .select_from(Mailbox)
+            .where(
+                Mailbox.tenant_id == tenant.id,
+                Mailbox.mailbox_class == MailboxClass.PROTECTED.value,
+            )
+        )
+    ).scalar_one()
+    team_used = (
+        await session.execute(
+            select(func.count())
+            .select_from(User)
+            .where(User.tenant_id == tenant.id, User.role != Role.OWNER.value)
+        )
+    ).scalar_one()
+    entitled = _mailbox_entitled(tenant)
+    cap = protected if entitled else 0
+    return {"used": team_used, "cap": cap, "entitled": entitled, "protected_mailboxes": protected}
+
+
+class CreateMemberRequest(BaseModel):
+    email: EmailStr
+    role: Literal["member", "admin"] = "member"
+
+
+@router.post("/members", status_code=201)
+async def create_member(
+    req: CreateMemberRequest, principal: AdminUser, session: Session
+) -> dict:
+    """Owner-provisioned access (PRD §15.1). The owner (or an admin) creates a
+    teammate and hands them a one-time temporary password; they must set their own
+    on first sign-in. Seat-limited by plan — see `_seat_usage`."""
+    tenant = await _tenant_or_404(session, principal.tenant_id)
+    if req.role == "admin" and principal.role is not Role.OWNER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "only the owner can create admins")
+
+    email = req.email.lower().strip()
+    if is_disposable_email(email):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "disposable email addresses are not allowed",
+        )
+    if (await session.execute(select(User).where(User.email == email))).scalar_one_or_none():
+        raise HTTPException(status.HTTP_409_CONFLICT, "a user with this email already exists")
+
+    seats = await _seat_usage(session, tenant)
+    if seats["used"] >= seats["cap"]:
+        if not seats["entitled"]:
+            raise HTTPException(
+                status.HTTP_402_PAYMENT_REQUIRED,
+                "team logins need an active trial or paid plan — Guard is owner-only",
+            )
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            f"all {seats['cap']} team seats are in use — add a protected mailbox to "
+            "add another login",
+        )
+
+    temp_password = secrets.token_urlsafe(12)
+    user = User(
+        id=uuid4(),
+        tenant_id=tenant.id,
+        email=email,
+        password_hash=hash_password(temp_password),
+        role=req.role,
+        is_admin=req.role == "admin",
+        status="active",
+        must_change_password=True,
+    )
+    session.add(user)
+    await session.flush()
+    await alert_svc.record_audit(
+        session,
+        tenant_id=tenant.id,
+        actor_id=principal.user_id,
+        action="member.created",
+        target_type="user",
+        target_id=user.id,
+        detail={"email": email, "role": req.role},
+    )
+    await session.commit()
+    return {
+        "id": str(user.id),
+        "email": user.email,
+        "role": user.role,
+        "temporary_password": temp_password,
+        "note": "Share this once, in person or over a trusted channel. They must "
+        "change it at first sign-in.",
+    }
+
+
 @router.get("/members")
 async def list_members(principal: AdminUser, session: Session) -> dict:
-    """Admins see everyone in the tenant, including colleagues awaiting approval."""
+    """Admins see everyone in the tenant, including colleagues awaiting approval,
+    plus how many team seats the plan allows."""
+    tenant = await _tenant_or_404(session, principal.tenant_id)
     rows = (
         (
             await session.execute(
@@ -649,10 +756,12 @@ async def list_members(principal: AdminUser, session: Session) -> dict:
                 "email": u.email,
                 "role": u.role,
                 "status": u.status,
+                "pending_password": u.must_change_password,
                 "is_self": u.id == principal.user_id,
             }
             for u in rows
-        ]
+        ],
+        "seats": await _seat_usage(session, tenant),
     }
 
 

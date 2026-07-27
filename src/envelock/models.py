@@ -67,6 +67,9 @@ class User(Base, UUIDMixin, TimestampMixin):
     #: active | pending. A colleague who joins an existing corporate tenant starts
     #: pending and sees nothing until an admin approves them (PRD §15.1).
     status: Mapped[str] = mapped_column(String(16), default="active")
+    #: True for a user the owner provisioned with a temporary password — they must
+    #: set their own on first sign-in before reaching any tenant data.
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
     #: MFA is mandatory before a session can be held (PRD §15.1). The secret is
     #: provisioned at enrolment and confirmed at first verify.
     totp_secret: Mapped[str | None] = mapped_column(String(64))
