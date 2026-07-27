@@ -213,6 +213,42 @@ async def _start_signup_trial(session: AsyncSession, tenant: Tenant, email: str)
     tenant.trial_ends_at = now + timedelta(days=get_settings().trial_days)
 
 
+async def _verify_step_up(
+    user: User, *, password: str, mfa_code: str | None
+) -> None:
+    """Re-authenticate before a sensitive change (PRD §15.1 forced re-auth).
+
+    An open session is not enough to change the password, recovery phone or second
+    factor: we demand the current password and, when MFA is on, a fresh TOTP code.
+    So a walk-up attacker on an unlocked laptop — or a stolen access token — still
+    cannot take the account over. Rate-limited and TOTP-replay-guarded like a login.
+    """
+    scope = f"stepup:{user.id}"
+    locked, retry_after = await active_lockout().ais_locked(scope)
+    if locked:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "too many attempts — wait and try again",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    ok = verify_password(password, user.password_hash or dummy_hash())
+    if ok and user.mfa_enabled:
+        if not mfa_code or not verify_totp(user.totp_secret or "", mfa_code):
+            ok = False
+        elif not await active_replay().acheck_and_record(f"{user.id}:{mfa_code}"):
+            ok = False  # a TOTP code is single-use for a step-up too
+
+    if not ok:
+        await active_lockout().arecord_failure(scope)
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "re-authentication failed — check your password"
+            + (" and authenticator code" if user.mfa_enabled else ""),
+        )
+    await active_lockout().arecord_success(scope)
+
+
 async def _existing_tenant_for_domain(session: AsyncSession, email: str) -> UUID | None:
     """If a corporate email domain already has a tenant, return its id so a
     colleague JOINS it rather than spinning up a second workspace — and a second
@@ -501,6 +537,66 @@ async def mfa_activate(
     return {"mfa_enabled": True, "recovery_codes": codes}
 
 
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(max_length=256)
+    new_password: str = Field(min_length=12, max_length=256)
+    mfa_code: str | None = Field(default=None, pattern=r"^\d{6}$")
+
+
+@router.post("/password")
+async def change_password(
+    req: PasswordChangeRequest, principal: CurrentUser, session: Session
+) -> dict:
+    """Change the account password behind a step-up re-auth (password + TOTP).
+
+    On success every other session is revoked, so a change made in response to a
+    suspected compromise actually kicks the attacker out rather than leaving their
+    refresh token alive.
+    """
+    user = await _user_by_id(session, principal.user_id)
+    await _verify_step_up(user, password=req.current_password, mfa_code=req.mfa_code)
+
+    try:
+        assess_passphrase(req.new_password)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    if verify_password(req.new_password, user.password_hash or ""):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "the new password must be different from the current one",
+        )
+
+    user.password_hash = hash_password(req.new_password)
+    await active_revocations().arevoke_user(
+        str(user.id), until=time.time() + REFRESH_TTL.total_seconds()
+    )
+    await session.commit()
+    return {"status": "password_changed", "sessions_revoked": True}
+
+
+class MfaDisableRequest(BaseModel):
+    password: str = Field(max_length=256)
+    mfa_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+@router.post("/mfa/disable")
+async def mfa_disable(
+    req: MfaDisableRequest, principal: CurrentUser, session: Session
+) -> dict:
+    """Turn MFA off — only behind the current password AND a valid TOTP code, so
+    the second factor cannot be stripped by someone who merely holds a session."""
+    user = await _user_by_id(session, principal.user_id)
+    if not user.mfa_enabled:
+        raise HTTPException(status.HTTP_409_CONFLICT, "MFA is not enabled")
+    await _verify_step_up(user, password=req.password, mfa_code=req.mfa_code)
+
+    user.mfa_enabled = False
+    user.totp_secret = None
+    user.recovery_hashes = []
+    await session.commit()
+    return {"mfa_enabled": False}
+
+
 @router.post("/recovery")
 async def recovery(req: RecoveryRequest, session: Session) -> dict:
     """Redeem a single-use recovery code when the authenticator is lost.
@@ -609,6 +705,10 @@ async def sensitive_actions(principal: CurrentUser) -> dict:
 # ── Phone verification (out-of-band + SMS-escalation channel) ─────────────────
 class PhoneStartRequest(BaseModel):
     phone: str = Field(min_length=8, max_length=32, pattern=r"^\+?[0-9 ()-]{7,31}$")
+    #: Required only when *changing* an already-verified recovery phone — a stolen
+    #: session must not be able to swap the out-of-band channel to the attacker's.
+    current_password: str | None = Field(default=None, max_length=256)
+    mfa_code: str | None = Field(default=None, pattern=r"^\d{6}$")
 
 
 class PhoneVerifyRequest(BaseModel):
@@ -638,6 +738,13 @@ async def phone_start(
         )
 
     user = await _user_by_id(session, principal.user_id)
+    # Adding a first phone is low-friction; *changing* a verified one is a
+    # sensitive action — the recovery channel is what an attacker would redirect.
+    if user.phone_verified:
+        await _verify_step_up(
+            user, password=req.current_password or "", mfa_code=req.mfa_code
+        )
+
     code = generate_numeric_otp()
     user.phone = req.phone.strip()
     user.phone_verified = False

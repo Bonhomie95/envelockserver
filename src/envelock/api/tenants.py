@@ -12,7 +12,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from envelock.auth.deps import ActiveUser, AdminUser, CurrentUser
@@ -27,9 +27,12 @@ from envelock.models import (
     BankRecord,
     Counterparty,
     Domain,
+    Finding,
     LookalikeDomain,
     Mailbox,
     MailboxCredential,
+    Message,
+    SensorSession,
     Tenant,
     User,
 )
@@ -401,16 +404,33 @@ async def connect_imap(
 async def remove_mailbox(
     mailbox_id: UUID, principal: AdminUser, session: Session
 ) -> dict:
-    """Disconnect and remove a mailbox and its stored credential."""
+    """Disconnect and remove a mailbox and everything that hangs off it.
+
+    A mailbox is the parent of messages, findings, sensor sessions and its stored
+    credential; deleting it while those rows exist violates their foreign keys and
+    500s (the reported bug). We remove them in FK-safe order — children first —
+    and deliberately *keep* alerts as the customer's incident record, detaching
+    them from the mailbox rather than deleting the history.
+    """
     mailbox = await _mailbox_or_404(session, mailbox_id, principal.tenant_id)
     address = mailbox.address
-    cred = (
-        await session.execute(
-            select(MailboxCredential).where(MailboxCredential.mailbox_id == mailbox.id)
+    mid = mailbox.id
+
+    # Findings reference messages and alerts, so they go first. Catch both the
+    # ones tagged with this mailbox and any tied to its messages.
+    msg_ids = select(Message.id).where(Message.mailbox_id == mid)
+    await session.execute(
+        delete(Finding).where(
+            or_(Finding.mailbox_id == mid, Finding.message_id.in_(msg_ids))
         )
-    ).scalar_one_or_none()
-    if cred is not None:
-        await session.delete(cred)
+    )
+    await session.execute(delete(Message).where(Message.mailbox_id == mid))
+    await session.execute(delete(SensorSession).where(SensorSession.mailbox_id == mid))
+    await session.execute(delete(MailboxCredential).where(MailboxCredential.mailbox_id == mid))
+    # Preserve the incident record — detach alerts instead of deleting them.
+    await session.execute(
+        update(Alert).where(Alert.mailbox_id == mid).values(mailbox_id=None)
+    )
     await session.delete(mailbox)
     await alert_svc.record_audit(
         session,
