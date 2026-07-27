@@ -232,8 +232,9 @@ async def register(req: RegisterRequest, session: Session) -> dict:
 
         existing_tenant_id = await _existing_tenant_for_domain(session, email)
         if existing_tenant_id is not None:
-            # A colleague — join the company's existing tenant as a member. No new
-            # tenant, and therefore no second trial for the same domain.
+            # A colleague — join the company's existing tenant as a member, but
+            # PENDING: an admin must approve before they see anything. No new
+            # tenant, so no second trial for the same domain either.
             session.add(
                 User(
                     id=uuid4(),
@@ -242,6 +243,7 @@ async def register(req: RegisterRequest, session: Session) -> dict:
                     password_hash=password_hash,
                     role=Role.MEMBER.value,
                     is_admin=False,
+                    status="pending",
                 )
             )
         else:
@@ -362,6 +364,104 @@ async def mfa_verify(req: MfaVerifyRequest, session: Session) -> dict:
     return await _complete_login(session, user, first_time=first_time)
 
 
+@router.post("/mfa/skip")
+async def mfa_skip(req: TokenRequest, session: Session) -> dict:
+    """Defer MFA enrolment and start a session now.
+
+    The PRD's stance is that MFA is mandatory, but forcing enrolment inside the
+    very first sign-in is a hard onboarding wall: someone evaluating the product
+    cannot even see their dashboard without first installing an authenticator app.
+    So enrolment is *deferrable* — a session is issued now, the account is flagged
+    as MFA-less, and the dashboard nags until it is turned on (auth/mfa/enroll).
+
+    An account that has *already* enabled MFA can never bypass it here — that would
+    make the second factor worthless for anyone who set it up.
+    """
+    try:
+        claims = decode_token(req.token, expect="mfa_pending")
+    except TokenError as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
+
+    user = await _user_by_id(session, claims.sub)
+    if user.mfa_enabled:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "MFA is enabled on this account — verify with your authenticator",
+        )
+
+    # No recovery codes: those are issued when MFA is actually turned on, not here.
+    tokens = await _complete_login(session, user)
+    tokens["mfa_enabled"] = False
+    tokens["mfa_deferred"] = True
+    return tokens
+
+
+@router.post("/mfa/enroll")
+async def mfa_enroll(principal: CurrentUser, session: Session) -> dict:
+    """Authenticated TOTP enrolment for a user who deferred MFA at sign-in.
+
+    Unlike `/mfa/setup` (which trades an `mfa_pending` token) this runs inside an
+    established session, so the deferred user can turn MFA on from the dashboard
+    without signing out. Returns a fresh secret; confirm it with `/mfa/activate`.
+    """
+    user = await _user_by_id(session, principal.user_id)
+    if user.mfa_enabled:
+        raise HTTPException(status.HTTP_409_CONFLICT, "MFA already enabled")
+
+    user.totp_secret = generate_totp_secret()
+    await session.commit()
+    return {
+        "secret": user.totp_secret,
+        "otpauth_uri": totp_uri(user.totp_secret, user.email),
+        "next": "Confirm with /auth/mfa/activate to turn MFA on.",
+    }
+
+
+class MfaActivateRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+@router.post("/mfa/activate")
+async def mfa_activate(
+    req: MfaActivateRequest, principal: CurrentUser, session: Session
+) -> dict:
+    """Confirm the code and enable MFA for an already-authenticated session.
+
+    Issues single-use recovery codes the first time MFA is turned on, exactly as
+    the sign-in enrolment path does.
+    """
+    user = await _user_by_id(session, principal.user_id)
+    if user.mfa_enabled:
+        raise HTTPException(status.HTTP_409_CONFLICT, "MFA already enabled")
+
+    locked, retry_after = await active_lockout().ais_locked(f"mfa:{user.email}")
+    if locked:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "too many failed attempts",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    if not user.totp_secret:
+        raise HTTPException(status.HTTP_409_CONFLICT, "start enrolment first")
+
+    if not verify_totp(user.totp_secret, req.code):
+        await active_lockout().arecord_failure(f"mfa:{user.email}")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid code")
+
+    # Same replay defence as sign-in: a TOTP code is valid for its whole window.
+    if not await active_replay().acheck_and_record(f"{user.id}:{req.code}"):
+        await active_lockout().arecord_failure(f"mfa:{user.email}")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "code already used")
+
+    user.mfa_enabled = True
+    codes = generate_recovery_codes()
+    user.recovery_hashes = [hash_recovery_code(c) for c in codes]
+    await active_lockout().arecord_success(f"mfa:{user.email}")
+    await session.commit()
+    return {"mfa_enabled": True, "recovery_codes": codes}
+
+
 @router.post("/recovery")
 async def recovery(req: RecoveryRequest, session: Session) -> dict:
     """Redeem a single-use recovery code when the authenticator is lost.
@@ -452,6 +552,7 @@ async def me(principal: CurrentUser, session: Session) -> dict:
         "tenant_id": str(user.tenant_id),
         "email": user.email,
         "role": user.role,
+        "status": user.status,
         "mfa_enabled": user.mfa_enabled,
         "phone": user.phone,
         "phone_verified": user.phone_verified,

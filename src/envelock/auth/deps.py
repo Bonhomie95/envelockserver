@@ -86,3 +86,56 @@ CurrentUser = Annotated[Principal, Depends(current_principal)]
 OptionalUser = Annotated[Principal | None, Depends(optional_principal)]
 AdminUser = Annotated[Principal, Depends(require_role(Role.ADMIN))]
 OwnerUser = Annotated[Principal, Depends(require_role(Role.OWNER))]
+
+
+@dataclass(frozen=True, slots=True)
+class Actor:
+    """A Principal enriched from the database with the fields needed for approval
+    gating and per-member scoping — the live role/status/email, not the token's
+    (so an approval or role change takes effect on the next request, not in 15
+    minutes when the access token rotates)."""
+
+    user_id: UUID
+    tenant_id: UUID
+    role: Role
+    email: str
+    status: str
+
+    @property
+    def is_admin(self) -> bool:
+        return role_at_least(self.role, Role.ADMIN)
+
+    @property
+    def is_member(self) -> bool:
+        return self.role is Role.MEMBER
+
+
+async def active_actor(
+    principal: Annotated[Principal, Depends(current_principal)],
+) -> Actor:
+    """Load the caller and require an *active* account. A pending colleague can
+    hold a session (to see the "awaiting approval" screen) but reaches no tenant
+    data until an admin approves them."""
+    # Imported here to avoid a module import cycle (models → db → config).
+    from envelock.db import get_sessionmaker
+    from envelock.models import User
+
+    async with get_sessionmaker()() as session:
+        user = await session.get(User, principal.user_id)
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
+    if user.status != "active":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "your account is awaiting approval from a workspace admin",
+        )
+    return Actor(
+        user_id=user.id,
+        tenant_id=user.tenant_id,
+        role=Role(user.role),
+        email=user.email,
+        status=user.status,
+    )
+
+
+ActiveUser = Annotated[Actor, Depends(active_actor)]

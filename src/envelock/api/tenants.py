@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from envelock.auth.deps import AdminUser, CurrentUser
+from envelock.auth.deps import ActiveUser, AdminUser, CurrentUser
 from envelock.channels.mail.ingest import ingest_address, new_ingest_token, onboarding_instructions
 from envelock.core.capabilities import capabilities_for, protection_level
 from envelock.core.enums import IntegrationTier, MailboxClass, SourceMechanism
@@ -31,6 +31,7 @@ from envelock.models import (
     Mailbox,
     MailboxCredential,
     Tenant,
+    User,
 )
 from envelock.platform import alerts as alert_svc
 from envelock.platform import graph_store
@@ -206,13 +207,24 @@ async def add_mailbox(req: MailboxRequest, principal: AdminUser, session: Sessio
     return _mailbox_payload(mailbox)
 
 
-@router.get("/mailboxes")
-async def list_mailboxes(principal: CurrentUser, session: Session) -> dict:
-    rows = (
-        (await session.execute(select(Mailbox).where(Mailbox.tenant_id == principal.tenant_id)))
-        .scalars()
-        .all()
+async def _member_mailbox_ids(session: AsyncSession, actor) -> list[UUID]:  # noqa: ANN001
+    """The mailbox ids a member may see — the ones addressed to them. Empty if
+    they own none. Admins/owners are never restricted (caller checks is_member)."""
+    rows = await session.execute(
+        select(Mailbox.id).where(
+            Mailbox.tenant_id == actor.tenant_id, Mailbox.address == actor.email
+        )
     )
+    return [mid for (mid,) in rows.all()]
+
+
+@router.get("/mailboxes")
+async def list_mailboxes(actor: ActiveUser, session: Session) -> dict:
+    query = select(Mailbox).where(Mailbox.tenant_id == actor.tenant_id)
+    # A member sees only their own mailbox (PRD §15.1); admins see the domain.
+    if actor.is_member:
+        query = query.where(Mailbox.address == actor.email)
+    rows = (await session.execute(query)).scalars().all()
     return {"mailboxes": [_mailbox_payload(m) for m in rows]}
 
 
@@ -320,6 +332,83 @@ async def remove_mailbox(
     return {"removed": True, "address": address}
 
 
+# ── Team / membership (PRD §15.1) ────────────────────────────────────────────
+@router.get("/members")
+async def list_members(principal: AdminUser, session: Session) -> dict:
+    """Admins see everyone in the tenant, including colleagues awaiting approval."""
+    rows = (
+        (
+            await session.execute(
+                select(User).where(User.tenant_id == principal.tenant_id).order_by(
+                    User.created_at.asc()
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "members": [
+            {
+                "id": str(u.id),
+                "email": u.email,
+                "role": u.role,
+                "status": u.status,
+                "is_self": u.id == principal.user_id,
+            }
+            for u in rows
+        ]
+    }
+
+
+async def _member_or_404(session: AsyncSession, user_id: UUID, tenant_id: UUID) -> User:
+    user = await session.get(User, user_id)
+    if user is None or user.tenant_id != tenant_id:
+        raise HTTPException(404, "member not found")
+    return user
+
+
+@router.post("/members/{user_id}/approve")
+async def approve_member(user_id: UUID, principal: AdminUser, session: Session) -> dict:
+    """Grant a pending colleague access to the workspace."""
+    user = await _member_or_404(session, user_id, principal.tenant_id)
+    user.status = "active"
+    await alert_svc.record_audit(
+        session,
+        tenant_id=principal.tenant_id,
+        actor_id=principal.user_id,
+        action="member.approved",
+        target_type="user",
+        target_id=user.id,
+        detail={"email": user.email},
+    )
+    await session.commit()
+    return {"id": str(user.id), "email": user.email, "status": user.status}
+
+
+@router.post("/members/{user_id}/reject")
+async def reject_member(user_id: UUID, principal: AdminUser, session: Session) -> dict:
+    """Remove a member (or decline a pending request). The owner cannot be removed
+    and an admin cannot remove themselves."""
+    user = await _member_or_404(session, user_id, principal.tenant_id)
+    if user.id == principal.user_id:
+        raise HTTPException(400, "you cannot remove yourself")
+    if user.role == "owner":
+        raise HTTPException(400, "the owner cannot be removed")
+    email = user.email
+    await session.delete(user)
+    await alert_svc.record_audit(
+        session,
+        tenant_id=principal.tenant_id,
+        actor_id=principal.user_id,
+        action="member.removed",
+        target_type="user",
+        detail={"email": email},
+    )
+    await session.commit()
+    return {"removed": True, "email": email}
+
+
 # ── Alerts ───────────────────────────────────────────────────────────────────
 def _alert_payload(a: Alert) -> dict:
     return {
@@ -338,11 +427,26 @@ def _alert_payload(a: Alert) -> dict:
     }
 
 
+async def _assert_alert_access(session: AsyncSession, actor, alert: Alert) -> None:
+    """A member may only touch alerts on their own mailbox (PRD §15.1). Return a
+    404 (not 403) for out-of-scope alerts so membership isn't an oracle."""
+    if not actor.is_member:
+        return
+    own = await _member_mailbox_ids(session, actor)
+    if alert.mailbox_id not in own:
+        raise HTTPException(404, "alert not found")
+
+
 @router.get("/alerts")
 async def list_alerts(
-    principal: CurrentUser, session: Session, state: str | None = None, limit: int = 100
+    actor: ActiveUser, session: Session, state: str | None = None, limit: int = 100
 ) -> dict:
-    query = select(Alert).where(Alert.tenant_id == principal.tenant_id)
+    query = select(Alert).where(Alert.tenant_id == actor.tenant_id)
+    if actor.is_member:
+        own = await _member_mailbox_ids(session, actor)
+        if not own:
+            return {"alerts": [], "count": 0}
+        query = query.where(Alert.mailbox_id.in_(own))
     if state:
         query = query.where(Alert.state == state)
     rows = (
@@ -354,9 +458,13 @@ async def list_alerts(
 
 
 @router.post("/alerts/{alert_id}/acknowledge")
-async def acknowledge_alert(alert_id: UUID, principal: CurrentUser, session: Session) -> dict:
+async def acknowledge_alert(alert_id: UUID, actor: ActiveUser, session: Session) -> dict:
+    existing = await session.get(Alert, alert_id)
+    if existing is None or existing.tenant_id != actor.tenant_id:
+        raise HTTPException(404, "alert not found")
+    await _assert_alert_access(session, actor, existing)
     alert = await alert_svc.acknowledge(
-        session, alert_id=alert_id, tenant_id=principal.tenant_id, actor_id=principal.user_id
+        session, alert_id=alert_id, tenant_id=actor.tenant_id, actor_id=actor.user_id
     )
     if alert is None:
         raise HTTPException(404, "alert not found")
@@ -366,13 +474,17 @@ async def acknowledge_alert(alert_id: UUID, principal: CurrentUser, session: Ses
 
 @router.post("/alerts/{alert_id}/resolve")
 async def resolve_alert(
-    alert_id: UUID, principal: CurrentUser, session: Session, dismiss: bool = False
+    alert_id: UUID, actor: ActiveUser, session: Session, dismiss: bool = False
 ) -> dict:
+    existing = await session.get(Alert, alert_id)
+    if existing is None or existing.tenant_id != actor.tenant_id:
+        raise HTTPException(404, "alert not found")
+    await _assert_alert_access(session, actor, existing)
     alert = await alert_svc.resolve(
         session,
         alert_id=alert_id,
-        tenant_id=principal.tenant_id,
-        actor_id=principal.user_id,
+        tenant_id=actor.tenant_id,
+        actor_id=actor.user_id,
         dismissed=dismiss,
     )
     if alert is None:
@@ -382,11 +494,12 @@ async def resolve_alert(
 
 
 @router.post("/alerts/{alert_id}/quarantine")
-async def quarantine(alert_id: UUID, principal: CurrentUser, session: Session) -> dict:
+async def quarantine(alert_id: UUID, actor: ActiveUser, session: Session) -> dict:
     """E2. Refuses honestly on forwarding-connected mailboxes."""
     alert = await session.get(Alert, alert_id)
-    if alert is None or alert.tenant_id != principal.tenant_id:
+    if alert is None or alert.tenant_id != actor.tenant_id:
         raise HTTPException(404, "alert not found")
+    await _assert_alert_access(session, actor, alert)
 
     source = SourceMechanism.FORWARD_INGEST
     caps = frozenset()
@@ -403,8 +516,8 @@ async def quarantine(alert_id: UUID, principal: CurrentUser, session: Session) -
     if result.succeeded:
         await alert_svc.record_audit(
             session,
-            tenant_id=principal.tenant_id,
-            actor_id=principal.user_id,
+            tenant_id=actor.tenant_id,
+            actor_id=actor.user_id,
             action=alert_svc.AuditAction.MESSAGE_QUARANTINED,
             target_type="alert",
             target_id=alert.id,

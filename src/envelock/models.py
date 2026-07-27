@@ -64,6 +64,9 @@ class User(Base, UUIDMixin, TimestampMixin):
     #: sync (admin or owner) for the notification recipient model (E4/E6).
     role: Mapped[str] = mapped_column(String(16), default="member")
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: active | pending. A colleague who joins an existing corporate tenant starts
+    #: pending and sees nothing until an admin approves them (PRD §15.1).
+    status: Mapped[str] = mapped_column(String(16), default="active")
     #: MFA is mandatory before a session can be held (PRD §15.1). The secret is
     #: provisioned at enrolment and confirmed at first verify.
     totp_secret: Mapped[str | None] = mapped_column(String(64))
