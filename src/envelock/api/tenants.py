@@ -15,7 +15,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from envelock.auth.deps import ActiveUser, AdminUser, CurrentUser
+from envelock.auth.deps import ActiveUser, AdminUser, CurrentUser, OwnerUser
+from envelock.auth.security import dummy_hash, verify_password, verify_totp
 from envelock.channels.mail.ingest import ingest_address, new_ingest_token, onboarding_instructions
 from envelock.core.capabilities import capabilities_for, protection_level
 from envelock.core.enums import IntegrationTier, MailboxClass, SourceMechanism
@@ -28,12 +29,17 @@ from envelock.models import (
     Counterparty,
     Domain,
     Finding,
+    Invoice,
     LookalikeDomain,
     Mailbox,
     MailboxCredential,
     Message,
+    NotificationDelivery,
+    PushSubscription,
+    SenderProfile,
     SensorSession,
     Tenant,
+    UsageMeter,
     User,
 )
 from envelock.platform import alerts as alert_svc
@@ -50,12 +56,38 @@ router = APIRouter(prefix="/api/v1", tags=["tenant"])
 
 Session = Annotated[AsyncSession, Depends(get_session)]
 
+#: Sources that mean a mailbox's MAIL is actually being ingested (vs identity-only
+#: signals). Used to tell "connected" from "unconnected".
+_MAIL_SOURCES = frozenset(
+    {"graph_api", "gmail_api", "admin_api", "imap_idle", "imap_poll", "forward_ingest", "journal"}
+)
+
 
 async def _tenant_or_404(session: AsyncSession, tenant_id: UUID) -> Tenant:
     tenant = await session.get(Tenant, tenant_id)
     if tenant is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "tenant not found")
     return tenant
+
+
+def _mailbox_entitled(tenant: Tenant) -> bool:
+    """Content mailboxes (Channel 1/2) need a paid plan or an active trial. Guard
+    is Channel-3-only and free — it protects domains, not mailboxes (PRD §12.3),
+    so a lapsed-trial tenant on Guard cannot keep adding protected seats."""
+    ends = tenant.trial_ends_at
+    if ends is not None and ends.tzinfo is None:
+        ends = ends.replace(tzinfo=UTC)
+    trial_active = bool(ends and ends > datetime.now(UTC))
+    return trial_active or tenant.payment_method_ok
+
+
+def _require_mailbox_entitlement(tenant: Tenant) -> None:
+    if not _mailbox_entitled(tenant):
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            "your trial has ended — add a payment method to protect mailboxes "
+            "(domain and brand monitoring stay free on Guard)",
+        )
 
 
 # ── Bootstrap ────────────────────────────────────────────────────────────────
@@ -169,6 +201,60 @@ async def current_tenant(principal: CurrentUser, session: Session) -> dict:
     }
 
 
+class DeleteTenantRequest(BaseModel):
+    password: str = Field(max_length=256)
+    mfa_code: str | None = Field(default=None, pattern=r"^\d{6}$")
+
+
+@router.delete("/tenant")
+async def delete_tenant(
+    req: DeleteTenantRequest, principal: OwnerUser, session: Session
+) -> dict:
+    """Full account deletion (PRD §15.2). Confirmed with the current password (and
+    a TOTP code when MFA is on), then removes the tenant and every row scoped to
+    it — mailboxes, credentials, messages, alerts, the audit trail, users.
+
+    The **domain trial ledger is deliberately kept** (PRD §12.7): its permanence is
+    the anti-abuse mechanism. So an owner who deletes their account after using the
+    trial and later returns gets no fresh trial — they subscribe from the start.
+    """
+    user = await session.get(User, principal.user_id)
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
+    if not verify_password(req.password, user.password_hash or dummy_hash()):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "password is incorrect")
+    if user.mfa_enabled and (
+        not req.mfa_code or not verify_totp(user.totp_secret or "", req.mfa_code)
+    ):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "authenticator code is incorrect")
+
+    tid = principal.tenant_id
+    # Children before parents. DomainTrialLedger is intentionally NOT in this list.
+    for stmt in (
+        delete(Finding).where(Finding.tenant_id == tid),
+        delete(NotificationDelivery).where(NotificationDelivery.tenant_id == tid),
+        delete(BankRecord).where(BankRecord.tenant_id == tid),
+        delete(SenderProfile).where(SenderProfile.tenant_id == tid),
+        delete(Message).where(Message.tenant_id == tid),
+        delete(SensorSession).where(SensorSession.tenant_id == tid),
+        delete(MailboxCredential).where(MailboxCredential.tenant_id == tid),
+        delete(Alert).where(Alert.tenant_id == tid),
+        delete(Counterparty).where(Counterparty.tenant_id == tid),
+        delete(Mailbox).where(Mailbox.tenant_id == tid),
+        delete(LookalikeDomain).where(LookalikeDomain.tenant_id == tid),
+        delete(PushSubscription).where(PushSubscription.tenant_id == tid),
+        delete(UsageMeter).where(UsageMeter.tenant_id == tid),
+        delete(Invoice).where(Invoice.tenant_id == tid),
+        delete(Domain).where(Domain.tenant_id == tid),
+        delete(AuditEvent).where(AuditEvent.tenant_id == tid),
+        delete(User).where(User.tenant_id == tid),
+        delete(Tenant).where(Tenant.id == tid),
+    ):
+        await session.execute(stmt)
+    await session.commit()
+    return {"deleted": True, "domain_ledger_retained": True}
+
+
 # ── Mailboxes ────────────────────────────────────────────────────────────────
 class MailboxRequest(BaseModel):
     address: str
@@ -194,7 +280,8 @@ def _mailbox_payload(m: Mailbox) -> dict:
 
 @router.post("/mailboxes", status_code=201)
 async def add_mailbox(req: MailboxRequest, principal: AdminUser, session: Session) -> dict:
-    await _tenant_or_404(session, principal.tenant_id)
+    tenant = await _tenant_or_404(session, principal.tenant_id)
+    _require_mailbox_entitlement(tenant)
     caps = capabilities_for(frozenset(req.sources))
     mailbox = Mailbox(
         tenant_id=principal.tenant_id,
@@ -207,13 +294,15 @@ async def add_mailbox(req: MailboxRequest, principal: AdminUser, session: Sessio
         known_user_count=req.known_user_count,
     )
     session.add(mailbox)
+    await session.flush()
     await alert_svc.record_audit(
         session,
         tenant_id=principal.tenant_id,
         actor_id=principal.user_id,
         action=alert_svc.AuditAction.MAILBOX_CONNECTED,
         target_type="mailbox",
-        detail={"address": mailbox.address, "sources": mailbox.sources},
+        target_id=mailbox.id,
+        detail={"address": mailbox.address, "event": "added"},
     )
     await session.commit()
     return _mailbox_payload(mailbox)
@@ -232,7 +321,8 @@ async def add_mailboxes_bulk(
     """Add many mailboxes in one request — the path for a whole finance team or a
     50-seat domain, instead of adding each address by hand. Idempotent: addresses
     that already exist (or repeat within the paste) are skipped, not duplicated."""
-    await _tenant_or_404(session, principal.tenant_id)
+    tenant = await _tenant_or_404(session, principal.tenant_id)
+    _require_mailbox_entitlement(tenant)
 
     existing = {
         addr.lower()
@@ -394,10 +484,103 @@ async def connect_imap(
         actor_id=principal.user_id,
         action=alert_svc.AuditAction.MAILBOX_CONNECTED,
         target_type="mailbox",
+        target_id=mailbox.id,
         detail={"address": mailbox.address, "method": "imap", "host": req.imap_host},
     )
     await session.commit()
     return _mailbox_payload(mailbox)
+
+
+@router.post("/mailboxes/{mailbox_id}/connect/forward")
+async def connect_forward(
+    mailbox_id: UUID, principal: AdminUser, session: Session
+) -> dict:
+    """Mark a mailbox as connected by mail forwarding.
+
+    The customer has set a forwarding rule to their ingest address; this records
+    it so the mailbox reads as covered. Forwarding arrives *post-delivery*, so it
+    is alert-only — it can never quarantine (PRD §4 fn.3) — which is why the
+    protection level lands at Limited. That is the honest ceiling of this path,
+    not a bug.
+    """
+    mailbox = await _mailbox_or_404(session, mailbox_id, principal.tenant_id)
+    mailbox.sources = sorted(
+        set(mailbox.sources or []) | {SourceMechanism.FORWARD_INGEST.value}
+    )
+    mailbox.integration_tier = int(IntegrationTier.FORWARDING)
+    mailbox.last_sync_at = datetime.now(UTC)
+    caps = capabilities_for(frozenset(SourceMechanism(s) for s in mailbox.sources))
+    mailbox.protection_level = protection_level(caps).value
+    mailbox.inactive_detections = inactive_for(caps)
+
+    await alert_svc.record_audit(
+        session,
+        tenant_id=principal.tenant_id,
+        actor_id=principal.user_id,
+        action=alert_svc.AuditAction.MAILBOX_CONNECTED,
+        target_type="mailbox",
+        target_id=mailbox.id,
+        detail={"address": mailbox.address, "method": "forwarding"},
+    )
+    await session.commit()
+    return _mailbox_payload(mailbox)
+
+
+@router.get("/mailboxes/{mailbox_id}/activity")
+async def mailbox_activity(
+    mailbox_id: UUID, actor: ActiveUser, session: Session
+) -> dict:
+    """What has actually happened on this mailbox — so IT can see it is protected,
+    not just wait for an alert. Connection events, coverage, and running counts of
+    messages scanned and alerts raised."""
+    mailbox = await _mailbox_or_404(session, mailbox_id, actor.tenant_id)
+    if actor.is_member and mailbox.address != actor.email:
+        raise HTTPException(404, "mailbox not found")
+
+    events = (
+        (
+            await session.execute(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.tenant_id == actor.tenant_id,
+                    AuditEvent.target_id == mailbox.id,
+                )
+                .order_by(AuditEvent.created_at.desc())
+                .limit(50)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    messages_scanned = (
+        await session.execute(
+            select(func.count()).select_from(Message).where(Message.mailbox_id == mailbox.id)
+        )
+    ).scalar_one()
+    alerts_raised = (
+        await session.execute(
+            select(func.count()).select_from(Alert).where(Alert.mailbox_id == mailbox.id)
+        )
+    ).scalar_one()
+
+    caps = capabilities_for(
+        frozenset(SourceMechanism(s) for s in (mailbox.sources or []) if s)
+    )
+    connected = any(s in _MAIL_SOURCES for s in (mailbox.sources or []))
+    return {
+        "address": mailbox.address,
+        "connected": connected,
+        "protection_level": protection_level(caps).value,
+        "sources": mailbox.sources or [],
+        "inactive_detections": inactive_for(caps),
+        "last_sync_at": mailbox.last_sync_at.isoformat() if mailbox.last_sync_at else None,
+        "messages_scanned": messages_scanned,
+        "alerts_raised": alerts_raised,
+        "events": [
+            {"action": e.action, "at": e.created_at.isoformat(), "detail": e.detail}
+            for e in events
+        ],
+    }
 
 
 @router.delete("/mailboxes/{mailbox_id}")

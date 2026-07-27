@@ -66,8 +66,10 @@ def _add_mailbox(client: TestClient, h: dict, address: str) -> str:
 def test_imap_connect_rejects_a_bad_password(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    h = _session(client, "it@acme.co")
-    mb_id = _add_mailbox(client, h, "ceo@acme.co")
+    # Unique domain per test — the trial ledger is permanent, and only a
+    # first-trial tenant is entitled to add content mailboxes.
+    h = _session(client, "it@imaprej.example", domain="imaprej.example")
+    mb_id = _add_mailbox(client, h, "ceo@imaprej.example")
 
     async def _reject(**_: object) -> broker.ImapVerifyResult:
         return broker.ImapVerifyResult(False, "the server rejected the address or password")
@@ -88,8 +90,8 @@ def test_imap_connect_rejects_a_bad_password(
 def test_imap_connect_succeeds_when_credentials_verify(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    h = _session(client, "it2@acme.co")
-    mb_id = _add_mailbox(client, h, "cfo@acme.co")
+    h = _session(client, "it2@imapok.example", domain="imapok.example")
+    mb_id = _add_mailbox(client, h, "cfo@imapok.example")
 
     async def _ok(**_: object) -> broker.ImapVerifyResult:
         return broker.ImapVerifyResult(True, "signed in")
@@ -107,16 +109,16 @@ def test_imap_connect_succeeds_when_credentials_verify(
 
 # ── Bulk add (issue 3) ────────────────────────────────────────────────────────
 def test_bulk_add_creates_many_and_skips_dupes(client: TestClient) -> None:
-    h = _session(client, "admin@acme.co")
+    h = _session(client, "admin@bulkco.example", domain="bulkco.example")
     out = client.post(
         "/api/v1/mailboxes/bulk",
         json={
             "addresses": [
-                "finance@acme.co",
-                "payroll@acme.co",
-                "finance@acme.co",  # duplicate within the paste
+                "finance@bulkco.example",
+                "payroll@bulkco.example",
+                "finance@bulkco.example",  # duplicate within the paste
                 "not-an-email",  # invalid
-                "  execs@acme.co  ",  # whitespace tolerated
+                "  execs@bulkco.example  ",  # whitespace tolerated
             ],
             "mailbox_class": "protected",
         },
@@ -128,4 +130,4 @@ def test_bulk_add_creates_many_and_skips_dupes(client: TestClient) -> None:
     assert body["skipped_count"] == 2
     listed = client.get("/api/v1/mailboxes", headers=h).json()["mailboxes"]
     addresses = {m["address"] for m in listed}
-    assert {"finance@acme.co", "payroll@acme.co", "execs@acme.co"} <= addresses
+    assert {"finance@bulkco.example", "payroll@bulkco.example", "execs@bulkco.example"} <= addresses

@@ -197,11 +197,13 @@ def test_changing_verified_phone_with_mfa(client: TestClient) -> None:
 
 # ── Mailbox delete no longer 500s on dependent rows ───────────────────────────
 def test_delete_mailbox_with_messages_alerts_and_findings(client: TestClient) -> None:
-    h = _session(client, "it@acme.com")
-    client.post("/api/v1/tenants/bootstrap", json={"name": "Acme", "domain": "acme.com"}, headers=h)
+    h = _session(client, "it@delmb.example")  # unique domain → first-trial, entitled
+    client.post(
+        "/api/v1/tenants/bootstrap", json={"name": "Del", "domain": "delmb.example"}, headers=h
+    )
     mb = client.post(
         "/api/v1/mailboxes",
-        json={"address": "ceo@acme.com", "mailbox_class": "protected", "sources": []},
+        json={"address": "ceo@delmb.example", "mailbox_class": "protected", "sources": []},
         headers=h,
     ).json()
     mid = mb["id"]

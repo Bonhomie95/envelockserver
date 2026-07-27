@@ -58,12 +58,22 @@ def client() -> Iterator[TestClient]:
     _reset_store()
 
 
-def _admin(client: TestClient) -> dict[str, str]:
+_admin_seq = 0
+
+
+def _admin(client: TestClient) -> tuple[dict[str, str], str]:
+    """Returns (auth headers, mailbox address). Each call uses a unique domain so
+    it always gets a first-trial (entitled to add mailboxes) — the trial ledger is
+    permanent and shared across the whole test session."""
+    global _admin_seq
+    _admin_seq += 1
+    domain = f"oauthco{_admin_seq}.example"
+    address = f"pay@{domain}"
     pw = "a-long-enough-passphrase"
-    email = "admin@acme.com"
+    email = f"admin@{domain}"
     client.post(
         "/api/v1/auth/register",
-        json={"email": email, "password": pw, "tenant_name": "Acme"},
+        json={"email": email, "password": pw, "tenant_name": domain},
     )
     login = client.post("/api/v1/auth/login", json={"email": email, "password": pw}).json()
     setup = client.post("/api/v1/auth/mfa/setup", json={"token": login["mfa_token"]}).json()
@@ -78,22 +88,22 @@ def _admin(client: TestClient) -> dict[str, str]:
     # A tenant must exist and own the mailbox.
     client.post(
         "/api/v1/tenants/bootstrap",
-        json={"name": "Acme", "domain": "acme.com"},
+        json={"name": domain, "domain": domain},
         headers=h,
     )
     client.post(
         "/api/v1/mailboxes",
-        json={"address": "pay@acme.com", "mailbox_class": "protected", "sources": []},
+        json={"address": address, "mailbox_class": "protected", "sources": []},
         headers=h,
     )
-    return h
+    return h, address
 
 
 def test_authorize_returns_a_consent_url(client: TestClient, configured_ms: None) -> None:
-    h = _admin(client)
+    h, addr = _admin(client)
     body = client.post(
         "/api/v1/connect/oauth/microsoft/authorize",
-        json={"mailbox_address": "pay@acme.com"},
+        json={"mailbox_address": addr},
         headers=h,
     ).json()
     assert "login.microsoftonline.com" in body["authorize_url"]
@@ -106,10 +116,10 @@ def test_unconfigured_provider_reports_503(client: TestClient) -> None:
     from envelock.config import get_settings
 
     get_settings.cache_clear()
-    h = _admin(client)
+    h, addr = _admin(client)
     r = client.post(
         "/api/v1/connect/oauth/microsoft/authorize",
-        json={"mailbox_address": "pay@acme.com"},
+        json={"mailbox_address": addr},
         headers=h,
     )
     assert r.status_code == 503
@@ -121,10 +131,10 @@ def test_callback_exchanges_code_and_flips_mailbox_to_tier1(
     fake = _FakeTransport()
     oauth.set_default_transport(fake)
     try:
-        h = _admin(client)
+        h, addr = _admin(client)
         auth = client.post(
             "/api/v1/connect/oauth/microsoft/authorize",
-            json={"mailbox_address": "pay@acme.com"},
+            json={"mailbox_address": addr},
             headers=h,
         ).json()
 
@@ -148,7 +158,7 @@ def test_callback_exchanges_code_and_flips_mailbox_to_tier1(
 
 
 def test_callback_rejects_a_forged_state(client: TestClient, configured_ms: None) -> None:
-    _admin(client)
+    _admin(client)  # tenant just needs to exist
     r = client.get(
         "/api/v1/connect/oauth/microsoft/callback",
         params={"code": "x", "state": "forged.state"},
@@ -172,10 +182,10 @@ def test_stored_oauth_token_is_encrypted_at_rest(
     fake = _FakeTransport()
     oauth.set_default_transport(fake)
     try:
-        h = _admin(client)
+        h, addr = _admin(client)
         auth = client.post(
             "/api/v1/connect/oauth/microsoft/authorize",
-            json={"mailbox_address": "pay@acme.com"},
+            json={"mailbox_address": addr},
             headers=h,
         ).json()
         client.get(
