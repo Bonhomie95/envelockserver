@@ -217,6 +217,60 @@ async def current_tenant(principal: CurrentUser, session: Session) -> dict:
     }
 
 
+_SELECTABLE_PLANS = {"guard", "essential", "complete", "solo"}
+
+
+class ChangePlanRequest(BaseModel):
+    plan: str = Field(description="Target subscribed plan")
+
+
+@router.post("/tenant/plan")
+async def change_plan(
+    req: ChangePlanRequest, principal: OwnerUser, session: Session
+) -> dict:
+    """Change the tenant's subscribed plan (upgrade/downgrade).
+
+    Only the owner can change what the company pays for. Moving to any paid tier
+    requires either an active trial or a payment method on file — otherwise we'd
+    be handing out paid protection for free. Downgrading to Guard (free) is always
+    allowed. Real card capture happens in the billing/confirm flow; this records
+    the *chosen* plan, which `current_tenant` then resolves into the effective
+    entitlement (Guard once a trial lapses unpaid).
+    """
+    target = req.plan.strip().lower()
+    if target not in _SELECTABLE_PLANS:
+        raise HTTPException(422, f"unknown plan: {req.plan}")
+
+    tenant = await session.get(Tenant, principal.tenant_id)
+    if tenant is None:
+        raise HTTPException(404, "tenant not found")
+
+    now = datetime.now(UTC)
+    ends = tenant.trial_ends_at
+    if ends is not None and ends.tzinfo is None:
+        ends = ends.replace(tzinfo=UTC)
+    trial_active = bool(ends and ends > now)
+
+    is_paid_target = target not in ("guard",)
+    if is_paid_target and not (trial_active or tenant.payment_method_ok):
+        raise HTTPException(
+            402,
+            "add a payment method to move to a paid plan — your trial has ended",
+        )
+
+    tenant.plan = target
+    await session.commit()
+
+    subscribed_plan = tenant.plan
+    effective_plan = subscribed_plan if (trial_active or tenant.payment_method_ok) else "guard"
+    return {
+        "subscribed_plan": subscribed_plan,
+        "plan": effective_plan,
+        "payment_method_ok": tenant.payment_method_ok,
+        "trial_active": trial_active,
+    }
+
+
 class DeleteTenantRequest(BaseModel):
     password: str = Field(max_length=256)
     mfa_code: str | None = Field(default=None, pattern=r"^\d{6}$")

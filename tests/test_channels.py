@@ -138,6 +138,82 @@ async def test_ingest_rejects_unknown_tenants() -> None:
     assert result.accepted and seen == [b"raw"]
 
 
+@pytest.mark.asyncio
+async def test_forwarding_runner_resolves_tenant_and_runs_pipeline(session, tenant_id) -> None:
+    """The production forwarding glue: an ingest address identifies the tenant,
+    and a forwarded copy runs through the same pipeline as any other channel —
+    learning the vendor, then firing Critical on a bank-detail change."""
+    from sqlalchemy import select as _select
+
+    from envelock.channels.mail.forward_runner import (
+        build_forwarding_ingest,
+        resolve_tenant_by_token,
+    )
+    from envelock.channels.mail.ingest import ingest_address
+    from envelock.db import get_sessionmaker
+    from envelock.models import Alert, Domain, Mailbox, Tenant
+
+    token = "fwdtoken12345678"  # noqa: S105 — ingest token, not a secret
+    session.add(Tenant(id=tenant_id, name="Acme"))
+    await session.flush()
+    session.add(
+        Domain(
+            tenant_id=tenant_id,
+            name="acme.com",
+            registrable_domain="acme.com",
+            verification_token=token,
+        )
+    )
+    session.add(
+        Mailbox(
+            tenant_id=tenant_id,
+            address="pay@acme.com",
+            mailbox_class=MailboxClass.PROTECTED.value,
+            sources=[SourceMechanism.FORWARD_INGEST.value],
+        )
+    )
+    await session.commit()
+
+    # Tenant identification from the private ingest address.
+    assert await resolve_tenant_by_token(token) == tenant_id
+    assert await resolve_tenant_by_token("nope00000000") is None  # noqa: S106
+
+    ingest = build_forwarding_ingest()
+    rcpt = ingest_address(token)
+    assert (await ingest.handle_rcpt(rcpt)).accepted
+    assert not (await ingest.handle_rcpt(ingest_address("unknown0000000"))).accepted
+
+    def _raw(body: str, extra: str = "") -> bytes:
+        return (
+            'From: "Gemini Accounts" <billing@gemini.com>\n'
+            "To: pay@acme.com\n"
+            "Subject: Invoice\n"
+            f"{extra}"
+            f"Content-Type: text/plain\n\n{body}"
+        ).encode()
+
+    # Learn the vendor + their real account over a few forwarded copies.
+    for _ in range(3):
+        await ingest.handle_data(
+            recipient=rcpt,
+            raw=_raw("Invoice attached. Account IBAN GB94BARC10201530093459 unchanged."),
+        )
+    # Then the fraud: a changed account, forwarded in.
+    await ingest.handle_data(
+        recipient=rcpt,
+        raw=_raw(
+            "Our bank account has changed. Remit to IBAN GB33BUKB20201555555555. "
+            "This is urgent, we need it today.",
+            extra="In-Reply-To: <old@gemini.com>\n",
+        ),
+    )
+
+    async with get_sessionmaker()() as check:
+        alerts = (await check.execute(_select(Alert))).scalars().all()
+    critical = [a for a in alerts if a.tier == "critical"]
+    assert critical, "a forwarded bank-change should raise a Critical alert"
+
+
 def test_forwarding_never_quarantines() -> None:
     assert ForwardingProvider().configured is True  # needs no credentials
 

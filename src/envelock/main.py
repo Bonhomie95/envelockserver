@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from envelock.api import auth, billing, channels, governance, health, tenants, v1
+from envelock.api import admin, auth, billing, channels, governance, health, tenants, v1
 from envelock.config import get_settings
 from envelock.detections import (  # noqa: F401  (registers detections)
     content,
@@ -99,7 +99,8 @@ def create_app() -> FastAPI:
     if not settings.is_production:
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=["http://localhost:5173"],
+            # 5173 = tenant web app, 5174 = the super-admin console (separate app).
+            allow_origins=["http://localhost:5173", "http://localhost:5174"],
             # Explicit rather than "*": a wildcard with credentials is a
             # cross-origin credential leak waiting to happen.
             allow_credentials=True,
@@ -115,6 +116,7 @@ def create_app() -> FastAPI:
     app.include_router(governance.router)
     app.include_router(tenants.router)
     app.include_router(channels.router)
+    app.include_router(admin.router)
     return app
 
 

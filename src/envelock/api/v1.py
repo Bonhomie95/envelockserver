@@ -7,6 +7,7 @@ raw message for analysis.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -42,6 +43,7 @@ from envelock.security.limits import (
     valid_domain,
 )
 from envelock.util.domains import registrable_domain
+from envelock.workers.watchers import RdapClient
 
 router = APIRouter(prefix="/api/v1")
 
@@ -126,6 +128,31 @@ class DomainScanRequest(BaseModel):
     observed: list[str] = Field(default_factory=list, max_length=MAX_OBSERVED_DOMAINS)
 
 
+#: Most cost-effective place to spend RDAP lookups: the highest-similarity
+#: candidates are the ones a human would actually be fooled by. Bounded so a
+#: single public scan can never fan out into hundreds of outbound requests.
+_MAX_RDAP_LOOKUPS = 15
+_RDAP_TIMEOUT_S = 3.0
+_rdap = RdapClient()
+
+
+async def _registration_dates(domains: list[str]) -> dict[str, str | None]:
+    """Look up registration dates for a bounded set of candidates concurrently.
+
+    A domain that isn't registered (or whose registry is slow) simply comes back
+    as `None` — the scan still returns, it just can't date that one.
+    """
+    async def _one(d: str) -> tuple[str, str | None]:
+        try:
+            record = await asyncio.wait_for(_rdap.lookup(d), timeout=_RDAP_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 — enrichment is best-effort, incl. timeout
+            return d, None
+        return d, (record or {}).get("registered_at")
+
+    results = await asyncio.gather(*(_one(d) for d in domains))
+    return dict(results)
+
+
 @router.post("/domains/scan")
 async def domain_scan(req: DomainScanRequest) -> dict:
     if not valid_domain(req.domain):
@@ -147,9 +174,30 @@ async def domain_scan(req: DomainScanRequest) -> dict:
                     "similarity": hit.similarity,
                     "tier": hit.tier,
                     "armed": hit.is_armed,
+                    "registered_at": None,
                 }
             )
+
+    # Enrich the strongest candidates with their registration date. A freshly
+    # registered lookalike is the live threat — attackers register just before
+    # they strike — so we surface the date and sort newest-first.
     hits.sort(key=lambda h: h["similarity"], reverse=True)
+    from envelock.config import get_settings
+
+    if get_settings().scan_registration_dates:
+        dates = await _registration_dates(
+            [h["candidate"] for h in hits[:_MAX_RDAP_LOOKUPS]]
+        )
+        for h in hits:
+            h["registered_at"] = dates.get(h["candidate"])
+
+    # Newest registration first; undated (unregistered or not looked up) fall to
+    # the bottom, ordered by similarity so the list still reads sensibly.
+    def _key(h: dict) -> tuple:
+        reg = h["registered_at"]
+        return (1 if reg else 0, reg or "", h["similarity"])
+
+    hits.sort(key=_key, reverse=True)
     return {
         "protected_domain": protected,
         "candidates_checked": len(candidates),

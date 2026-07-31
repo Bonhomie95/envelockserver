@@ -92,6 +92,9 @@ class Settings(BaseSettings):
     czds_password: SecretStr | None = None
     rdap_bootstrap_url: str = "https://rdap.org/"
     nrd_feed_api_key: SecretStr | None = None
+    #: Enrich /domains/scan hits with RDAP registration dates (and sort by them).
+    #: On in production; the suite turns it off so scans stay hermetic.
+    scan_registration_dates: bool = True
 
     # ── Detection cascades (PRD §12.12) ──────────────────────────────────────
     safebrowsing_api_key: SecretStr | None = None
@@ -128,10 +131,20 @@ class Settings(BaseSettings):
     trial_backfill_days: int = 30
     backfill_days: int = 90
 
+    # Public origin of the web app, used to build Stripe Checkout return URLs
+    # (success/cancel). Server-built rather than client-supplied so a caller can't
+    # turn checkout into an open redirect. Defaults to the local dev origin.
+    public_base_url: str = "http://localhost:5173"
+
     # Global payment rails. Stripe is the primary processor (North America and
     # global); the regional acquirers cover markets Stripe serves less well.
     stripe_secret_key: SecretStr | None = None
     stripe_webhook_secret: SecretStr | None = None
+    # Stripe Price IDs (recurring, monthly) for each paid plan. Created once in the
+    # Stripe dashboard; the checkout session references them so pricing lives in
+    # Stripe, not hardcoded in a charge call.
+    stripe_price_essential: str | None = None
+    stripe_price_complete: str | None = None
     adyen_api_key: SecretStr | None = None  # Europe / global enterprise
     adyen_merchant_account: str | None = None
     mercadopago_access_token: SecretStr | None = None  # Latin America
@@ -140,10 +153,21 @@ class Settings(BaseSettings):
     paypal_client_id: str | None = None
     paypal_client_secret: SecretStr | None = None
 
+    # Platform operators who can reach the cross-tenant admin console. A simple
+    # allowlist (comma-separated emails) rather than a self-service flag — super
+    # admin can never be granted through the product itself, only by deployment.
+    superadmin_emails: str = ""
+
     # ── Derived ──────────────────────────────────────────────────────────────
     @property
     def is_production(self) -> bool:
         return self.env == "production"
+
+    @property
+    def superadmin_email_set(self) -> frozenset[str]:
+        return frozenset(
+            e.strip().lower() for e in self.superadmin_emails.split(",") if e.strip()
+        )
 
     @property
     def egress_ip_pool(self) -> list[str]:

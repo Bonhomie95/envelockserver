@@ -163,11 +163,31 @@ def test_same_corporate_domain_joins_one_tenant(client: TestClient) -> None:
     assert me2["role"] == "member"
 
 
-def test_free_mail_users_get_separate_tenants(client: TestClient) -> None:
-    """gmail/outlook/etc. have many unrelated users, so each is its own tenant."""
-    h1 = _session(client, "a@gmail.com")
-    me1 = client.get("/api/v1/auth/me", headers=h1).json()
-    h2 = _session(client, "b@gmail.com")
-    me2 = client.get("/api/v1/auth/me", headers=h2).json()
+@pytest.mark.parametrize(
+    "email",
+    ["a@gmail.com", "b@outlook.com", "c@hotmail.com", "d@yahoo.com", "e@icloud.com"],
+)
+def test_consumer_free_mail_signups_are_rejected(client: TestClient, email: str) -> None:
+    """Envelock protects a company domain, so consumer inboxes can't register.
+    A company on Google Workspace / Microsoft 365 uses its own domain and is
+    unaffected (covered by test_workspace_company_domain_is_allowed)."""
+    r = client.post(
+        "/api/v1/auth/register",
+        json={"email": email, "password": "a-long-enough-passphrase", "tenant_name": "X"},
+    )
+    assert r.status_code == 422
+    assert "work email" in r.json()["detail"].lower()
 
-    assert me1["tenant_id"] != me2["tenant_id"]
+
+def test_workspace_company_domain_is_allowed(client: TestClient) -> None:
+    """A custom company domain — even one hosted on Google Workspace / M365 — is
+    not a consumer domain, so it registers normally."""
+    r = client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "cfo@workspace-customer-uniq.com",
+            "password": "a-long-enough-passphrase",
+            "tenant_name": "Workspace Customer",
+        },
+    )
+    assert r.status_code == 201

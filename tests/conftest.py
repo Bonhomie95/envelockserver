@@ -22,6 +22,8 @@ os.environ.setdefault("ENVELOCK_ENV", "development")
 # No connection pooling in tests: the suite runs many short event loops and a
 # pooled asyncpg connection must never be reused across a different loop.
 os.environ["ENVELOCK_DB_NULLPOOL"] = "true"
+# Keep the domain scan hermetic — no live RDAP calls to date lookalike hits.
+os.environ.setdefault("ENVELOCK_SCAN_REGISTRATION_DATES", "false")
 
 
 @pytest.fixture(scope="session", autouse=True)

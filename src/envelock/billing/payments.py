@@ -56,21 +56,47 @@ class Subscription:
     raw: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class CheckoutSession:
+    """A hosted-checkout redirect. The card form lives on the provider's domain,
+    so raw card data never touches us — the PCI-simplest way to take a card."""
+
+    provider: str
+    id: str
+    url: str
+
+
 # ── Transport (injectable for tests) ─────────────────────────────────────────
 class Transport(Protocol):
     async def request(
-        self, method: str, url: str, *, headers: dict, json: dict | None = None
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict,
+        json: dict | None = None,
+        data: dict | None = None,
     ) -> dict: ...
 
 
 class HttpxTransport:
     async def request(
-        self, method: str, url: str, *, headers: dict, json: dict | None = None
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict,
+        json: dict | None = None,
+        data: dict | None = None,
     ) -> dict:
         import httpx
 
         async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.request(method, url, headers=headers, json=json)
+            # Stripe (and most acquirers) speak form-encoding; `data` takes
+            # precedence when a caller needs it, else fall back to JSON.
+            resp = await client.request(
+                method, url, headers=headers, data=data, json=None if data else json
+            )
         if resp.status_code >= 400:
             raise PaymentError(f"{url} returned {resp.status_code}: {resp.text[:200]}")
         return resp.json()
@@ -156,7 +182,7 @@ class _Stripe:
             "POST",
             "https://api.stripe.com/v1/subscriptions",
             headers=self._headers(),
-            json={
+            data={
                 "customer_email": customer_email,
                 "amount": amount_cents,
                 "currency": currency,
@@ -171,6 +197,70 @@ class _Stripe:
             currency=currency,
             raw=body,
         )
+
+    async def create_checkout_session(
+        self,
+        *,
+        price_id: str,
+        customer_email: str,
+        success_url: str,
+        cancel_url: str,
+        client_reference_id: str,
+        metadata: dict[str, str] | None = None,
+        transport: Transport | None = None,
+    ) -> CheckoutSession:
+        """Create a hosted Stripe Checkout Session in subscription mode.
+
+        Pricing lives in Stripe as a Price object, referenced by id — no amount is
+        passed here, so a price change never needs a redeploy. `metadata` and
+        `client_reference_id` ride through to the webhook so we can attribute the
+        completed payment to the right tenant and plan.
+        """
+        if not self.is_configured():
+            raise PaymentError("Stripe is not configured on this deployment")
+        # Stripe wants form-encoded, nested keys.
+        form: dict[str, str] = {
+            "mode": "subscription",
+            "line_items[0][price]": price_id,
+            "line_items[0][quantity]": "1",
+            "success_url": success_url,
+            "cancel_url": cancel_url,
+            "customer_email": customer_email,
+            "client_reference_id": client_reference_id,
+        }
+        for k, v in (metadata or {}).items():
+            form[f"metadata[{k}]"] = v
+            # Mirror onto the subscription so it's visible after the session expires.
+            form[f"subscription_data[metadata][{k}]"] = v
+        body = await _transport(transport).request(
+            "POST",
+            "https://api.stripe.com/v1/checkout/sessions",
+            headers=self._headers(),
+            data=form,
+        )
+        return CheckoutSession(
+            provider=self.id, id=body.get("id", ""), url=body.get("url", "")
+        )
+
+    async def create_billing_portal_session(
+        self,
+        *,
+        customer_id: str,
+        return_url: str,
+        transport: Transport | None = None,
+    ) -> str:
+        """Open the Stripe-hosted billing portal so the customer can update their
+        card, see invoices, or cancel — self-service, no code from us. Returns the
+        one-time URL to redirect to."""
+        if not self.is_configured():
+            raise PaymentError("Stripe is not configured on this deployment")
+        body = await _transport(transport).request(
+            "POST",
+            "https://api.stripe.com/v1/billing_portal/sessions",
+            headers=self._headers(),
+            data={"customer": customer_id, "return_url": return_url},
+        )
+        return body.get("url", "")
 
 
 # ── Adyen (Europe / global enterprise) ───────────────────────────────────────
@@ -371,8 +461,62 @@ class _Razorpay:
         )
 
 
+# ── Sandbox (development only) ───────────────────────────────────────────────
+@dataclass(frozen=True, slots=True)
+class _Sandbox:
+    """A no-network processor for local development and demos.
+
+    It is *only ever* configured when `env == "development"`, so it can never be
+    selected in staging or production — a real key is required there. It accepts
+    any non-empty reference and derives a stable fingerprint from it, so the
+    domain-trial anti-abuse ledger still behaves exactly as with a real card.
+    """
+
+    id: str = "sandbox"
+
+    def is_configured(self) -> bool:
+        return get_settings().env == "development"
+
+    async def verify_instrument(
+        self, reference: str, *, transport: Transport | None = None
+    ) -> Instrument:
+        if not self.is_configured():  # defence in depth — never live outside dev
+            raise PaymentError("sandbox payments are only available in development")
+        ref = (reference or "").strip()
+        if not ref:
+            raise PaymentError("a card reference is required")
+        import hashlib
+
+        fingerprint = "sbx_" + hashlib.sha256(ref.encode()).hexdigest()[:24]
+        return Instrument(
+            provider=self.id,
+            reference=ref,
+            fingerprint=fingerprint,
+            brand="Sandbox",
+            last4=ref[-4:].rjust(4, "0"),
+        )
+
+    async def create_subscription(
+        self,
+        *,
+        customer_email: str,
+        amount_cents: int,
+        currency: str,
+        interval: str,
+        transport: Transport | None = None,
+    ) -> Subscription:
+        return Subscription(
+            provider=self.id,
+            reference="sub_sandbox",
+            status="active",
+            amount_cents=amount_cents,
+            currency=currency,
+            raw={"sandbox": True, "email": customer_email, "interval": interval},
+        )
+
+
 _PROVIDERS: dict[str, PaymentProvider] = {
-    p.id: p for p in (_Stripe(), _Adyen(), _MercadoPago(), _Razorpay())
+    p.id: p for p in (_Stripe(), _Adyen(), _MercadoPago(), _Razorpay(), _Sandbox())
 }
 
 
@@ -382,3 +526,49 @@ def provider_for(name: str) -> PaymentProvider | None:
 
 def configured_providers() -> list[str]:
     return [pid for pid, p in _PROVIDERS.items() if p.is_configured()]
+
+
+class WebhookError(Exception):
+    """Raised when a webhook signature can't be verified — treat as hostile."""
+
+
+def verify_stripe_webhook(
+    payload: bytes, sig_header: str | None, secret: str, *, tolerance: int = 300
+) -> dict:
+    """Verify a Stripe webhook signature and return the parsed event.
+
+    Implements Stripe's scheme without the SDK: the `Stripe-Signature` header
+    carries `t=<unix>,v1=<hex hmac>`; the signed payload is `"{t}.{raw body}"`
+    HMAC-SHA256'd with the endpoint's signing secret. We constant-time compare and
+    reject stale timestamps, so a replayed or forged event never reaches the
+    handler. Anything unverifiable raises — a payment state change must never be
+    driven by an unauthenticated request.
+    """
+    import hashlib
+    import hmac
+    import json as _json
+    import time
+
+    if not secret:
+        raise WebhookError("no webhook signing secret configured")
+    if not sig_header:
+        raise WebhookError("missing signature header")
+
+    parts = dict(
+        p.split("=", 1) for p in sig_header.split(",") if "=" in p
+    )
+    timestamp, provided = parts.get("t"), parts.get("v1")
+    if not timestamp or not provided:
+        raise WebhookError("malformed signature header")
+    if tolerance and abs(time.time() - int(timestamp)) > tolerance:
+        raise WebhookError("timestamp outside tolerance")
+
+    signed = f"{timestamp}.".encode() + payload
+    expected = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, provided):
+        raise WebhookError("signature mismatch")
+
+    try:
+        return _json.loads(payload)
+    except ValueError as exc:
+        raise WebhookError("invalid JSON payload") from exc

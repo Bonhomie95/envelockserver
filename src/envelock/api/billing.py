@@ -14,8 +14,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,7 +25,7 @@ from envelock.auth.deps import CurrentUser, OwnerUser
 from envelock.billing import payments, trial
 from envelock.config import get_settings
 from envelock.db import get_session
-from envelock.models import DomainTrialLedger, Tenant
+from envelock.models import Domain, DomainTrialLedger, Tenant, User
 from envelock.util.domains import is_free_mail, registrable_domain
 
 router = APIRouter(prefix="/api/v1/billing", tags=["billing"])
@@ -175,3 +176,207 @@ def _to_entry(row: DomainTrialLedger) -> trial.LedgerEntry:
         payment_fingerprint=row.payment_fingerprint,
         override_by=str(row.override_by) if row.override_by else None,
     )
+
+
+# ── Stripe hosted Checkout (the real card flow) ──────────────────────────────
+_PAID_PLANS = {"essential", "complete"}
+
+
+def _price_for(plan: str) -> str | None:
+    s = get_settings()
+    return {"essential": s.stripe_price_essential, "complete": s.stripe_price_complete}.get(plan)
+
+
+async def _primary_domain(session: AsyncSession, tenant_id: UUID) -> str | None:
+    return (
+        await session.execute(
+            select(Domain.registrable_domain)
+            .where(Domain.tenant_id == tenant_id)
+            .order_by(Domain.created_at.asc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+class CheckoutRequest(BaseModel):
+    plan: str = Field(description="essential | complete")
+
+
+@router.post("/checkout")
+async def create_checkout(
+    req: CheckoutRequest, principal: OwnerUser, session: Session
+) -> dict:
+    """Start a hosted Stripe Checkout for a paid plan and return the redirect URL.
+
+    The card is entered on Stripe's own page (no card data touches us). On success
+    Stripe fires `checkout.session.completed` to our webhook, which is what
+    actually flips the plan on — see `stripe_webhook`.
+    """
+    plan = req.plan.strip().lower()
+    if plan not in _PAID_PLANS:
+        raise HTTPException(422, "choose the Essential or Complete plan")
+
+    stripe = payments.provider_for("stripe")
+    if stripe is None or not stripe.is_configured():
+        raise HTTPException(503, "card checkout isn't enabled on this deployment yet")
+    price_id = _price_for(plan)
+    if not price_id:
+        raise HTTPException(503, f"no Stripe price is configured for the {plan} plan")
+
+    user = await session.get(User, principal.user_id)
+    domain = await _primary_domain(session, principal.tenant_id)
+    base = get_settings().public_base_url.rstrip("/")
+    checkout = await stripe.create_checkout_session(
+        price_id=price_id,
+        customer_email=user.email if user else "",
+        # Stripe substitutes the real id into {CHECKOUT_SESSION_ID} on redirect.
+        success_url=f"{base}/billing?status=success&session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{base}/billing?status=cancel",
+        client_reference_id=str(principal.tenant_id),
+        metadata={
+            "tenant_id": str(principal.tenant_id),
+            "plan": plan,
+            "domain": domain or "",
+        },
+    )
+    return {"url": checkout.url, "id": checkout.id}
+
+
+async def _activate_paid_plan(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    plan: str | None,
+    domain: str | None,
+    customer_id: str | None = None,
+) -> bool:
+    """Open the gate and set the plan after a verified payment. Idempotent — Stripe
+    retries webhooks, and setting these fields twice is harmless."""
+    try:
+        tid = UUID(tenant_id)
+    except (ValueError, TypeError):
+        return False
+    tenant = await session.get(Tenant, tid)
+    if tenant is None:
+        return False
+
+    tenant.payment_method_ok = True
+    if plan in _PAID_PLANS:
+        tenant.plan = plan
+    if customer_id and not tenant.stripe_customer_id:
+        tenant.stripe_customer_id = customer_id
+
+    now = datetime.now(UTC)
+    reg = registrable_domain(domain or "")
+    if reg and not is_free_mail(reg):
+        row = await session.get(DomainTrialLedger, reg)
+        if row is None:
+            session.add(
+                DomainTrialLedger(
+                    registrable_domain=reg,
+                    first_trial_at=now,
+                    first_tenant_id=tenant.id,
+                    outcome="active",
+                )
+            )
+    if tenant.trial_started_at is None:
+        tenant.trial_started_at = now
+        tenant.trial_ends_at = now + timedelta(days=get_settings().trial_days)
+
+    await session.commit()
+    return True
+
+
+@router.post("/stripe/webhook")
+async def stripe_webhook(request: Request, session: Session) -> dict:
+    """Stripe's server-to-server confirmation — the source of truth for activation.
+
+    The signature is verified against the endpoint's signing secret before any
+    state changes, so a forged or replayed POST is rejected. Only
+    `checkout.session.completed` activates a plan.
+    """
+    settings = get_settings()
+    secret = (
+        settings.stripe_webhook_secret.get_secret_value()
+        if settings.stripe_webhook_secret
+        else ""
+    )
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature")
+    try:
+        event = payments.verify_stripe_webhook(payload, sig, secret)
+    except payments.WebhookError as exc:
+        raise HTTPException(400, f"webhook verification failed: {exc}") from exc
+
+    etype = event.get("type")
+    obj = (event.get("data") or {}).get("object") or {}
+    meta = obj.get("metadata") or {}
+
+    if etype == "checkout.session.completed":
+        await _activate_paid_plan(
+            session,
+            tenant_id=obj.get("client_reference_id") or meta.get("tenant_id") or "",
+            plan=meta.get("plan"),
+            domain=meta.get("domain"),
+            customer_id=obj.get("customer"),
+        )
+    elif etype == "customer.subscription.deleted":
+        # Subscription ended (canceled or lapsed) → fall back to Guard (free).
+        # Never locked out — Guard keeps domain/brand monitoring on.
+        await _downgrade_to_guard(
+            session,
+            tenant_id=meta.get("tenant_id"),
+            customer_id=obj.get("customer"),
+        )
+
+    return {"received": True}
+
+
+async def _downgrade_to_guard(
+    session: AsyncSession, *, tenant_id: str | None, customer_id: str | None
+) -> bool:
+    """Drop a tenant to Guard when their subscription ends. Idempotent. Finds the
+    tenant by the metadata tenant_id, or failing that by the Stripe customer id."""
+    tenant: Tenant | None = None
+    if tenant_id:
+        try:
+            tenant = await session.get(Tenant, UUID(tenant_id))
+        except (ValueError, TypeError):
+            tenant = None
+    if tenant is None and customer_id:
+        tenant = (
+            await session.execute(
+                select(Tenant).where(Tenant.stripe_customer_id == customer_id)
+            )
+        ).scalar_one_or_none()
+    if tenant is None:
+        return False
+    tenant.plan = "guard"
+    tenant.payment_method_ok = False
+    await session.commit()
+    return True
+
+
+class PortalRequest(BaseModel):
+    return_path: str = Field(default="/billing", max_length=200)
+
+
+@router.post("/portal")
+async def billing_portal(
+    req: PortalRequest, principal: OwnerUser, session: Session
+) -> dict:
+    """Open the Stripe-hosted billing portal for the tenant's customer so they can
+    update the card, view invoices, or cancel — all self-service."""
+    stripe = payments.provider_for("stripe")
+    if stripe is None or not stripe.is_configured():
+        raise HTTPException(503, "billing portal isn't enabled on this deployment")
+    tenant = await session.get(Tenant, principal.tenant_id)
+    if tenant is None or not tenant.stripe_customer_id:
+        raise HTTPException(409, "no billing account yet — add a payment method first")
+    # Only allow returning to an in-app path, never an arbitrary absolute URL.
+    path = req.return_path if req.return_path.startswith("/") else "/billing"
+    base = get_settings().public_base_url.rstrip("/")
+    url = await stripe.create_billing_portal_session(
+        customer_id=tenant.stripe_customer_id, return_url=f"{base}{path}"
+    )
+    return {"url": url}

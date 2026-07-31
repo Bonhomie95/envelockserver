@@ -304,6 +304,24 @@ async def register(req: RegisterRequest, session: Session) -> dict:
             "disposable email addresses are not allowed — use a permanent inbox",
         )
 
+    # Business-only: Envelock protects a company's mail, so it needs a company
+    # domain. Consumer inboxes (Gmail, Outlook.com, Yahoo, iCloud…) have no
+    # domain we can monitor or verify and each holds thousands of unrelated
+    # users. A company on Google Workspace or Microsoft 365 is unaffected — it
+    # signs up with its own domain (acme.com), which is not in this list; only
+    # the free consumer *domains themselves* are refused. Like the disposable
+    # check, this is a policy on the address format, so it leaks no account
+    # existence signal.
+    reg_domain = registrable_domain(email.rsplit("@", 1)[-1] if "@" in email else "")
+    if is_free_mail(reg_domain):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "use your work email — Envelock protects a company domain, so "
+            "consumer inboxes like Gmail or Outlook.com can't be used. If your "
+            "company uses Google Workspace or Microsoft 365, sign up with your "
+            "own company address (you@yourcompany.com).",
+        )
+
     # Identical response whether or not the address exists — a 409 here would
     # turn signup into an account-enumeration endpoint.
     if await _user_by_email(session, email) is None:

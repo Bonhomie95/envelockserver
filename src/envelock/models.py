@@ -49,6 +49,9 @@ class Tenant(Base, UUIDMixin, TimestampMixin):
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     payment_method_ok: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: Stripe Customer id, captured from the first completed Checkout. Lets us open
+    #: the hosted billing portal so a customer can update the card or cancel.
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(64))
 
     domains: Mapped[list[Domain]] = relationship(back_populates="tenant")
 

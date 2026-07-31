@@ -164,6 +164,42 @@ def test_domain_scan_needs_no_integration(client: TestClient) -> None:
     body = client.post("/api/v1/domains/scan", json={"domain": "gemini.com"}).json()
     assert body["protected_domain"] == "gemini.com"
     assert len(body["hits"]) > 0
+    # Every hit carries a registration-date field (null here — dates are disabled
+    # in the suite to stay hermetic; populated live via RDAP).
+    assert all("registered_at" in h for h in body["hits"])
+
+
+def test_domain_scan_sorts_registered_newest_first(client: TestClient, monkeypatch) -> None:
+    """With registration dates present, hits are ordered newest-registered first,
+    and undated candidates fall to the bottom."""
+    from envelock.api import v1
+
+    async def _fake_dates(domains: list[str]) -> dict[str, str | None]:
+        # Give two of them dates, one older, one newer; leave the rest undated.
+        out: dict[str, str | None] = dict.fromkeys(domains)
+        if domains:
+            out[domains[0]] = "2020-01-01T00:00:00Z"  # old
+        if len(domains) > 1:
+            out[domains[1]] = "2024-06-01T00:00:00Z"  # new
+        return out
+
+    from envelock.config import get_settings
+
+    monkeypatch.setattr(v1, "_registration_dates", _fake_dates)
+    monkeypatch.setattr(get_settings(), "scan_registration_dates", True)
+
+    body = client.post("/api/v1/domains/scan", json={"domain": "gemini.com"}).json()
+    dated = [h for h in body["hits"] if h["registered_at"]]
+    assert len(dated) >= 2
+    # Newest first among dated, and dated appear before undated.
+    assert dated[0]["registered_at"] >= dated[1]["registered_at"]
+    first_undated = next(
+        (i for i, h in enumerate(body["hits"]) if not h["registered_at"]), len(body["hits"])
+    )
+    last_dated = max(
+        (i for i, h in enumerate(body["hits"]) if h["registered_at"]), default=-1
+    )
+    assert last_dated < first_undated
 
 
 def test_pricing_matches_prd_worked_examples(client: TestClient) -> None:
@@ -239,6 +275,51 @@ def test_tenant_endpoint_returns_the_registered_domain(client: TestClient) -> No
     body = client.get("/api/v1/tenant", headers=h).json()
     assert body["primary_domain"] == "globex.com"
     assert any(d["registrable_domain"] == "globex.com" for d in body["domains"])
+
+
+def test_owner_can_change_plan_during_trial(client: TestClient) -> None:
+    """During the signup trial an owner can pick any plan — no card required yet."""
+    h = _auth_header(client, email="owner@planco-uniq.com")
+    r = client.post("/api/v1/tenant/plan", json={"plan": "essential"}, headers=h)
+    assert r.status_code == 200
+    assert r.json()["subscribed_plan"] == "essential"
+    assert client.get("/api/v1/tenant", headers=h).json()["subscribed_plan"] == "essential"
+
+
+def test_change_plan_rejects_unknown_plan(client: TestClient) -> None:
+    h = _auth_header(client, email="owner@planco2-uniq.com")
+    r = client.post("/api/v1/tenant/plan", json={"plan": "platinum"}, headers=h)
+    assert r.status_code == 422
+
+
+def test_paid_upgrade_needs_trial_or_card(client: TestClient) -> None:
+    """Once the trial lapses with no card, a paid plan is refused (402); Guard is
+    always allowed."""
+    import asyncio
+    from datetime import UTC, datetime, timedelta
+
+    from envelock.db import get_sessionmaker
+    from envelock.models import Tenant
+
+    email = "owner@planexpired-uniq.com"
+    h = _auth_header(client, email=email)
+    tid = client.get("/api/v1/auth/me", headers=h).json()["tenant_id"]
+
+    async def _expire() -> None:
+        async with get_sessionmaker()() as s:
+            from uuid import UUID
+
+            t = await s.get(Tenant, UUID(tid))
+            t.trial_ends_at = datetime.now(UTC) - timedelta(days=1)
+            t.payment_method_ok = False
+            await s.commit()
+
+    asyncio.run(_expire())
+
+    refused = client.post("/api/v1/tenant/plan", json={"plan": "complete"}, headers=h)
+    assert refused.status_code == 402
+    # Guard (free) is always allowed.
+    assert client.post("/api/v1/tenant/plan", json={"plan": "guard"}, headers=h).status_code == 200
 
 
 def test_bootstrap_rejects_a_company_name_as_domain(client: TestClient) -> None:

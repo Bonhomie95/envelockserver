@@ -24,7 +24,9 @@ class _FakeStripe:
     def __init__(self, fingerprint: str = "fp_reused") -> None:
         self.fingerprint = fingerprint
 
-    async def request(self, method: str, url: str, *, headers: dict, json=None) -> dict:
+    async def request(
+        self, method: str, url: str, *, headers: dict, json=None, data=None
+    ) -> dict:
         if "payment_methods" in url:
             return {
                 "id": "pm_123",
@@ -34,6 +36,10 @@ class _FakeStripe:
                     "last4": "4242",
                 },
             }
+        if "checkout/sessions" in url:
+            return {"id": "cs_test_123", "url": "https://checkout.stripe.com/c/pay/cs_test_123"}
+        if "billing_portal/sessions" in url:
+            return {"url": "https://billing.stripe.com/p/session/test_123"}
         return {"id": "sub_123", "status": "active"}
 
 
@@ -199,7 +205,9 @@ def test_ledger_entry_is_persisted(client: TestClient, configured_stripe: None) 
 class _FakeAcquirer:
     """A regional processor returning a stored-card token as the fingerprint."""
 
-    async def request(self, method: str, url: str, *, headers: dict, json=None) -> dict:
+    async def request(
+        self, method: str, url: str, *, headers: dict, json=None, data=None
+    ) -> dict:
         if "storedPaymentMethods" in url:  # Adyen
             return {"id": "sp_1", "networkToken": "ntok_abc", "brand": "mc", "lastFour": "1111"}
         return {"pspReference": "psp_1", "resultCode": "Authorised"}
@@ -218,8 +226,246 @@ async def test_regional_provider_verifies_through_the_same_interface() -> None:
 
 
 def test_configured_providers_span_the_americas_europe_and_asia() -> None:
-    """The rails are Stripe (North America + global) plus one acquirer each for
-    Europe, Latin America and Asia."""
+    """The real rails are Stripe (North America + global) plus one acquirer each
+    for Europe, Latin America and Asia. A dev-only sandbox rides alongside so the
+    funnel is demonstrable without keys — it is never a real rail."""
     from envelock.billing.payments import _PROVIDERS
 
-    assert set(_PROVIDERS) == {"stripe", "adyen", "mercadopago", "razorpay"}
+    assert {"stripe", "adyen", "mercadopago", "razorpay"} <= set(_PROVIDERS)
+    assert "sandbox" in _PROVIDERS
+
+
+def test_sandbox_provider_is_dev_only_and_verifies(monkeypatch) -> None:
+    """The sandbox is configured only in development and never leaks into a real
+    deployment; when active it yields a stable fingerprint like any real card."""
+    import asyncio
+
+    from envelock.billing.payments import PaymentError, provider_for
+    from envelock.config import get_settings
+
+    sandbox = provider_for("sandbox")
+    assert sandbox is not None
+
+    # Development: configured, and verifies any reference into a stable fingerprint.
+    monkeypatch.setattr(get_settings(), "env", "development")
+    assert sandbox.is_configured() is True
+    inst = asyncio.run(sandbox.verify_instrument("4242424242424242"))
+    assert inst.provider == "sandbox" and inst.fingerprint and inst.last4 == "4242"
+
+    # Production: never configured, and refuses even if called directly.
+    monkeypatch.setattr(get_settings(), "env", "production")
+    assert sandbox.is_configured() is False
+    try:
+        asyncio.run(sandbox.verify_instrument("4242424242424242"))
+        raise AssertionError("sandbox must refuse outside development")
+    except PaymentError:
+        pass
+
+
+# ── Stripe hosted Checkout ───────────────────────────────────────────────────
+def _sign(payload: bytes, secret: str, *, ts: int | None = None) -> str:
+    import hashlib
+    import hmac
+
+    t = str(ts if ts is not None else int(time.time()))
+    sig = hmac.new(secret.encode(), f"{t}.".encode() + payload, hashlib.sha256).hexdigest()
+    return f"t={t},v1={sig}"
+
+
+def test_stripe_checkout_session_returns_redirect_url(
+    client: TestClient, configured_stripe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With Stripe + a Price configured, /billing/checkout returns a hosted URL to
+    redirect to — no card data touches us."""
+    from envelock.config import get_settings
+
+    monkeypatch.setenv("ENVELOCK_STRIPE_PRICE_COMPLETE", "price_complete_x")
+    get_settings.cache_clear()
+    payments.set_default_transport(_FakeStripe())
+    try:
+        h = _owner(client, "owner@checkoutco-uniq.com")
+        r = client.post("/api/v1/billing/checkout", json={"plan": "complete"}, headers=h)
+        assert r.status_code == 200
+        assert r.json()["url"].startswith("https://checkout.stripe.com/")
+    finally:
+        payments.set_default_transport(None)
+        get_settings.cache_clear()
+
+
+def test_checkout_requires_stripe_configured(client: TestClient) -> None:
+    """No Stripe key → the endpoint reports 503 rather than pretending to charge."""
+    h = _owner(client, "owner@nostripe-uniq.com")
+    r = client.post("/api/v1/billing/checkout", json={"plan": "complete"}, headers=h)
+    assert r.status_code == 503
+
+
+def test_webhook_signature_is_verified() -> None:
+    secret = "whsec_test"  # noqa: S105 — test secret
+    payload = b'{"type":"ping"}'
+
+    event = payments.verify_stripe_webhook(payload, _sign(payload, secret), secret)
+    assert event["type"] == "ping"
+
+    # Forged signature and a stale timestamp are both rejected.
+    with pytest.raises(payments.WebhookError):
+        payments.verify_stripe_webhook(payload, "t=1,v1=deadbeef", secret)
+    stale = _sign(payload, secret, ts=int(time.time()) - 10_000)
+    with pytest.raises(payments.WebhookError):
+        payments.verify_stripe_webhook(payload, stale, secret)
+
+
+def test_stripe_webhook_activates_the_plan(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A validly signed checkout.session.completed opens the gate and sets the
+    plan — the webhook is the source of truth for activation."""
+    import json as _json
+
+    from envelock.config import get_settings
+
+    secret = "whsec_test"  # noqa: S105 — test secret
+    monkeypatch.setenv("ENVELOCK_STRIPE_WEBHOOK_SECRET", secret)
+    get_settings.cache_clear()
+    try:
+        h = _owner(client, "owner@webhookco-uniq.com")
+        tid = client.get("/api/v1/auth/me", headers=h).json()["tenant_id"]
+        event = {
+            "type": "checkout.session.completed",
+            "data": {
+                "object": {
+                    "client_reference_id": tid,
+                    "metadata": {
+                        "tenant_id": tid,
+                        "plan": "complete",
+                        "domain": "webhookco-uniq.com",
+                    },
+                }
+            },
+        }
+        payload = _json.dumps(event).encode()
+        r = client.post(
+            "/api/v1/billing/stripe/webhook",
+            content=payload,
+            headers={
+                "Stripe-Signature": _sign(payload, secret),
+                "Content-Type": "application/json",
+            },
+        )
+        assert r.status_code == 200 and r.json()["received"] is True
+
+        tenant = client.get("/api/v1/tenant", headers=h).json()
+        assert tenant["trial"]["payment_method_ok"] is True
+        assert tenant["subscribed_plan"] == "complete"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_stripe_webhook_rejects_a_forged_event(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from envelock.config import get_settings
+
+    monkeypatch.setenv("ENVELOCK_STRIPE_WEBHOOK_SECRET", "whsec_test")
+    get_settings.cache_clear()
+    try:
+        r = client.post(
+            "/api/v1/billing/stripe/webhook",
+            content=b'{"type":"checkout.session.completed"}',
+            headers={"Stripe-Signature": "t=1,v1=deadbeef", "Content-Type": "application/json"},
+        )
+        assert r.status_code == 400
+    finally:
+        get_settings.cache_clear()
+
+
+def _complete_checkout(client: TestClient, h: dict, tid: str, domain: str, secret: str) -> None:
+    import json as _json
+
+    event = {
+        "type": "checkout.session.completed",
+        "data": {
+            "object": {
+                "client_reference_id": tid,
+                "customer": "cus_test_1",
+                "metadata": {"tenant_id": tid, "plan": "complete", "domain": domain},
+            }
+        },
+    }
+    payload = _json.dumps(event).encode()
+    r = client.post(
+        "/api/v1/billing/stripe/webhook",
+        content=payload,
+        headers={"Stripe-Signature": _sign(payload, secret), "Content-Type": "application/json"},
+    )
+    assert r.status_code == 200
+
+
+def test_portal_opens_after_checkout_stores_customer(
+    client: TestClient, configured_stripe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checkout stores the Stripe customer id; the portal then opens against it."""
+    from envelock.config import get_settings
+
+    secret = "whsec_test"  # noqa: S105
+    monkeypatch.setenv("ENVELOCK_STRIPE_WEBHOOK_SECRET", secret)
+    get_settings.cache_clear()
+    payments.set_default_transport(_FakeStripe())
+    try:
+        dom = "portalco-uniq.com"
+        h = _owner(client, f"owner@{dom}")
+        tid = client.get("/api/v1/auth/me", headers=h).json()["tenant_id"]
+
+        # Before any checkout, the portal has no customer to open.
+        assert client.post("/api/v1/billing/portal", json={}, headers=h).status_code == 409
+
+        _complete_checkout(client, h, tid, dom, secret)
+
+        r = client.post("/api/v1/billing/portal", json={}, headers=h)
+        assert r.status_code == 200
+        assert r.json()["url"].startswith("https://billing.stripe.com/")
+    finally:
+        payments.set_default_transport(None)
+        get_settings.cache_clear()
+
+
+def test_subscription_deleted_drops_tenant_to_guard(
+    client: TestClient, configured_stripe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the subscription ends, the tenant falls back to Guard (free), never
+    locked out."""
+    import json as _json
+
+    from envelock.config import get_settings
+
+    secret = "whsec_test"  # noqa: S105
+    monkeypatch.setenv("ENVELOCK_STRIPE_WEBHOOK_SECRET", secret)
+    get_settings.cache_clear()
+    payments.set_default_transport(_FakeStripe())
+    try:
+        dom = "cancelco-uniq.com"
+        h = _owner(client, f"owner@{dom}")
+        tid = client.get("/api/v1/auth/me", headers=h).json()["tenant_id"]
+        _complete_checkout(client, h, tid, dom, secret)
+        assert client.get("/api/v1/tenant", headers=h).json()["subscribed_plan"] == "complete"
+
+        event = {
+            "type": "customer.subscription.deleted",
+            "data": {"object": {"customer": "cus_test_1", "metadata": {"tenant_id": tid}}},
+        }
+        payload = _json.dumps(event).encode()
+        r = client.post(
+            "/api/v1/billing/stripe/webhook",
+            content=payload,
+            headers={
+                "Stripe-Signature": _sign(payload, secret),
+                "Content-Type": "application/json",
+            },
+        )
+        assert r.status_code == 200
+
+        tenant = client.get("/api/v1/tenant", headers=h).json()
+        assert tenant["subscribed_plan"] == "guard"
+        assert tenant["trial"]["payment_method_ok"] is False
+    finally:
+        payments.set_default_transport(None)
+        get_settings.cache_clear()

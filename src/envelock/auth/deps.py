@@ -139,3 +139,34 @@ async def active_actor(
 
 
 ActiveUser = Annotated[Actor, Depends(active_actor)]
+
+
+async def superadmin_actor(
+    principal: Annotated[Principal, Depends(current_principal)],
+) -> Actor:
+    """Platform operator gate for the cross-tenant admin console.
+
+    Membership is an email allowlist set at deployment (`ENVELOCK_SUPERADMIN_EMAILS`)
+    — never grantable through the product — so no in-app role change can escalate
+    to seeing every tenant's data. A valid session whose email isn't on the list
+    gets 404 (not 403): we don't advertise that a super-admin surface exists.
+    """
+    from envelock.config import get_settings
+    from envelock.db import get_sessionmaker
+    from envelock.models import User
+
+    allow = get_settings().superadmin_email_set
+    async with get_sessionmaker()() as session:
+        user = await session.get(User, principal.user_id)
+    if user is None or not allow or user.email.lower() not in allow:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "not found")
+    return Actor(
+        user_id=user.id,
+        tenant_id=user.tenant_id,
+        role=Role(user.role),
+        email=user.email,
+        status=user.status,
+    )
+
+
+SuperAdmin = Annotated[Actor, Depends(superadmin_actor)]
