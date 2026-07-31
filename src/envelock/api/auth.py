@@ -356,8 +356,9 @@ async def register(req: RegisterRequest, session: Session) -> dict:
     return {
         "status": "registration_received",
         "mfa_required": True,
-        "next": "Sign in, then complete MFA setup. MFA is mandatory before this "
-        "account can hold a session.",
+        "next": "Sign in, then set up two-factor authentication. You can skip it "
+        "for now and turn it on later from your dashboard, but it is strongly "
+        "recommended.",
     }
 
 

@@ -241,6 +241,31 @@ def test_tenant_endpoint_returns_the_registered_domain(client: TestClient) -> No
     assert any(d["registrable_domain"] == "globex.com" for d in body["domains"])
 
 
+def test_bootstrap_rejects_a_company_name_as_domain(client: TestClient) -> None:
+    """A company name typed into the domain field ("Acme Corp") reduces to a
+    truthy-but-bogus registrable domain. Storing it would silently break every
+    domain-based lookup and the ingest token, so bootstrap must reject it."""
+    h = _auth_header(client, email="owner@validco.dev")
+    bad = client.post(
+        "/api/v1/tenants/bootstrap",
+        json={"name": "Valid Co", "domain": "Valid Co"},
+        headers=h,
+    )
+    assert bad.status_code == 422
+
+    # No garbage domain was persisted.
+    assert client.get("/api/v1/tenant", headers=h).json()["primary_domain"] is None
+
+    # The real domain still works.
+    ok = client.post(
+        "/api/v1/tenants/bootstrap",
+        json={"name": "Valid Co", "domain": "validco.dev"},
+        headers=h,
+    )
+    assert ok.status_code == 201
+    assert ok.json()["domain"] == "validco.dev"
+
+
 def test_imap_connect_seals_credentials_and_marks_connected(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

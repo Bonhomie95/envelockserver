@@ -73,9 +73,7 @@ def seal(plaintext: bytes, *, aad: bytes | None = None) -> SealedSecret:
     return SealedSecret(ciphertext=ciphertext, wrapped_dek=wrapped, key_id=_key_id())
 
 
-def open_secret(
-    sealed: SealedSecret, *, aad: bytes | None = None
-) -> bytes:
+def open_secret(sealed: SealedSecret, *, aad: bytes | None = None) -> bytes:
     """Unwrap the DEK, then decrypt. Raises `CryptoError` on any tamper."""
     try:
         kek_nonce, wrapped = sealed.wrapped_dek[:12], sealed.wrapped_dek[12:]

@@ -58,6 +58,7 @@ from envelock.platform.remediation import (
     plan_remediation,
 )
 from envelock.security.crypto import seal
+from envelock.security.limits import valid_domain
 from envelock.util.domains import registrable_domain
 
 router = APIRouter(prefix="/api/v1", tags=["tenant"])
@@ -113,6 +114,13 @@ async def bootstrap(req: BootstrapRequest, principal: CurrentUser, session: Sess
         session.add(existing)
         await session.flush()
 
+    # Validate the shape *before* deriving the registrable domain: a company
+    # name like "Acme Corp" reduces to "acme corp", which is truthy but not a
+    # domain. Storing it would silently break every domain-based lookup (MX,
+    # DMARC, Certificate Transparency, lookalikes) and the ingest token for the
+    # whole tenant, with no error anywhere.
+    if not valid_domain(req.domain):
+        raise HTTPException(422, "enter a valid domain, e.g. yourcompany.com")
     reg = registrable_domain(req.domain)
     if not reg:
         raise HTTPException(422, "invalid domain")
