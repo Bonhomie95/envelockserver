@@ -22,6 +22,10 @@ os.environ.setdefault("ENVELOCK_ENV", "development")
 # No connection pooling in tests: the suite runs many short event loops and a
 # pooled asyncpg connection must never be reused across a different loop.
 os.environ["ENVELOCK_DB_NULLPOOL"] = "true"
+# Force the in-memory rate limiter / auth stores in tests, overriding any local
+# .env=redis. Tests reset the in-process state between cases; a shared Redis would
+# leak counters from a dev server (or a prior run) and cause spurious 429s.
+os.environ["ENVELOCK_RATE_LIMIT_BACKEND"] = "memory"
 # Keep the domain scan hermetic — no live RDAP calls to date lookalike hits.
 os.environ.setdefault("ENVELOCK_SCAN_REGISTRATION_DATES", "false")
 

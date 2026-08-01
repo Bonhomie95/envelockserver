@@ -73,8 +73,30 @@ def test_guard_is_owner_only(client: TestClient) -> None:
     assert r.status_code == 402
 
 
-def test_seat_cap_tracks_protected_mailboxes(client: TestClient) -> None:
-    h = _owner(client, "seatco.example")  # entitled (trial active), 0 protected → 0 seats
+def test_member_login_requires_protection_pool(client: TestClient) -> None:
+    """A member login can ONLY be created for someone the company is paying to
+    protect — i.e. an existing protected mailbox. Anyone else is refused."""
+    h = _owner(client, "poolco.example")
+    _add_protected(client, h, "cfo@poolco.example")  # cap 1
+
+    # Not in the protection pool → refused, even though a seat is free.
+    outsider = client.post(
+        "/api/v1/members", json={"email": "random@poolco.example", "role": "member"}, headers=h
+    )
+    assert outsider.status_code == 422
+
+    # A protected mailbox → allowed.
+    ok = client.post(
+        "/api/v1/members", json={"email": "cfo@poolco.example", "role": "member"}, headers=h
+    )
+    assert ok.status_code == 201
+    assert ok.json()["temporary_password"]
+
+
+def test_seat_cap_limits_active_logins(client: TestClient) -> None:
+    """Active non-owner logins can't exceed the number of protected mailboxes,
+    regardless of role."""
+    h = _owner(client, "seatco.example")  # entitled (trial active), 0 protected
 
     # No protected mailboxes yet → no seats.
     blocked = client.post(
@@ -82,26 +104,28 @@ def test_seat_cap_tracks_protected_mailboxes(client: TestClient) -> None:
     )
     assert blocked.status_code == 402
 
-    _add_protected(client, h, "cfo@seatco.example")  # 1 protected → 1 seat
-    ok = client.post(
-        "/api/v1/members", json={"email": "a@seatco.example", "role": "member"}, headers=h
-    )
-    assert ok.status_code == 201
-    assert ok.json()["temporary_password"]
+    _add_protected(client, h, "cfo@seatco.example")  # cap 1
 
-    # Second member exceeds the single seat.
-    full = client.post(
-        "/api/v1/members", json={"email": "b@seatco.example", "role": "member"}, headers=h
+    # The owner spends the single seat on an admin (admins are exempt from the
+    # pool rule but still consume a seat).
+    admin = client.post(
+        "/api/v1/members", json={"email": "ops@seatco.example", "role": "admin"}, headers=h
     )
-    assert full.status_code == 402
+    assert admin.status_code == 201
 
     seats = client.get("/api/v1/members", headers=h).json()["seats"]
     assert seats == {"used": 1, "cap": 1, "entitled": True, "protected_mailboxes": 1}
 
+    # Seat is full → even the valid pool member cfo@ is refused for lack of a seat.
+    full = client.post(
+        "/api/v1/members", json={"email": "cfo@seatco.example", "role": "member"}, headers=h
+    )
+    assert full.status_code == 402
+
 
 def test_provisioned_member_must_change_password_then_signs_in(client: TestClient) -> None:
     h = _owner(client, "provco.example")
-    _add_protected(client, h, "cfo@provco.example")
+    _add_protected(client, h, "member@provco.example")  # the login is for this mailbox
     created = client.post(
         "/api/v1/members",
         json={"email": "member@provco.example", "role": "member"},
@@ -173,11 +197,44 @@ def test_only_owner_can_create_admins(client: TestClient) -> None:
     )
     assert r.status_code == 403  # only the owner mints admins
 
-    # But the admin CAN create a plain member (a seat remains).
+    # But the admin CAN create a plain member for someone in the pool (a seat
+    # remains): ceo@ is a protected mailbox added above.
     ok = client.post(
-        "/api/v1/members", json={"email": "m@adminco.example", "role": "member"}, headers=ah
+        "/api/v1/members", json={"email": "ceo@adminco.example", "role": "member"}, headers=ah
     )
     assert ok.status_code == 201
+
+
+def test_approval_is_gated_by_the_protection_pool(client: TestClient) -> None:
+    """Self-registration can't be a way around the pool: approving a pending
+    colleague is refused until they're a protected mailbox (someone paid for)."""
+    h = _owner(client, "apco.example")
+    _add_protected(client, h, "cfo@apco.example")  # cap 1
+
+    # A colleague self-registers on the company domain → pending member.
+    client.post(
+        "/api/v1/auth/register",
+        json={"email": "bob@apco.example", "password": PW, "tenant_name": "x"},
+    )
+    bob = next(
+        m
+        for m in client.get("/api/v1/members", headers=h).json()["members"]
+        if m["email"] == "bob@apco.example"
+    )
+    assert bob["status"] == "pending"
+
+    # Refused — bob isn't in the protection pool.
+    assert client.post(f"/api/v1/members/{bob['id']}/approve", headers=h).status_code == 422
+
+    # Add bob as a protected mailbox → in the pool, seat available → approval works.
+    _add_protected(client, h, "bob@apco.example")  # cap 2
+    assert client.post(f"/api/v1/members/{bob['id']}/approve", headers=h).status_code == 200
+    active = next(
+        m
+        for m in client.get("/api/v1/members", headers=h).json()["members"]
+        if m["email"] == "bob@apco.example"
+    )
+    assert active["status"] == "active"
 
 
 def _mfa_owner(client: TestClient, domain: str) -> tuple[dict, str]:

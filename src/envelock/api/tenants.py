@@ -25,6 +25,7 @@ from envelock.auth.security import (
     verify_password,
     verify_totp,
 )
+from envelock.billing.pricing import Plan, included_mailbox_seats
 from envelock.channels.mail.ingest import ingest_address, new_ingest_token, onboarding_instructions
 from envelock.core.capabilities import capabilities_for, protection_level
 from envelock.core.enums import IntegrationTier, MailboxClass, SourceMechanism
@@ -94,8 +95,57 @@ def _require_mailbox_entitlement(tenant: Tenant) -> None:
     if not _mailbox_entitled(tenant):
         raise HTTPException(
             status.HTTP_402_PAYMENT_REQUIRED,
-            "your trial has ended — add a payment method to protect mailboxes "
-            "(domain and brand monitoring stay free on Guard)",
+            "add a payment method or upgrade to Essential or Complete to protect "
+            "mailboxes — domain and brand monitoring stay free on Guard",
+        )
+
+
+def _effective_plan(tenant: Tenant) -> str:
+    """Guard once the trial has lapsed unpaid, else the subscribed plan (matches
+    what `current_tenant` reports to the dashboard)."""
+    return tenant.plan if _mailbox_entitled(tenant) else Plan.GUARD.value
+
+
+def _mailbox_capacity(tenant: Tenant) -> int:
+    """How many mailboxes this tenant may protect right now: the plan's included
+    seats plus any purchased, or 0 on Guard (no mailboxes without a paid plan/trial).
+
+    During the trial the tenant sits on the top plan, so the allowance is COMPLETE's
+    (7). A paid Essential tenant gets 5. Extra purchased seats add on top."""
+    plan = _effective_plan(tenant)
+    if plan == Plan.GUARD.value:
+        return 0
+    return included_mailbox_seats(plan) + max(0, tenant.extra_mailbox_seats or 0)
+
+
+async def _mailbox_count(session: AsyncSession, tenant_id: UUID) -> int:
+    return int(
+        (
+            await session.execute(
+                select(func.count()).select_from(Mailbox).where(Mailbox.tenant_id == tenant_id)
+            )
+        ).scalar_one()
+    )
+
+
+async def _require_mailbox_capacity(
+    session: AsyncSession, tenant: Tenant, *, adding: int = 1
+) -> None:
+    """Enforce the plan's mailbox seat cap so a trial or paid tenant can't protect
+    more mailboxes than they're entitled to. Over the cap → 402, and the client
+    routes the admin to upgrade or buy more seats before anything connects."""
+    _require_mailbox_entitlement(tenant)  # Guard / lapsed-unpaid can't add at all.
+    cap = _mailbox_capacity(tenant)
+    used = await _mailbox_count(session, tenant.id)
+    if used + adding > cap:
+        plan = _effective_plan(tenant)
+        need = used + adding - cap
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            f"your {plan.capitalize()} plan covers {cap} mailbox"
+            f"{'' if cap == 1 else 'es'} and {used} are in use. "
+            f"Buy {need} more seat{'' if need == 1 else 's'} (or upgrade) before "
+            "adding another mailbox.",
         )
 
 
@@ -189,12 +239,21 @@ async def current_tenant(principal: CurrentUser, session: Session) -> dict:
     # file); when the trial lapses unpaid, the tenant is relegated to Guard (free)
     # rather than losing access entirely (PRD §12.3 — Guard is free forever).
     effective_plan = subscribed_plan if (trial_active or paid) else "guard"
+    mailbox_used = await _mailbox_count(session, principal.tenant_id) if tenant else 0
+    mailbox_capacity = _mailbox_capacity(tenant) if tenant else 0
     return {
         "tenant_id": str(principal.tenant_id),
         "name": tenant.name if tenant else None,
         "plan": effective_plan,
         "subscribed_plan": subscribed_plan,
         "trial_ended": bool(ends and not trial_active and not paid),
+        "mailboxes": {
+            "used": mailbox_used,
+            "capacity": mailbox_capacity,
+            "included": included_mailbox_seats(effective_plan),
+            "extra_seats": tenant.extra_mailbox_seats if tenant else 0,
+            "can_add": mailbox_used < mailbox_capacity,
+        },
         "trial": {
             "started_at": tenant.trial_started_at.isoformat()
             if tenant and tenant.trial_started_at
@@ -351,7 +410,18 @@ def _mailbox_payload(m: Mailbox) -> dict:
 @router.post("/mailboxes", status_code=201)
 async def add_mailbox(req: MailboxRequest, principal: AdminUser, session: Session) -> dict:
     tenant = await _tenant_or_404(session, principal.tenant_id)
-    _require_mailbox_entitlement(tenant)
+    # Don't charge a seat for a mailbox we already have (idempotent re-add).
+    existing = (
+        await session.execute(
+            select(Mailbox).where(
+                Mailbox.tenant_id == principal.tenant_id,
+                func.lower(Mailbox.address) == req.address.lower(),
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return _mailbox_payload(existing)  # idempotent — no new seat charged
+    await _require_mailbox_capacity(session, tenant, adding=1)
     caps = capabilities_for(frozenset(req.sources))
     mailbox = Mailbox(
         tenant_id=principal.tenant_id,
@@ -406,8 +476,13 @@ async def add_mailboxes_bulk(
     level = protection_level(caps).value
     inactive = inactive_for(caps)
 
+    # Only add up to the plan's remaining seats; the rest are reported so the admin
+    # can buy more seats rather than silently getting free protection.
+    remaining = max(0, _mailbox_capacity(tenant) - len(existing))
+
     created: list[Mailbox] = []
     skipped: list[dict] = []
+    over_limit = 0
     seen: set[str] = set()
     for raw in req.addresses:
         addr = raw.strip().lower()
@@ -419,6 +494,11 @@ async def add_mailboxes_bulk(
         if addr in existing or addr in seen:
             skipped.append({"address": addr, "reason": "already added"})
             continue
+        if remaining <= 0:
+            over_limit += 1
+            skipped.append({"address": addr, "reason": "no seat available — buy more seats"})
+            continue
+        remaining -= 1
         seen.add(addr)
         mailbox = Mailbox(
             tenant_id=principal.tenant_id,
@@ -446,6 +526,9 @@ async def add_mailboxes_bulk(
         "skipped": skipped,
         "created_count": len(created),
         "skipped_count": len(skipped),
+        # >0 means the paste exceeded the plan's seats — the client prompts to buy.
+        "over_limit_count": over_limit,
+        "capacity": _mailbox_capacity(tenant),
     }
 
 
@@ -712,16 +795,75 @@ async def _seat_usage(session: AsyncSession, tenant: Tenant) -> dict:
             )
         )
     ).scalar_one()
+    # A seat is consumed by an ACTIVE login. Pending join-requests don't burn a
+    # paid seat — the seat is spent only when an admin actually grants access.
     team_used = (
         await session.execute(
             select(func.count())
             .select_from(User)
-            .where(User.tenant_id == tenant.id, User.role != Role.OWNER.value)
+            .where(
+                User.tenant_id == tenant.id,
+                User.role != Role.OWNER.value,
+                User.status == "active",
+            )
         )
     ).scalar_one()
     entitled = _mailbox_entitled(tenant)
     cap = protected if entitled else 0
     return {"used": team_used, "cap": cap, "entitled": entitled, "protected_mailboxes": protected}
+
+
+async def _is_protected_mailbox(session: AsyncSession, tenant_id: UUID, email: str) -> bool:
+    """Is this address one of the tenant's protected mailboxes — i.e. someone they
+    are actually paying to protect?"""
+    return bool(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(Mailbox)
+                .where(
+                    Mailbox.tenant_id == tenant_id,
+                    func.lower(Mailbox.address) == email.lower(),
+                    Mailbox.mailbox_class == MailboxClass.PROTECTED.value,
+                )
+            )
+        ).scalar_one()
+    )
+
+
+async def _assert_can_grant_login(
+    session: AsyncSession, tenant: Tenant, *, email: str, role: str
+) -> None:
+    """Gate for granting a team login — used on both create and approve.
+
+    Two independent limits, so an admin can only give access to people the company
+    is paying for:
+      1. **Seats** — active logins can't exceed the number of protected mailboxes.
+      2. **Protection pool** — a *member* login must be one of those protected
+         mailboxes. (Admins are the company's own overseers and only the owner can
+         mint them, so they're exempt from the pool check but still cost a seat.)
+    """
+    seats = await _seat_usage(session, tenant)
+    if not seats["entitled"]:
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            "team logins need an active trial or paid plan — Guard is owner-only",
+        )
+    if seats["used"] >= seats["cap"]:
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            f"all {seats['cap']} paid seat{'' if seats['cap'] == 1 else 's'} are in "
+            "use — add a protected mailbox to open another login",
+        )
+    if role == Role.MEMBER.value and not await _is_protected_mailbox(
+        session, tenant.id, email
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{email} isn't a protected mailbox in your account. Add it as a "
+            "protected mailbox first — team logins are only for people you are "
+            "paying to protect.",
+        )
 
 
 class CreateMemberRequest(BaseModel):
@@ -749,18 +891,7 @@ async def create_member(
     if (await session.execute(select(User).where(User.email == email))).scalar_one_or_none():
         raise HTTPException(status.HTTP_409_CONFLICT, "a user with this email already exists")
 
-    seats = await _seat_usage(session, tenant)
-    if seats["used"] >= seats["cap"]:
-        if not seats["entitled"]:
-            raise HTTPException(
-                status.HTTP_402_PAYMENT_REQUIRED,
-                "team logins need an active trial or paid plan — Guard is owner-only",
-            )
-        raise HTTPException(
-            status.HTTP_402_PAYMENT_REQUIRED,
-            f"all {seats['cap']} team seats are in use — add a protected mailbox to "
-            "add another login",
-        )
+    await _assert_can_grant_login(session, tenant, email=email, role=req.role)
 
     temp_password = secrets.token_urlsafe(12)
     user = User(
@@ -836,8 +967,14 @@ async def _member_or_404(session: AsyncSession, user_id: UUID, tenant_id: UUID) 
 
 @router.post("/members/{user_id}/approve")
 async def approve_member(user_id: UUID, principal: AdminUser, session: Session) -> dict:
-    """Grant a pending colleague access to the workspace."""
+    """Grant a pending colleague access to the workspace.
+
+    Approval is the moment a seat is actually spent, so the same limits as
+    creating a login apply here — otherwise self-registration would be a way
+    around the seat cap and the protection pool."""
     user = await _member_or_404(session, user_id, principal.tenant_id)
+    tenant = await _tenant_or_404(session, principal.tenant_id)
+    await _assert_can_grant_login(session, tenant, email=user.email, role=user.role)
     user.status = "active"
     await alert_svc.record_audit(
         session,

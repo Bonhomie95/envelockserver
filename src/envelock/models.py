@@ -52,6 +52,9 @@ class Tenant(Base, UUIDMixin, TimestampMixin):
     #: Stripe Customer id, captured from the first completed Checkout. Lets us open
     #: the hosted billing portal so a customer can update the card or cancel.
     stripe_customer_id: Mapped[str | None] = mapped_column(String(64))
+    #: Mailbox seats bought on top of the plan's included allowance. Capacity is
+    #: `plan seats + this`; each protected mailbox beyond the allowance needs one.
+    extra_mailbox_seats: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     domains: Mapped[list[Domain]] = relationship(back_populates="tenant")
 

@@ -48,6 +48,24 @@ PLATFORM_CENTS: dict[Plan, int] = {
     Plan.SOLO: 0,
 }
 
+#: Mailbox seats included with each plan — the number of mailboxes a tenant may
+#: protect before buying more. Guard protects domains only (no mailboxes). During
+#: the trial the tenant sits on the top plan, so the trial allowance is COMPLETE's.
+#: Additional seats can be purchased on top (Tenant.extra_mailbox_seats).
+PLAN_MAILBOX_SEATS: dict[Plan, int] = {
+    Plan.GUARD: 0,
+    Plan.SOLO: 1,
+    Plan.ESSENTIAL: 5,
+    Plan.COMPLETE: 7,
+}
+
+
+def included_mailbox_seats(plan: str) -> int:
+    try:
+        return PLAN_MAILBOX_SEATS[Plan(plan)]
+    except (ValueError, KeyError):
+        return 0
+
 #: Additional mail-carrying domains cost half. Defensive/parked domains are free
 #: and unlimited — monitoring one costs a daily DNS lookup.
 ADDITIONAL_DOMAIN_RATE = 0.5
