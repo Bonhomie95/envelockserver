@@ -205,6 +205,23 @@ def test_only_owner_can_create_admins(client: TestClient) -> None:
     assert ok.status_code == 201
 
 
+def test_login_must_be_on_the_company_domain(client: TestClient) -> None:
+    """An admin can only create logins on their own registered domain — never for
+    an outside address, whatever the role."""
+    h = _owner(client, "domco.example")
+    _add_protected(client, h, "cfo@domco.example")
+
+    ext = client.post(
+        "/api/v1/members", json={"email": "hacker@evil.com", "role": "admin"}, headers=h
+    )
+    assert ext.status_code == 422  # outside the company domain
+
+    ok = client.post(
+        "/api/v1/members", json={"email": "it@domco.example", "role": "admin"}, headers=h
+    )
+    assert ok.status_code == 201
+
+
 def test_approval_is_gated_by_the_protection_pool(client: TestClient) -> None:
     """Self-registration can't be a way around the pool: approving a pending
     colleague is refused until they're a protected mailbox (someone paid for)."""

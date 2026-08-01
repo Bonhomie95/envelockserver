@@ -215,6 +215,11 @@ class MailboxCredential(Base, UUIDMixin, TimestampMixin):
     kind: Mapped[str] = mapped_column(String(16))  # imap_password|oauth_token
     imap_host: Mapped[str | None] = mapped_column(String(253))
     imap_port: Mapped[int | None] = mapped_column(Integer)
+    #: Transport security for the IMAP connection: "ssl" (implicit TLS, usual 993),
+    #: "starttls" (upgrade on 143), or "none" (plain — discouraged).
+    imap_security: Mapped[str | None] = mapped_column(String(16), default="ssl")
+    #: Login username when it differs from the mailbox address (some providers).
+    imap_username: Mapped[str | None] = mapped_column(String(320))
     #: Ciphertext only. Never logged, never returned by the API.
     ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
     wrapped_dek: Mapped[bytes] = mapped_column(LargeBinary)

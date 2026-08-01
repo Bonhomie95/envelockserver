@@ -563,6 +563,11 @@ async def _mailbox_or_404(session: AsyncSession, mailbox_id: UUID, tenant_id: UU
 class ImapConnectRequest(BaseModel):
     imap_host: str = Field(min_length=3, max_length=253)
     imap_port: int = Field(default=993, ge=1, le=65535)
+    #: Transport security — we don't assume 993/implicit-TLS, since many ISP servers
+    #: use STARTTLS on 143. "ssl" | "starttls" | "none".
+    security: Literal["ssl", "starttls", "none"] = "ssl"
+    #: Login username, when it isn't the mailbox address (some providers).
+    username: str | None = Field(default=None, max_length=320)
     #: The mailbox password, or (preferred) an app-specific password. Sealed with
     #: envelope encryption and never returned or logged (PRD §5.2).
     password: str = Field(min_length=1, max_length=1024)
@@ -583,11 +588,14 @@ async def connect_imap(
     # wrong password (then silently ingesting nothing) is worse than an error.
     from envelock.channels.mail import broker
 
+    host = req.imap_host.strip().lower()
+    login_user = (req.username or mailbox.address).strip()
     check = await broker.verify_imap_credentials(
-        host=req.imap_host.strip().lower(),
+        host=host,
         port=req.imap_port,
-        username=mailbox.address,
+        username=login_user,
         password=req.password,
+        security=req.security,
     )
     if not check.ok:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"could not connect — {check.reason}")
@@ -604,8 +612,10 @@ async def connect_imap(
                 mailbox_id=mailbox.id,
                 tenant_id=principal.tenant_id,
                 kind="imap_password",
-                imap_host=req.imap_host.strip().lower(),
+                imap_host=host,
                 imap_port=req.imap_port,
+                imap_security=req.security,
+                imap_username=req.username.strip() if req.username else None,
                 ciphertext=sealed.ciphertext,
                 wrapped_dek=sealed.wrapped_dek,
                 key_id=sealed.key_id,
@@ -613,8 +623,10 @@ async def connect_imap(
         )
     else:
         existing.kind = "imap_password"
-        existing.imap_host = req.imap_host.strip().lower()
+        existing.imap_host = host
         existing.imap_port = req.imap_port
+        existing.imap_security = req.security
+        existing.imap_username = req.username.strip() if req.username else None
         existing.ciphertext = sealed.ciphertext
         existing.wrapped_dek = sealed.wrapped_dek
         existing.key_id = sealed.key_id
@@ -836,13 +848,32 @@ async def _assert_can_grant_login(
 ) -> None:
     """Gate for granting a team login — used on both create and approve.
 
-    Two independent limits, so an admin can only give access to people the company
-    is paying for:
+    Three independent limits, so an admin can only give access to their own
+    company's people, and only those the company is paying for:
+      0. **Company domain** — the email must be on one of the tenant's registered
+         domains. An admin can never create a login for an outside address.
       1. **Seats** — active logins can't exceed the number of protected mailboxes.
       2. **Protection pool** — a *member* login must be one of those protected
          mailboxes. (Admins are the company's own overseers and only the owner can
          mint them, so they're exempt from the pool check but still cost a seat.)
     """
+    # 0. Must be on one of the company's own domains.
+    reg = registrable_domain(email.rsplit("@", 1)[-1] if "@" in email else "")
+    domains = {
+        d
+        for (d,) in (
+            await session.execute(
+                select(Domain.registrable_domain).where(Domain.tenant_id == tenant.id)
+            )
+        ).all()
+    }
+    if domains and reg not in domains:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{email} isn't on your company's domain "
+            f"({', '.join(sorted(domains))}). Team logins must use a company address.",
+        )
+
     seats = await _seat_usage(session, tenant)
     if not seats["entitled"]:
         raise HTTPException(

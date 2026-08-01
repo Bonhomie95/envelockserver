@@ -110,6 +110,9 @@ _RUNTIME_COLUMNS: tuple[str, ...] = (
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS stripe_customer_id varchar(64)",
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS "
     "extra_mailbox_seats integer NOT NULL DEFAULT 0",
+    "ALTER TABLE mailbox_credentials ADD COLUMN IF NOT EXISTS "
+    "imap_security varchar(16) DEFAULT 'ssl'",
+    "ALTER TABLE mailbox_credentials ADD COLUMN IF NOT EXISTS imap_username varchar(320)",
 )
 
 

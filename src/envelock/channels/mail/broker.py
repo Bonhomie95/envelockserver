@@ -259,41 +259,59 @@ class ImapVerifyResult:
 
 
 async def verify_imap_credentials(
-    *, host: str, port: int, username: str, password: str, timeout: float = 12.0  # noqa: ASYNC109
+    *,
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    security: str = "ssl",
+    timeout: float = 12.0,  # noqa: ASYNC109
 ) -> ImapVerifyResult:
     """Prove the mailbox credentials actually work before we store them.
 
-    Connecting a mailbox must fail loudly on a wrong address/password rather than
-    reporting success and then silently ingesting nothing. We open a real TLS
-    IMAP session, attempt LOGIN, and immediately log out — we read no mail here.
+    We honour the caller's transport choice rather than assuming implicit TLS on
+    993 — that assumption is why some ISPs wouldn't connect:
+      * ``ssl``      — implicit TLS (usually port 993).
+      * ``starttls`` — connect plain (usually 143), then upgrade to TLS.
+      * ``none``     — plain, no TLS (discouraged; some legacy/internal servers).
 
-    An auth rejection and an unreachable host are both failures (either way we
-    cannot ingest), with a message specific enough for the user to fix it.
+    Runs the one-shot login on the stdlib IMAP client in a thread (it supports
+    STARTTLS, which aioimaplib does not) — we attempt LOGIN and log straight out,
+    reading no mail. An auth rejection and an unreachable/misconfigured host are
+    both failures, with a message specific enough for the user to fix it.
     """
-    import aioimaplib
+    import imaplib
 
-    client = aioimaplib.IMAP4_SSL(host=host, port=port, timeout=timeout)
-    try:
-        await asyncio.wait_for(client.wait_hello_from_server(), timeout=timeout)
-        response = await asyncio.wait_for(
-            client.login(username, password), timeout=timeout
-        )
-    except TimeoutError:
-        return ImapVerifyResult(
-            False, "the IMAP server did not respond — check the host and port"
-        )
-    except Exception:  # noqa: BLE001 — any connect/TLS failure is a connect failure
-        return ImapVerifyResult(
-            False, "could not reach the IMAP server — check the host and port"
-        )
-    finally:
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(client.logout(), timeout=timeout)
+    def _check() -> tuple[bool, str]:
+        try:
+            if security == "ssl":
+                client: imaplib.IMAP4 = imaplib.IMAP4_SSL(host, port, timeout=timeout)
+            else:
+                client = imaplib.IMAP4(host, port, timeout=timeout)
+                if security == "starttls":
+                    client.starttls()
+            try:
+                typ, _ = client.login(username, password)
+            finally:
+                with contextlib.suppress(Exception):
+                    client.logout()
+            return (typ == "OK", "ok")
+        except imaplib.IMAP4.error:
+            return (False, "auth")  # server reachable, credentials rejected
+        except Exception:  # noqa: BLE001 — any socket/TLS/DNS failure is a connect failure
+            return (False, "conn")
 
-    if response.result == "OK":
+    ok, kind = await asyncio.to_thread(_check)
+    if ok:
         return ImapVerifyResult(True, "signed in")
+    if kind == "auth":
+        return ImapVerifyResult(
+            False,
+            "the server rejected the username or password — use an app-specific "
+            "password if your provider requires one",
+        )
     return ImapVerifyResult(
         False,
-        "the server rejected the address or password — use an app-specific "
-        "password if your provider requires one",
+        "could not reach the IMAP server — check the server, port and the "
+        "SSL/TLS setting",
     )

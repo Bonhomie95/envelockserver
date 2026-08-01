@@ -402,6 +402,69 @@ def test_imap_connect_seals_credentials_and_marks_connected(
     assert b"s3cret-app-pw" not in cred.ciphertext  # sealed, not plaintext
 
 
+def test_imap_connect_honours_security_mode_and_username(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The connect form's SSL/TLS choice, custom port and login username reach the
+    verifier and are stored — we don't assume 993/implicit-TLS/address-as-username."""
+    import asyncio
+
+    from sqlalchemy import select
+
+    from envelock.channels.mail import broker
+    from envelock.db import get_sessionmaker
+    from envelock.models import MailboxCredential
+
+    seen: dict = {}
+
+    async def _capture(**kw: object) -> broker.ImapVerifyResult:
+        seen.update(kw)
+        return broker.ImapVerifyResult(True, "signed in")
+
+    monkeypatch.setattr(broker, "verify_imap_credentials", _capture)
+
+    h = _auth_header(client, email="admin@ispmail.dev")
+    client.post(
+        "/api/v1/tenants/bootstrap",
+        json={"name": "ISP", "domain": "ispmail.dev"},
+        headers=h,
+    )
+    mb = client.post(
+        "/api/v1/mailboxes",
+        json={"address": "ap@ispmail.dev", "mailbox_class": "protected", "sources": []},
+        headers=h,
+    ).json()
+
+    out = client.post(
+        f"/api/v1/mailboxes/{mb['id']}/connect/imap",
+        json={
+            "imap_host": "mail.ispmail.dev",
+            "imap_port": 143,
+            "security": "starttls",
+            "username": "ap.login",
+            "password": "app-pw",
+        },
+        headers=h,
+    )
+    assert out.status_code == 200
+    # The verifier saw the chosen transport + explicit username, not defaults.
+    assert seen["security"] == "starttls" and seen["port"] == 143
+    assert seen["username"] == "ap.login"
+
+    async def _read() -> MailboxCredential | None:
+        async with get_sessionmaker()() as s:
+            return (
+                await s.execute(
+                    select(MailboxCredential).order_by(MailboxCredential.created_at.desc())
+                )
+            ).scalars().first()
+
+    cred = asyncio.run(_read())
+    assert cred is not None
+    assert cred.imap_security == "starttls" and cred.imap_port == 143
+    assert cred.imap_username == "ap.login"
+
+
 def test_remove_mailbox(client: TestClient) -> None:
     h = _auth_header(client, email="admin@removeco.dev")
     client.post(
