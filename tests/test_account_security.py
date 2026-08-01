@@ -48,17 +48,28 @@ def _session(client: TestClient, email: str, *, with_mfa: bool = False) -> dict:
     return {"Authorization": f"Bearer {skip['access_token']}"}
 
 
-# ── Sensitive changes require MFA to be enabled ───────────────────────────────
-def test_password_change_requires_mfa_enabled(client: TestClient) -> None:
-    """A user who deferred MFA cannot change the password until they enrol — the
-    account keys are gated behind a second factor even though basic use is not."""
+# ── Sensitive changes: MFA adds a code, its absence doesn't block ─────────────
+def test_password_change_without_mfa_uses_password_only(client: TestClient) -> None:
+    """A user who deferred MFA can still change their password with just the
+    current password — demanding a code they don't have was the "password won't
+    change" dead end. The current password is still verified."""
     h = _session(client, "nomfa@acme.com")  # MFA skipped at sign-up
-    r = client.post(
+
+    # Wrong current password → refused.
+    bad = client.post(
+        "/api/v1/auth/password",
+        json={"current_password": "not-the-password", "new_password": "a-brand-new-passphrase-9"},
+        headers=h,
+    )
+    assert bad.status_code == 401
+
+    # Correct current password → changed, no code required.
+    ok = client.post(
         "/api/v1/auth/password",
         json={"current_password": PW, "new_password": "a-brand-new-passphrase-9"},
         headers=h,
     )
-    assert r.status_code == 403  # "turn on two-factor first"
+    assert ok.status_code == 200
 
 
 def _step_code(secret: str) -> str:
