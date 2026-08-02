@@ -573,6 +573,26 @@ class ImapConnectRequest(BaseModel):
     password: str = Field(min_length=1, max_length=1024)
 
 
+@router.post("/mailboxes/{mailbox_id}/connect/imap/test")
+async def test_imap(
+    mailbox_id: UUID, req: ImapConnectRequest, principal: AdminUser, session: Session
+) -> dict:
+    """Verify the IMAP server/port/security/username/password without storing
+    anything — the connect form's "Test connection" button. Same tenant scoping
+    as the real connect, so it can't probe another tenant's mailbox."""
+    mailbox = await _mailbox_or_404(session, mailbox_id, principal.tenant_id)
+    from envelock.channels.mail import broker
+
+    check = await broker.verify_imap_credentials(
+        host=req.imap_host.strip().lower(),
+        port=req.imap_port,
+        username=(req.username or mailbox.address).strip(),
+        password=req.password,
+        security=req.security,
+    )
+    return {"ok": check.ok, "reason": check.reason}
+
+
 @router.post("/mailboxes/{mailbox_id}/connect/imap")
 async def connect_imap(
     mailbox_id: UUID, req: ImapConnectRequest, principal: AdminUser, session: Session

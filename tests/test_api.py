@@ -465,6 +465,50 @@ def test_imap_connect_honours_security_mode_and_username(
     assert cred.imap_username == "ap.login"
 
 
+def test_imap_test_endpoint_verifies_without_storing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 'Test connection' button verifies the settings but stores nothing."""
+    import asyncio
+
+    from sqlalchemy import func, select
+
+    from envelock.channels.mail import broker
+    from envelock.db import get_sessionmaker
+    from envelock.models import MailboxCredential
+
+    async def _reject(**_: object) -> broker.ImapVerifyResult:
+        return broker.ImapVerifyResult(False, "the server rejected the password")
+
+    monkeypatch.setattr(broker, "verify_imap_credentials", _reject)
+
+    h = _auth_header(client, email="admin@testconn.dev")
+    client.post(
+        "/api/v1/tenants/bootstrap", json={"name": "TC", "domain": "testconn.dev"}, headers=h
+    )
+    mb = client.post(
+        "/api/v1/mailboxes",
+        json={"address": "cfo@testconn.dev", "mailbox_class": "protected", "sources": []},
+        headers=h,
+    ).json()
+
+    r = client.post(
+        f"/api/v1/mailboxes/{mb['id']}/connect/imap/test",
+        json={"imap_host": "imap.testconn.dev", "imap_port": 993, "password": "x"},
+        headers=h,
+    )
+    assert r.status_code == 200
+    assert r.json()["ok"] is False and "rejected" in r.json()["reason"]
+
+    async def _cred_count() -> int:
+        async with get_sessionmaker()() as s:
+            return int(
+                (await s.execute(select(func.count()).select_from(MailboxCredential))).scalar_one()
+            )
+
+    assert asyncio.run(_cred_count()) == 0  # nothing persisted by a test
+
+
 def test_remove_mailbox(client: TestClient) -> None:
     h = _auth_header(client, email="admin@removeco.dev")
     client.post(
