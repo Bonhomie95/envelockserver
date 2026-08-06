@@ -43,6 +43,22 @@ logger = logging.getLogger("envelock.imap")
 
 _IMAP_SOURCES = {SourceMechanism.IMAP_IDLE.value, SourceMechanism.IMAP_POLL.value}
 
+#: Last poll cycle's outcome, surfaced at GET /status/channels so a stalled or
+#: erroring worker is visible in the dashboard rather than only in logs.
+_LAST_CYCLE: dict = {
+    "ran_at": None,
+    "mailboxes": 0,
+    "fetched": 0,
+    "alerted": 0,
+    "quarantined": 0,
+    "errors": 0,
+}
+
+
+def worker_health() -> dict:
+    """Health snapshot of the live IMAP worker for the ops status endpoint."""
+    return dict(_LAST_CYCLE)
+
 
 async def _owned_domains(session: AsyncSession, tenant_id: UUID) -> frozenset[str]:
     rows = (
@@ -246,6 +262,7 @@ async def run_imap_poll_cycle(*, client_factory=None) -> dict:  # noqa: ANN001
             totals["quarantined"] += summary.get("quarantined", 0)
         else:
             totals["errors"] += 1
+    _LAST_CYCLE.update(totals, ran_at=datetime.now(UTC).isoformat())
     return totals
 
 

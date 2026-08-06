@@ -49,6 +49,10 @@ class PipelineResult:
     protection_level: str
     inactive_detections: list[str]
     latency_seconds: float
+    #: The message was already ingested (same rfc_message_id on this mailbox) and
+    #: was skipped — no re-analysis, no duplicate alert. The two live sources
+    #: (IMAP poll + a forwarded copy) legitimately deliver the same message twice.
+    duplicate: bool = False
 
     @property
     def alerted(self) -> bool:
@@ -307,6 +311,38 @@ async def analyse_event(
     attachment_verdicts: dict[str, str] | None = None,
     sender_domain_age_days: int | None = None,
 ) -> PipelineResult:
+    # Idempotency: the same message reaches us twice whenever a mailbox is on both
+    # a live IMAP poll and a forwarding rule (and on any poll overlap). Keyed on
+    # (mailbox_id, rfc_message_id), a message we have already stored is skipped
+    # before any analysis — no duplicate alert, no double-counted counterparty
+    # learning. Messages without an rfc_message_id fall through (nothing to key on).
+    if (
+        persist
+        and isinstance(event, MailEvent)
+        and event.rfc_message_id
+        and event.mailbox_id is not None
+    ):
+        seen = (
+            await session.execute(
+                select(Message.id).where(
+                    Message.mailbox_id == event.mailbox_id,
+                    Message.rfc_message_id == event.rfc_message_id,
+                )
+            )
+        ).first()
+        if seen is not None:
+            return PipelineResult(
+                findings=[],
+                assessment=None,
+                alert_id=None,
+                protection_level=protection_level(
+                    capabilities_for(frozenset({event.source}))
+                ).value,
+                inactive_detections=[],
+                latency_seconds=0.0,
+                duplicate=True,
+            )
+
     ctx = await build_context(
         session,
         event,

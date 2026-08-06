@@ -82,3 +82,48 @@ def open_secret(sealed: SealedSecret, *, aad: bytes | None = None) -> bytes:
         return AESGCM(dek).decrypt(nonce, body, aad)
     except Exception as exc:  # cryptography raises InvalidTag, among others
         raise CryptoError("could not open sealed secret — wrong key or tampered") from exc
+
+
+def _kek_from(raw: str) -> bytes:
+    if not raw:
+        raise CryptoError("empty master key")
+    return hashlib.sha256(raw.encode()).digest()
+
+
+def _key_id_from(kek: bytes) -> str:
+    return "local:" + hashlib.sha256(kek).hexdigest()[:16]
+
+
+def rekey(
+    sealed: SealedSecret,
+    *,
+    aad: bytes | None,
+    old_master_key: str,
+    new_master_key: str,
+) -> SealedSecret:
+    """Re-seal a secret under a new master key without exposing the plaintext to
+    a column, log, or the caller.
+
+    Rotating `ENVELOCK_CREDENTIAL_MASTER_KEY` otherwise silently bricks every
+    stored credential (the mailbox reads as connected but can't be read). Run this
+    over the credential store as part of a planned rotation so secrets survive.
+    Decrypt with the old KEK, re-encrypt under a fresh DEK wrapped by the new KEK.
+    """
+    import os
+
+    old_kek = _kek_from(old_master_key)
+    try:
+        kek_nonce, wrapped = sealed.wrapped_dek[:12], sealed.wrapped_dek[12:]
+        dek = AESGCM(old_kek).decrypt(kek_nonce, wrapped, None)
+        nonce, body = sealed.ciphertext[:12], sealed.ciphertext[12:]
+        plaintext = AESGCM(dek).decrypt(nonce, body, aad)
+    except Exception as exc:
+        raise CryptoError("could not open under the old key — wrong old key?") from exc
+
+    new_kek = _kek_from(new_master_key)
+    new_dek = AESGCM.generate_key(bit_length=256)
+    dek_nonce = os.urandom(12)
+    ciphertext = dek_nonce + AESGCM(new_dek).encrypt(dek_nonce, plaintext, aad)
+    kek_nonce = os.urandom(12)
+    wrapped = kek_nonce + AESGCM(new_kek).encrypt(kek_nonce, new_dek, None)
+    return SealedSecret(ciphertext=ciphertext, wrapped_dek=wrapped, key_id=_key_id_from(new_kek))

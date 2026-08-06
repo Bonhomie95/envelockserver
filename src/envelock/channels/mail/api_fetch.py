@@ -17,7 +17,9 @@ fetch/normalisation logic here is complete and tested regardless.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import logging
 from typing import Protocol
 from uuid import UUID
 
@@ -25,6 +27,8 @@ from envelock.channels.mail.parser import parse_message
 from envelock.channels.mail.providers import GmailProvider
 from envelock.core.enums import SourceMechanism
 from envelock.core.events import MailEvent
+
+logger = logging.getLogger("envelock.apifetch")
 
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1"
 GRAPH_API = "https://graph.microsoft.com/v1.0"
@@ -59,6 +63,27 @@ def _bearer(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+async def _retry(coro_factory, *, attempts: int = 3, backoff: float = 0.5):  # noqa: ANN001, ANN201
+    """Call an async factory with exponential backoff.
+
+    Graph and Gmail throttle aggressively (HTTP 429) and have transient 5xx; a
+    single try means a poll cycle drops mail on a blip. Retries any exception,
+    backing off `backoff * 2**n`, and re-raises the last error if all attempts
+    fail. `backoff=0` disables the delay (tests)."""
+    last: Exception | None = None
+    for n in range(max(attempts, 1)):
+        try:
+            return await coro_factory()
+        except Exception as exc:  # noqa: BLE001 — provider errors are all retryable here
+            last = exc
+            if n + 1 < attempts and backoff > 0:
+                await asyncio.sleep(backoff * (2**n))
+            elif n + 1 < attempts:
+                continue
+    logger.warning("provider request failed after %d attempts: %s", attempts, last)
+    raise last  # type: ignore[misc]
+
+
 async def gmail_fetch(
     *,
     access_token: str,
@@ -68,6 +93,7 @@ async def gmail_fetch(
     query: str = "newer_than:2d",
     limit: int = 50,
     transport: HttpTransport | None = None,
+    backoff: float = 0.5,
 ) -> list[MailEvent]:
     """Pull recent inbox messages from Gmail and normalise to MailEvents.
 
@@ -77,17 +103,23 @@ async def gmail_fetch(
     transport = transport or HttpxTransport()
     headers = _bearer(access_token)
 
-    listing = await transport.get_json(
-        f"{GMAIL_API}/users/me/messages?maxResults={limit}&q={query}",
-        headers=headers,
+    listing = await _retry(
+        lambda: transport.get_json(
+            f"{GMAIL_API}/users/me/messages?maxResults={limit}&q={query}",
+            headers=headers,
+        ),
+        backoff=backoff,
     )
     events: list[MailEvent] = []
     for ref in listing.get("messages", []) or []:
         msg_id = ref.get("id")
         if not msg_id:
             continue
-        detail = await transport.get_json(
-            f"{GMAIL_API}/users/me/messages/{msg_id}?format=raw", headers=headers
+        detail = await _retry(
+            lambda mid=msg_id: transport.get_json(
+                f"{GMAIL_API}/users/me/messages/{mid}?format=raw", headers=headers
+            ),
+            backoff=backoff,
         )
         raw_b64 = detail.get("raw")
         if not raw_b64:
@@ -110,6 +142,7 @@ async def graph_fetch(
     mailbox_address: str | None = None,
     limit: int = 50,
     transport: HttpTransport | None = None,
+    backoff: float = 0.5,
 ) -> list[MailEvent]:
     """Pull recent inbox messages from Microsoft Graph and normalise to MailEvents.
 
@@ -119,10 +152,13 @@ async def graph_fetch(
     headers = _bearer(access_token)
 
     base = f"{GRAPH_API}/users/{mailbox_address}" if mailbox_address else f"{GRAPH_API}/me"
-    listing = await transport.get_json(
-        f"{base}/mailFolders/inbox/messages?$top={limit}&$select=id"
-        f"&$orderby=receivedDateTime%20desc",
-        headers=headers,
+    listing = await _retry(
+        lambda: transport.get_json(
+            f"{base}/mailFolders/inbox/messages?$top={limit}&$select=id"
+            f"&$orderby=receivedDateTime%20desc",
+            headers=headers,
+        ),
+        backoff=backoff,
     )
     events: list[MailEvent] = []
     for ref in listing.get("value", []) or []:
@@ -132,7 +168,12 @@ async def graph_fetch(
         # `/$value` returns the full RFC822 MIME, so the shared parser gives the
         # same fidelity (URLs, auth results, attachments) as the IMAP/Gmail paths —
         # richer than Graph's JSON projection, which omits URL extraction.
-        raw = await transport.get_bytes(f"{base}/messages/{msg_id}/$value", headers=headers)
+        raw = await _retry(
+            lambda mid=msg_id: transport.get_bytes(
+                f"{base}/messages/{mid}/$value", headers=headers
+            ),
+            backoff=backoff,
+        )
         if not raw:
             continue
         events.append(

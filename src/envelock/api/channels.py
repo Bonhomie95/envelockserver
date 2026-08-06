@@ -734,9 +734,12 @@ async def backfill(mailbox_id: UUID, principal: AdminUser, session: Session) -> 
 # ── Operational status ───────────────────────────────────────────────────────
 @router.get("/status/channels")
 async def channel_status(principal: CurrentUser) -> dict:
+    from envelock.workers.imap_fetch import worker_health
+
     return {
         "mail_providers": provider_status(),
         "imap_broker": _BROKER.snapshot(),
+        "imap_worker": worker_health(),
         "notification_rungs": Dispatcher().status(),
         "zone_files": ZoneFileWatcher().status(),
         "cert_transparency": _CT.stats.payload(),
