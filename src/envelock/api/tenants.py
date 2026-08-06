@@ -27,7 +27,11 @@ from envelock.auth.security import (
 )
 from envelock.billing.pricing import Plan, included_mailbox_seats
 from envelock.channels.mail.ingest import ingest_address, new_ingest_token, onboarding_instructions
-from envelock.core.capabilities import capabilities_for, protection_level
+from envelock.core.capabilities import (
+    capabilities_for,
+    protection_advice,
+    protection_level,
+)
 from envelock.core.enums import IntegrationTier, MailboxClass, SourceMechanism
 from envelock.db import get_session
 from envelock.detections.base import inactive_for
@@ -394,16 +398,24 @@ class MailboxRequest(BaseModel):
 
 
 def _mailbox_payload(m: Mailbox) -> dict:
-    caps = capabilities_for(frozenset(SourceMechanism(s) for s in (m.sources or []) if s))
+    sources = frozenset(SourceMechanism(s) for s in (m.sources or []) if s)
+    caps = capabilities_for(sources)
     return {
         "id": str(m.id),
         "address": m.address,
         "mailbox_class": m.mailbox_class,
         "sources": m.sources or [],
         "protection_level": protection_level(caps).value,
+        # The explainer: why this level, and exactly what raises it. Keeps
+        # "Standard" from reading as broken when it is the honest ceiling of the
+        # connected sources (P4/E7). Distinct from the billing plan/trial, which
+        # is tenant-level (see GET /tenant).
+        "protection": protection_advice(sources),
         "inactive_detections": inactive_for(caps),
         "is_shared": m.is_shared,
         "last_sync_at": m.last_sync_at.isoformat() if m.last_sync_at else None,
+        "needs_reconnect": m.needs_reconnect,
+        "connection_error": m.connection_error,
     }
 
 
@@ -662,6 +674,10 @@ async def connect_imap(
     caps = capabilities_for(frozenset(SourceMechanism(s) for s in mailbox.sources))
     mailbox.protection_level = protection_level(caps).value
     mailbox.inactive_detections = inactive_for(caps)
+    # Credentials were just re-verified and re-sealed under the current key, so
+    # any prior "needs reconnect" state is resolved.
+    mailbox.needs_reconnect = False
+    mailbox.connection_error = None
 
     await alert_svc.record_audit(
         session,
@@ -674,6 +690,36 @@ async def connect_imap(
     )
     await session.commit()
     return _mailbox_payload(mailbox)
+
+
+@router.post("/mailboxes/{mailbox_id}/sync")
+async def sync_mailbox_now(
+    mailbox_id: UUID, principal: AdminUser, session: Session
+) -> dict:
+    """Poll a connected IMAP mailbox immediately instead of waiting for the next
+    background cycle. This is the "Sync now" button — connect a mailbox, send a
+    test message, click this, and any new mail is fetched and run through the full
+    detection pipeline right now. Returns what was fetched, flagged and quarantined."""
+    mailbox = await _mailbox_or_404(session, mailbox_id, principal.tenant_id)
+    if not any(
+        s in {SourceMechanism.IMAP_IDLE.value, SourceMechanism.IMAP_POLL.value}
+        for s in (mailbox.sources or [])
+    ):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "this mailbox is not connected over IMAP — connect it first",
+        )
+    from envelock.workers.imap_fetch import sync_mailbox
+
+    summary = await sync_mailbox(session, mailbox)
+    if not summary.get("ok"):
+        # Not a server error — a reachable-but-failing poll (bad creds, unreachable
+        # host). Surface the reason so the user can fix the connection.
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"could not sync mailbox — {summary.get('reason', 'unknown error')}",
+        )
+    return summary
 
 
 @router.post("/mailboxes/{mailbox_id}/connect/forward")

@@ -73,6 +73,13 @@ class Settings(BaseSettings):
     imap_reconnect_jitter_seconds: int = 120
     imap_egress_ips: str = ""
 
+    #: The live IMAP poll worker (workers/imap_fetch). On by default so a
+    #: connected mailbox is actually read; the poll cadence is the protection
+    #: latency for Monitored mailboxes and the fallback for Protected ones.
+    #: Disabled in the test suite, which drives the worker directly.
+    imap_poll_worker_enabled: bool = True
+    imap_poll_worker_seconds: int = 60
+
     # ── Channel 1: Tier 4 ────────────────────────────────────────────────────
     ingest_domain: str = "in.envelock.io"
     ingest_smtp_host: str = "0.0.0.0"  # noqa: S104

@@ -191,3 +191,78 @@ def protection_level(capabilities: frozenset[Capability]) -> ProtectionLevel:
     if capabilities >= _STANDARD_REQUIREMENTS:
         return ProtectionLevel.STANDARD
     return ProtectionLevel.LIMITED
+
+
+#: Human-readable, per-capability "what this unlocks" + which source grants it.
+#: Drives the connect UI's "to reach Full protection, do X" explainer so the level
+#: is never a bare word the customer has to guess about (P4, E7).
+_CAPABILITY_GUIDANCE: dict[Capability, tuple[str, str]] = {
+    Capability.READ_INBOUND: ("scan incoming mail", "connect the mailbox"),
+    Capability.MODIFY_MESSAGE: (
+        "quarantine or rewrite a dangerous message",
+        "connect over IMAP/OAuth (not forwarding, which is post-delivery)",
+    ),
+    Capability.READ_OUTBOUND: (
+        "watch sent mail for signature and stylometry drift",
+        "connect over IMAP or OAuth",
+    ),
+    Capability.READ_HISTORY: (
+        "backfill history so baselines are accurate from day one",
+        "connect over IMAP or OAuth",
+    ),
+    Capability.READ_SESSIONS: (
+        "alert on unknown-IP, new-country and new-device logins",
+        "install the browser/Outlook sensor, or connect via Microsoft 365 / Google Workspace",
+    ),
+    Capability.READ_SERVER_RULES: (
+        "detect malicious mailbox rules and hidden forwarding",
+        "connect via Microsoft 365 / Google Workspace (IMAP cannot see server rules)",
+    ),
+}
+
+
+def _sources_granting(capability: Capability) -> list[str]:
+    return sorted(
+        s.value for s, caps in MECHANISM_CAPABILITIES.items() if capability in caps
+    )
+
+
+def protection_advice(sources: frozenset[SourceMechanism]) -> dict:
+    """Explain the current protection level and exactly what would raise it.
+
+    Returns the level, whether it is already the maximum, and — if not — the
+    capabilities still missing for the next level, each with a plain-language
+    reason and the way to obtain it. This is what the UI shows next to the level
+    so "Standard" is never a bare, unexplained word (P4/E7).
+    """
+    caps = capabilities_for(sources)
+    level = protection_level(caps)
+
+    if level is ProtectionLevel.FULL:
+        return {"level": level.value, "is_max": True, "next_level": None, "missing": []}
+
+    next_level = (
+        ProtectionLevel.STANDARD
+        if level is ProtectionLevel.LIMITED
+        else ProtectionLevel.FULL
+    )
+    required = (
+        _STANDARD_REQUIREMENTS if next_level is ProtectionLevel.STANDARD else _FULL_REQUIREMENTS
+    )
+    missing = []
+    for cap in sorted(required - caps, key=lambda c: c.value):
+        unlocks, how = _CAPABILITY_GUIDANCE.get(cap, (cap.value.replace("_", " "), ""))
+        missing.append(
+            {
+                "capability": cap.value,
+                "unlocks": unlocks,
+                "how": how,
+                "provided_by": _sources_granting(cap),
+            }
+        )
+    return {
+        "level": level.value,
+        "is_max": False,
+        "next_level": next_level.value,
+        "missing": missing,
+    }

@@ -28,6 +28,11 @@ os.environ["ENVELOCK_DB_NULLPOOL"] = "true"
 os.environ["ENVELOCK_RATE_LIMIT_BACKEND"] = "memory"
 # Keep the domain scan hermetic — no live RDAP calls to date lookalike hits.
 os.environ.setdefault("ENVELOCK_SCAN_REGISTRATION_DATES", "false")
+# The live IMAP poll worker must not run during tests — the suite drives
+# sync_mailbox / run_imap_poll_cycle directly with an injected client. A real
+# background poller would open sockets and leak tasks across the TestClient
+# lifespan.
+os.environ["ENVELOCK_IMAP_POLL_WORKER_ENABLED"] = "false"
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -11,6 +11,7 @@ from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Date,
     DateTime,
@@ -201,6 +202,13 @@ class Mailbox(Base, UUIDMixin, TimestampMixin):
     backfilled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: Set when the stored credential can no longer be used (e.g. the master key
+    #: rotated, or the provider revoked the password): the mailbox reads as
+    #: "connected" but cannot sync, so the UI must prompt a reconnect instead of
+    #: silently protecting nothing.
+    needs_reconnect: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: Human-readable reason for needs_reconnect, surfaced to the admin.
+    connection_error: Mapped[str | None] = mapped_column(String(255))
 
     __table_args__ = (UniqueConstraint("tenant_id", "address"),)
 
@@ -224,6 +232,14 @@ class MailboxCredential(Base, UUIDMixin, TimestampMixin):
     ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
     wrapped_dek: Mapped[bytes] = mapped_column(LargeBinary)
     key_id: Mapped[str | None] = mapped_column(String(255))
+    #: IMAP sync cursor. UIDs are only monotonic within one UIDVALIDITY epoch, so
+    #: we store both: if the server resets UIDVALIDITY we restart the cursor rather
+    #: than silently skipping mail (RFC 3501 §2.3.1.1).
+    imap_last_uid: Mapped[int | None] = mapped_column(BigInteger)
+    imap_uidvalidity: Mapped[int | None] = mapped_column(BigInteger)
+    #: Last time the broker successfully polled this mailbox (distinct from the
+    #: mailbox's own last_sync_at, which the UI shows).
+    imap_last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

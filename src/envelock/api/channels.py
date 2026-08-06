@@ -355,7 +355,56 @@ async def sensor_heartbeat(
         )
     ).scalar_one_or_none()
 
+    alerted = False
+    findings: list[dict] = []
     if existing is None:
+        # A previously-unseen device/session on this mailbox is a sign-in. Run it
+        # through the real detection pipeline BEFORE persisting the new session, so
+        # "previous session" is the prior one — this is what makes an unknown-IP,
+        # new-country or new-device login actually raise an alert (C7/C8/C9/C10).
+        owned = {
+            d
+            for (d,) in (
+                await session.execute(
+                    select(Domain.registrable_domain).where(
+                        Domain.tenant_id == principal.tenant_id
+                    )
+                )
+            ).all()
+        }
+        event = IdentityEvent(
+            tenant_id=principal.tenant_id,
+            mailbox_id=mailbox.id,
+            occurred_at=now,
+            ingested_at=now,
+            source=SourceMechanism.CLIENT_SENSOR,
+            kind=IdentityEventKind.SIGN_IN,
+            network=NetworkContext(ip=req.ip, country=req.country),
+            device=DeviceContext(
+                fingerprint=req.device_fingerprint,
+                browser=req.browser,
+                os=req.os,
+                mail_client=req.mail_client,
+            ),
+        )
+        from envelock.channels.mail.forward_runner import _recipients
+
+        recipients = await _recipients(session, principal.tenant_id)
+        result = await analyse_event(
+            session,
+            event,
+            tenant_id=principal.tenant_id,
+            owned_domains=frozenset(owned),
+            recipients=recipients,
+        )
+        if result.alert_id is not None:
+            await deliver_pending(session, alert_id=result.alert_id)
+            alerted = True
+        findings = [
+            {"service": f.service, "tier": f.tier.value, "summary": f.summary}
+            for f in result.findings
+        ]
+
         session.add(
             SensorSession(
                 tenant_id=principal.tenant_id,
@@ -375,7 +424,12 @@ async def sensor_heartbeat(
         existing.last_seen_at = now
 
     await session.commit()
-    return {"acknowledged": True, "at": now.isoformat()}
+    return {
+        "acknowledged": True,
+        "at": now.isoformat(),
+        "alerted": alerted,
+        "findings": findings,
+    }
 
 
 @router.post("/sensor/message-opened")

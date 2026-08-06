@@ -73,9 +73,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("shared state: redis unavailable (%s) — using in-process", exc)
 
-    # Connection pools, the IMAP broker and channel subscribers attach here as
-    # they land. Keep startup ordered: datastores, then channels, then workers.
+    # Live IMAP worker (PRD §5.3). This is what actually *reads* a connected
+    # mailbox: without it, connect_imap stores a credential but no mail is ever
+    # fetched or analysed. Runs as a background task in-process; a redis-backed
+    # multi-instance deployment would elect a single poller, but a single instance
+    # is correct as-is. Disabled in tests (they drive the worker directly).
+    import asyncio
+
+    imap_stop = asyncio.Event()
+    imap_task: asyncio.Task | None = None
+    if settings.imap_poll_worker_enabled:
+        from envelock.workers.imap_fetch import imap_poll_loop
+
+        imap_task = asyncio.create_task(
+            imap_poll_loop(imap_stop, interval_seconds=settings.imap_poll_worker_seconds)
+        )
+        logger.info("imap poll worker enabled (%ss)", settings.imap_poll_worker_seconds)
+
     yield
+
+    if imap_task is not None:
+        imap_stop.set()
+        imap_task.cancel()
+        import contextlib
+
+        with contextlib.suppress(asyncio.CancelledError):
+            await imap_task
 
     logger.info("envelock stopped")
 
