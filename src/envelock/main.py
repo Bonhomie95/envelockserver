@@ -35,6 +35,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # from a local DB to a production one is only a change of ENVELOCK_POSTGRES_DSN.
     from envelock.db import create_all
 
+    # One-time schema rebuild for a DRIFTED database (e.g. a pre-launch Render DB
+    # whose `users` table predates `tenant_id`). `create_all` only creates missing
+    # tables, never alters existing ones, so a drifted schema keeps 500-ing. Set
+    # ENVELOCK_RESET_SCHEMA_ON_STARTUP=true, redeploy once, then set it back to
+    # false. DANGER: this WIPES ALL DATA — only for a pre-launch/throwaway DB.
+    if settings.reset_schema_on_startup:
+        from sqlalchemy import text
+
+        from envelock.db import get_engine
+
+        logger.warning(
+            "ENVELOCK_RESET_SCHEMA_ON_STARTUP=true — DROPPING AND REBUILDING THE "
+            "SCHEMA. ALL DATA IN THIS DATABASE IS BEING ERASED. Set this back to "
+            "false immediately after this deploy, or every restart will wipe it."
+        )
+        engine = get_engine()
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+            await conn.execute(text("CREATE SCHEMA public"))
+
     await create_all()
 
     # Hydrate the E8 counterparty graph from its durable store so the moat — one

@@ -175,6 +175,12 @@ class Settings(BaseSettings):
     # the password-reset link). Should match the deployed client origin.
     web_base_url: str = "https://envelockclient.vercel.app"
 
+    # DANGER — one-time schema rebuild. When true, the app DROPS AND RECREATES the
+    # database schema on startup (wiping all data), to repair a drifted pre-launch
+    # database. Set true, redeploy once, then set back to false. Never true with
+    # real customer data — use Alembic migrations instead.
+    reset_schema_on_startup: bool = False
+
     # ── Derived ──────────────────────────────────────────────────────────────
     @property
     def is_production(self) -> bool:
