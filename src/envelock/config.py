@@ -165,6 +165,16 @@ class Settings(BaseSettings):
     # admin can never be granted through the product itself, only by deployment.
     superadmin_emails: str = ""
 
+    # Browser origins allowed to call the API cross-origin (comma-separated). The
+    # web client is served from a different origin than the API in production
+    # (e.g. Vercel → Render), so its origin must be allow-listed or the browser
+    # blocks every call. Localhost dev origins are always allowed.
+    cors_origins: str = "https://envelockclient.vercel.app"
+
+    # Public URL of the web client — used to build links in outbound email (e.g.
+    # the password-reset link). Should match the deployed client origin.
+    web_base_url: str = "https://envelockclient.vercel.app"
+
     # ── Derived ──────────────────────────────────────────────────────────────
     @property
     def is_production(self) -> bool:
@@ -175,6 +185,14 @@ class Settings(BaseSettings):
         return frozenset(
             e.strip().lower() for e in self.superadmin_emails.split(",") if e.strip()
         )
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        """Configured cross-origin callers plus the local dev origins."""
+        configured = [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+        dev = ["http://localhost:5173", "http://localhost:5174"]
+        # De-dupe while preserving order.
+        return list(dict.fromkeys(configured + dev))
 
     @property
     def egress_ip_pool(self) -> list[str]:

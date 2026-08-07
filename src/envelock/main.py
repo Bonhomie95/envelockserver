@@ -119,18 +119,20 @@ def create_app() -> FastAPI:
     app.add_middleware(SecurityHeadersMiddleware, production=settings.is_production)
     app.add_middleware(RequestGuardMiddleware)
 
-    if not settings.is_production:
-        app.add_middleware(
-            CORSMiddleware,
-            # 5173 = tenant web app, 5174 = the super-admin console (separate app).
-            allow_origins=["http://localhost:5173", "http://localhost:5174"],
-            # Explicit rather than "*": a wildcard with credentials is a
-            # cross-origin credential leak waiting to happen.
-            allow_credentials=True,
-            allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-            allow_headers=["Authorization", "Content-Type"],
-            max_age=600,
-        )
+    # CORS is required in production too: the web client is served from a
+    # different origin (e.g. Vercel) than this API (e.g. Render), so its origin
+    # must be allow-listed or the browser blocks every call. Origins come from
+    # ENVELOCK_CORS_ORIGINS (plus localhost dev). Explicit list rather than "*":
+    # a wildcard with credentials is a cross-origin credential leak waiting to
+    # happen.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origin_list,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+        max_age=600,
+    )
 
     app.include_router(health.router, tags=["health"])
     app.include_router(v1.router, tags=["v1"])

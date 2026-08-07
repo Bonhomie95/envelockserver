@@ -11,6 +11,7 @@ recovery-code hashes are durable.
 
 from __future__ import annotations
 
+import logging
 import secrets
 import time
 from datetime import UTC, datetime, timedelta
@@ -56,6 +57,7 @@ from envelock.security.limits import (
 from envelock.util.domains import is_free_mail, registrable_domain
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
+logger = logging.getLogger("envelock.auth")
 
 Session = Annotated[AsyncSession, Depends(get_session)]
 
@@ -525,6 +527,147 @@ async def mfa_enroll(principal: CurrentUser, session: Session) -> dict:
         "otpauth_uri": totp_uri(user.totp_secret, user.email),
         "next": "Confirm with /auth/mfa/activate to turn MFA on.",
     }
+
+
+# ── Password reset (forgot password) ─────────────────────────────────────────
+#: A reset token is short-lived; long enough to check email, short enough to
+#: limit exposure of a leaked link.
+PASSWORD_RESET_TTL = timedelta(minutes=30)
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(min_length=12, max_length=256)
+    #: Required only when the account has MFA — the authenticator code proves
+    #: identity in place of an emailed link.
+    code: str | None = Field(default=None, pattern=r"^\d{6}$")
+
+
+def _send_password_reset_email(to: str, link: str) -> None:
+    """Best-effort reset email. Always logs the link (recoverable from logs);
+    sends over SMTP when a real relay is configured. Never raises."""
+    from envelock.config import get_settings
+
+    logger.info("password reset link for %s: %s", to, link)
+    settings = get_settings()
+    host = settings.smtp_host
+    if not host or host == "localhost":
+        return  # no relay configured yet (see the owner setup guide) — log only
+    try:
+        import smtplib
+        from email.message import EmailMessage
+
+        msg = EmailMessage()
+        msg["From"] = settings.smtp_from
+        msg["To"] = to
+        msg["Subject"] = "Reset your Envelock password"
+        msg.set_content(
+            "We received a request to reset your Envelock password.\n\n"
+            f"Reset it here (valid for 30 minutes):\n{link}\n\n"
+            "If you didn't ask for this, you can ignore this email."
+        )
+        with smtplib.SMTP(host, settings.smtp_port, timeout=10) as smtp:
+            smtp.starttls()
+            if settings.smtp_username and settings.smtp_password:
+                smtp.login(
+                    settings.smtp_username, settings.smtp_password.get_secret_value()
+                )
+            smtp.send_message(msg)
+    except Exception as exc:  # noqa: BLE001 — email failure must not break the flow
+        logger.warning("password reset email to %s failed: %s", to, exc)
+
+
+@router.post("/password/forgot")
+async def forgot_password(req: ForgotPasswordRequest, session: Session) -> dict:
+    """Begin a password reset.
+
+    Behaviour depends on the account (per the product rule): an account with MFA
+    resets **using the authenticator** (no email needed) — we hand back a reset
+    token that only works together with a valid TOTP code. An account without MFA
+    gets a reset **link emailed** to it. Unknown emails get the same "email sent"
+    answer as a real non-MFA account, so this never reveals who has an account.
+    """
+    email = req.email.lower().strip()
+    user = await _user_by_email(session, email)
+    generic = {
+        "method": "email",
+        "message": "If that account exists, a reset link has been sent to its email.",
+    }
+    if user is None:
+        return generic
+
+    token = issue_token(
+        user_id=user.id,
+        tenant_id=user.tenant_id,
+        role=_role_of(user),
+        typ="password_reset",
+        ttl=PASSWORD_RESET_TTL,
+    )
+
+    if user.mfa_enabled:
+        # Reset in place with the second factor — no email round-trip.
+        return {
+            "method": "mfa",
+            "reset_token": token,
+            "message": "Enter your authenticator code and a new password to reset.",
+        }
+
+    from envelock.config import get_settings
+
+    settings = get_settings()
+    link = f"{settings.web_base_url.rstrip('/')}/reset-password?token={token}"
+    _send_password_reset_email(user.email, link)
+    resp = dict(generic)
+    if settings.env == "development":
+        resp["reset_link"] = link  # dev convenience, mirrors the OTP dev_code rule
+    return resp
+
+
+@router.post("/password/reset")
+async def reset_password(req: ResetPasswordRequest, session: Session) -> dict:
+    """Complete a password reset.
+
+    The token proves the request came from `password/forgot`. For an MFA account,
+    a valid authenticator code is also required (the token alone is not enough).
+    For a non-MFA account, possession of the emailed token is the proof.
+    """
+    try:
+        claims = decode_token(req.token, expect="password_reset")
+    except TokenError as exc:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "this reset link is invalid or has expired"
+        ) from exc
+
+    user = await _user_by_id(session, claims.sub)
+
+    try:
+        assess_passphrase(req.new_password)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    if user.mfa_enabled:
+        locked, retry_after = await active_lockout().ais_locked(f"pwreset:{user.email}")
+        if locked:
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "too many attempts",
+                headers={"Retry-After": str(retry_after)},
+            )
+        if not req.code or not verify_totp(user.totp_secret or "", req.code):
+            await active_lockout().arecord_failure(f"pwreset:{user.email}")
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED, "invalid authenticator code"
+            )
+        await active_lockout().arecord_success(f"pwreset:{user.email}")
+
+    user.password_hash = hash_password(req.new_password)
+    user.must_change_password = False
+    await session.commit()
+    return {"ok": True, "message": "Password updated — sign in with your new password."}
 
 
 class MfaActivateRequest(BaseModel):
