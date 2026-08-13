@@ -33,6 +33,21 @@ os.environ.setdefault("ENVELOCK_SCAN_REGISTRATION_DATES", "false")
 # background poller would open sockets and leak tasks across the TestClient
 # lifespan.
 os.environ["ENVELOCK_IMAP_POLL_WORKER_ENABLED"] = "false"
+# Likewise, the periodic scheduler (escalation, retention, watchers, OAuth
+# refresh) is driven directly by its own tests, never as a background loop under
+# the TestClient — a live CT-log websocket or purge loop would leak tasks.
+os.environ["ENVELOCK_SCHEDULER_ENABLED"] = "false"
+# L2 email and L3 SMS are unconfigured in the suite so the ladder reports them as
+# skipped rather than attempting a real network send against a dev .env's SMTP
+# host. Delivery transports have their own focused tests with injected fakes.
+os.environ["ENVELOCK_SMTP_HOST"] = ""
+os.environ["ENVELOCK_SMS_ENABLED"] = "false"
+# Most connect-flow tests predate domain verification and connect mailboxes
+# directly; the enforcement has its own focused test that flips this on.
+os.environ["ENVELOCK_REQUIRE_DOMAIN_VERIFICATION"] = "false"
+# Sender-domain reputation does live DNSBL lookups; keep the suite hermetic and
+# fast. Its own test drives the checker directly.
+os.environ["ENVELOCK_DOMAIN_REPUTATION_ENABLED"] = "false"
 
 
 @pytest.fixture(scope="session", autouse=True)

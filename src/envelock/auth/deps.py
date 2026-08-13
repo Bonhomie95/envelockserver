@@ -44,7 +44,16 @@ async def current_principal(
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
 
+    _bind_tenant(claims.tenant)
     return Principal(user_id=claims.sub, tenant_id=claims.tenant, role=claims.role)
+
+
+def _bind_tenant(tenant_id: UUID) -> None:
+    """Bind the request's tenant to the DB contextvar so Postgres RLS (when
+    enabled) scopes every query on this task to it."""
+    from envelock.db import set_current_tenant
+
+    set_current_tenant(tenant_id)
 
 
 async def optional_principal(
@@ -63,6 +72,7 @@ async def optional_principal(
         claims = decode_token(authorization.split(" ", 1)[1].strip(), expect="access")
     except TokenError:
         return None
+    _bind_tenant(claims.tenant)
     return Principal(user_id=claims.sub, tenant_id=claims.tenant, role=claims.role)
 
 

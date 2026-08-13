@@ -83,6 +83,9 @@ async def sync_mailbox(
     client_factory=None,  # noqa: ANN001 — imap_sync.ClientFactory, injected in tests
 ) -> dict:
     """Poll one mailbox once and analyse every new message. Commits on success."""
+    from envelock.db import set_current_tenant
+
+    set_current_tenant(mailbox.tenant_id)  # scope RLS to this mailbox's tenant
     cred = (
         await session.execute(
             select(MailboxCredential).where(MailboxCredential.mailbox_id == mailbox.id)

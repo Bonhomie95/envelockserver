@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -171,57 +171,91 @@ async def quality_evaluate(rows: list[ConfusionInput], principal: AdminUser) -> 
 
 
 # ── Export and SIEM (§15.3) ──────────────────────────────────────────────────
-def _demo_alerts() -> list[ex.AlertRecord]:
-    """Stand-in until alerts are persisted; the formatters are the real thing."""
-    now = datetime.now(UTC)
-    return [
-        ex.AlertRecord(
-            id="alt_01H9",
-            tier=AlertTier.CRITICAL,
-            service="A1",
-            title="Payment details do not match the account on file",
-            mailbox="pay@acme.com",
-            detail="Invoice 4471 | new IBAN GB33BUKB…5555 | 47 prior messages",
-            raised_at=now,
-            state="open",
-        ),
-        ex.AlertRecord(
-            id="alt_01H8",
-            tier=AlertTier.HIGH,
-            service="D4",
-            title="acrne.com registered and configured to send mail",
-            mailbox="domain-monitoring",
-            detail="rn/m substitution | MX live",
-            raised_at=now,
-            state="acknowledged",
-            acknowledged_at=now,
-            acknowledged_by="it@acme.com",
-        ),
-    ]
+async def _tenant_alerts(
+    session: AsyncSession, tenant_id, *, limit: int = 5000
+) -> list[ex.AlertRecord]:
+    """The tenant's real alerts, newest first, shaped for every export format.
+
+    Joins each alert's mailbox address and its lead finding's service so the CSV,
+    JSONL and CEF an auditor or SIEM ingests carries the same detail the dashboard
+    shows — not a placeholder."""
+    from envelock.models import Finding, Mailbox, User
+
+    rows = (
+        await session.execute(
+            select(Alert)
+            .where(Alert.tenant_id == tenant_id)
+            .order_by(Alert.created_at.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+
+    records: list[ex.AlertRecord] = []
+    for a in rows:
+        mailbox_addr = "domain-monitoring"
+        if a.mailbox_id is not None:
+            mb = await session.get(Mailbox, a.mailbox_id)
+            if mb is not None:
+                mailbox_addr = mb.address
+        lead = (
+            await session.execute(
+                select(Finding.service)
+                .where(Finding.alert_id == a.id)
+                .order_by(Finding.score.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        acked_by = None
+        if a.acknowledged_by is not None:
+            u = await session.get(User, a.acknowledged_by)
+            acked_by = u.email if u else str(a.acknowledged_by)
+        records.append(
+            ex.AlertRecord(
+                id=str(a.id),
+                tier=AlertTier(a.tier),
+                service=lead or "-",
+                title=a.title,
+                mailbox=mailbox_addr,
+                detail=a.body.replace("\n", " | ")[:500],
+                raised_at=_aware(a.created_at),
+                state=a.state,
+                acknowledged_at=_aware(a.acknowledged_at),
+                acknowledged_by=acked_by,
+            )
+        )
+    return records
+
+
+def _aware(dt):  # noqa: ANN001, ANN201
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt
 
 
 @router.get("/export/alerts.csv")
-async def export_csv(principal: AdminUser) -> Response:
+async def export_csv(principal: AdminUser, session: Session) -> Response:
     """What auditors actually ask for."""
     return Response(
-        content=ex.to_csv(_demo_alerts()),
+        content=ex.to_csv(await _tenant_alerts(session, principal.tenant_id)),
         media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="envelock-alerts.csv"'},
     )
 
 
 @router.get("/export/alerts.jsonl")
-async def export_jsonl(principal: AdminUser) -> Response:
-    body = "\n".join(ex.to_json_line(a) for a in _demo_alerts())
+async def export_jsonl(principal: AdminUser, session: Session) -> Response:
+    records = await _tenant_alerts(session, principal.tenant_id)
+    body = "\n".join(ex.to_json_line(a) for a in records)
     return Response(content=body, media_type="application/x-ndjson")
 
 
 @router.get("/export/alerts.cef")
-async def export_cef(principal: AdminUser, syslog: bool = False) -> Response:
+async def export_cef(principal: AdminUser, session: Session, syslog: bool = False) -> Response:
     """CEF for ArcSight, Splunk, QRadar and Sentinel; RFC 5424 framing optional."""
     fmt = ex.to_syslog if syslog else ex.to_cef
+    records = await _tenant_alerts(session, principal.tenant_id)
     return Response(
-        content="\n".join(fmt(a) for a in _demo_alerts()),
+        content="\n".join(fmt(a) for a in records),
         media_type="text/plain",
     )
 
@@ -266,18 +300,126 @@ class TokenRequest(BaseModel):
 
 
 @router.post("/export/tokens", status_code=201)
-async def create_token(req: TokenRequest, principal: OwnerUser) -> dict:
+async def create_token(req: TokenRequest, principal: OwnerUser, session: Session) -> dict:
     """Export tokens are read-only by design — a leaked read token is a far
-    smaller incident than a leaked write token."""
+    smaller incident than a leaked write token. Persisted (hash only) so a
+    presented token actually authenticates something (PRD §15.3)."""
+    from envelock.models import ExportToken
+
     try:
         plaintext, record = ex.issue_api_token(frozenset(req.scopes))
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+    session.add(
+        ExportToken(
+            tenant_id=principal.tenant_id,
+            prefix=record.prefix,
+            hashed=record.hashed,
+            scopes=sorted(s.value for s in record.scopes),
+            created_by=principal.user_id,
+        )
+    )
+    await session.commit()
     return {
         "token": plaintext,
         "prefix": record.prefix,
         "scopes": sorted(s.value for s in record.scopes),
         "note": "Shown once. Only a hash is stored.",
+    }
+
+
+@router.get("/export/tokens")
+async def list_tokens(principal: OwnerUser, session: Session) -> dict:
+    from envelock.models import ExportToken
+
+    rows = (
+        await session.execute(
+            select(ExportToken)
+            .where(ExportToken.tenant_id == principal.tenant_id, ExportToken.revoked_at.is_(None))
+            .order_by(ExportToken.created_at.desc())
+        )
+    ).scalars().all()
+    return {
+        "tokens": [
+            {
+                "prefix": t.prefix,
+                "scopes": t.scopes,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "last_used_at": t.last_used_at.isoformat() if t.last_used_at else None,
+            }
+            for t in rows
+        ]
+    }
+
+
+@router.delete("/export/tokens/{prefix}", status_code=204)
+async def revoke_token(prefix: str, principal: OwnerUser, session: Session) -> Response:
+    from envelock.models import ExportToken
+
+    row = (
+        await session.execute(
+            select(ExportToken).where(
+                ExportToken.tenant_id == principal.tenant_id, ExportToken.prefix == prefix
+            )
+        )
+    ).scalar_one_or_none()
+    if row is not None and row.revoked_at is None:
+        row.revoked_at = datetime.now(UTC)
+        await session.commit()
+    return Response(status_code=204)
+
+
+async def _authenticate_export_token(session: AsyncSession, authorization: str | None):
+    """Resolve an `Authorization: Bearer envk_...` read-only export token to its
+    tenant and scopes, or raise 401. Records last_used_at."""
+    from envelock.models import ExportToken
+
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "missing export token")
+    plaintext = authorization.split(" ", 1)[1].strip()
+    if not plaintext.startswith("envk_"):
+        raise HTTPException(401, "not an export token")
+    prefix = plaintext[len("envk_"):][:8]
+    rows = (
+        await session.execute(
+            select(ExportToken).where(
+                ExportToken.prefix == prefix, ExportToken.revoked_at.is_(None)
+            )
+        )
+    ).scalars().all()
+    for row in rows:
+        stored = ex.ApiToken(
+            prefix=row.prefix,
+            hashed=row.hashed,
+            scopes=frozenset(ex.Scope(s) for s in row.scopes),
+        )
+        if ex.verify_api_token(plaintext, stored):
+            row.last_used_at = datetime.now(UTC)
+            await session.commit()
+            return row.tenant_id, stored.scopes
+    raise HTTPException(401, "invalid export token")
+
+
+@router.get("/export/api/alerts")
+async def export_api_alerts(
+    session: Session,
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict:
+    """Read-only alert feed for a SIEM, authenticated by an export token (not a
+    user session). This is what a customer points Splunk/Sentinel at."""
+    tenant_id, scopes = await _authenticate_export_token(session, authorization)
+    if ex.Scope.ALERTS_READ not in scopes:
+        raise HTTPException(403, "token lacks alerts:read scope")
+    records = await _tenant_alerts(session, tenant_id)
+    return {
+        "alerts": [
+            {
+                "id": r.id, "tier": r.tier.value, "service": r.service, "title": r.title,
+                "mailbox": r.mailbox, "state": r.state,
+                "raised_at": r.raised_at.isoformat() if r.raised_at else None,
+            }
+            for r in records
+        ]
     }
 
 

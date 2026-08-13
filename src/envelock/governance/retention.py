@@ -158,6 +158,80 @@ def deletion_plan(*, closed_at: datetime) -> dict:
     }
 
 
+async def purge_expired(session, *, now: datetime | None = None) -> dict[str, int]:  # noqa: ANN001
+    """Actually enforce the schedule (PRD §15.2).
+
+    Deletion must be *demonstrable*, so this returns a count per data class and is
+    meant to run on the scheduler. FK order matters — findings and deliveries
+    reference alerts, so they go first. Message bodies are the highest-sensitivity
+    class and expire first (30 days); the metadata row survives to power A9/A12.
+    """
+    from sqlalchemy import delete, select, update
+
+    from envelock.models import (
+        Alert,
+        AuditEvent,
+        Finding,
+        Message,
+        NotificationDelivery,
+        SensorSession,
+    )
+
+    now = now or datetime.now(UTC)
+    counts: dict[str, int] = {}
+
+    # 1. Message bodies (30d): drop the body pointer + subject, keep the metadata
+    #    row. Nulling an already-null body (metadata-only tenants) is a no-op.
+    body_cut = cutoff(DataClass.MESSAGE_BODY, now=now)
+    if body_cut is not None:
+        res = await session.execute(
+            update(Message)
+            .where(Message.received_at < body_cut, Message.body_storage_key.isnot(None))
+            .values(body_storage_key=None, subject=None)
+        )
+        counts["message_body"] = res.rowcount or 0
+
+    # 2. Identity events (365d).
+    id_cut = cutoff(DataClass.IDENTITY_EVENT, now=now)
+    if id_cut is not None:
+        res = await session.execute(
+            delete(SensorSession).where(SensorSession.last_seen_at < id_cut)
+        )
+        counts["identity_event"] = res.rowcount or 0
+
+    # 3. Audit events (365d).
+    audit_cut = cutoff(DataClass.AUDIT_EVENT, now=now)
+    if audit_cut is not None:
+        res = await session.execute(
+            delete(AuditEvent).where(AuditEvent.created_at < audit_cut)
+        )
+        counts["audit_event"] = res.rowcount or 0
+
+    # 4/5/6. Findings + deliveries + alerts (730d) — FK-safe order.
+    finding_cut = cutoff(DataClass.FINDING, now=now)
+    alert_cut = cutoff(DataClass.ALERT, now=now)
+    if finding_cut is not None:
+        res = await session.execute(
+            delete(Finding).where(Finding.created_at < finding_cut)
+        )
+        counts["finding"] = res.rowcount or 0
+    if alert_cut is not None:
+        old_alert_ids = (
+            await session.execute(select(Alert.id).where(Alert.created_at < alert_cut))
+        ).scalars().all()
+        if old_alert_ids:
+            await session.execute(
+                delete(NotificationDelivery).where(
+                    NotificationDelivery.alert_id.in_(old_alert_ids)
+                )
+            )
+            res = await session.execute(delete(Alert).where(Alert.id.in_(old_alert_ids)))
+            counts["alert"] = res.rowcount or 0
+
+    await session.commit()
+    return counts
+
+
 def schedule_payload() -> list[dict]:
     """Customer-facing retention schedule."""
     return [

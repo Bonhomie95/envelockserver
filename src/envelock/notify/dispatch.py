@@ -81,9 +81,21 @@ async def deliver_pending(
             row.error = "no destination"
             touched.append(row)
             continue
-        result = await dispatcher.sender(rung).send(
-            notification_from_alert(alert, row.tenant_id), to=dest
-        )
+        note = notification_from_alert(alert, row.tenant_id)
+        if rung is Rung.L1_PUSH:
+            # Web Push needs the subscription's encryption keys, not just the
+            # endpoint — fetch them and hand them to the sender.
+            sub = (
+                await session.execute(
+                    select(PushSubscription).where(
+                        PushSubscription.user_id == row.user_id
+                    )
+                )
+            ).scalars().first()
+            keys = {"p256dh": sub.p256dh, "auth": sub.auth} if sub else None
+            result = await dispatcher.push.send(note, to=dest, keys=keys)
+        else:
+            result = await dispatcher.sender(rung).send(note, to=dest)
         if result.delivered:
             row.status = "sent"
             row.cost_micros = result.cost_micros

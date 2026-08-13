@@ -14,6 +14,7 @@ from email.message import EmailMessage
 from email.utils import getaddresses, parsedate_to_datetime
 from uuid import UUID
 
+from envelock.channels.mail.attachments import extract as extract_attachment
 from envelock.core.enums import AuthResult, MailDirection, SourceMechanism
 from envelock.core.events import (
     AttachmentRef,
@@ -116,6 +117,11 @@ def _attachments(msg: EmailMessage) -> tuple[AttachmentRef, ...]:
             continue
         payload = part.get_payload(decode=True) or b""
         name = filename.lower()
+        # Pull text (and QR URLs) out of PDF/DOCX/image attachments so A1 sees a
+        # changed IBAN inside an attached invoice, and B3 sees a quishing URL. The
+        # extracted text is transient — used for this analysis, never persisted.
+        content_type = part.get_content_type()
+        extracted, qr_urls = extract_attachment(payload, mime=content_type, filename=filename)
         refs.append(
             AttachmentRef(
                 filename=filename,
@@ -123,9 +129,11 @@ def _attachments(msg: EmailMessage) -> tuple[AttachmentRef, ...]:
                 # here makes the shared cross-tenant verdict cache automatic.
                 sha256=hashlib.sha256(payload).hexdigest(),
                 size_bytes=len(payload),
-                declared_mime=part.get_content_type(),
+                declared_mime=content_type,
                 detected_mime=_sniff(payload),
                 is_archive=name.endswith(_ARCHIVE_EXT),
+                extracted_text=extracted or None,
+                qr_urls=qr_urls,
             )
         )
     return tuple(refs)

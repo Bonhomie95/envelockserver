@@ -117,7 +117,10 @@ class Settings(BaseSettings):
     detonation_monthly_cap_per_mailbox: int = 150
 
     # ── Notifications (PRD §8.1) ─────────────────────────────────────────────
-    smtp_host: str = "localhost"
+    #: Unset by default (like every other provider): L2 email is disabled until a
+    #: real SMTP host is configured, rather than silently failing against
+    #: localhost. L0 in-app always covers the alert regardless.
+    smtp_host: str = ""
     smtp_port: int = 587
     smtp_username: str | None = None
     smtp_password: SecretStr | None = None
@@ -130,8 +133,54 @@ class Settings(BaseSettings):
     sms_provider: str | None = None
     sms_api_key: SecretStr | None = None
     sms_sender_id: str = "Envelock"
+    #: Provider REST endpoint for SMS. Twilio-style form POST by default; any
+    #: provider that accepts an HTTP form/JSON body works via sms_provider.
+    sms_api_url: str | None = None
+    sms_account_sid: str | None = None  # Twilio account SID (basic-auth user)
     escalate_critical_after_seconds: int = 900
     escalate_unacked_count: int = 5
+
+    # ── Background scheduler (PRD §8.1 E6, §15.2 retention, §17 watchers) ─────
+    #: The in-process periodic scheduler that runs everything that must fire on a
+    #: timer: E6 escalation, retention purge, OAuth token refresh, and the
+    #: Channel-3 domain watchers. Disabled in the test suite (which drives each
+    #: job directly); on by default so the product actually *does* things.
+    scheduler_enabled: bool = True
+    escalation_cycle_seconds: int = 60
+    retention_purge_seconds: int = 3600
+    oauth_refresh_seconds: int = 1800
+    #: Channel-3 CT-log watcher (certstream). The free Guard tier and the S12
+    #: pre-signup demo depend on this running.
+    ct_watcher_enabled: bool = True
+    #: How often the watcher reloads the set of protected domains from the DB.
+    watcher_domain_refresh_seconds: int = 300
+
+    # ── Tenant isolation (PRD §11, §15) ──────────────────────────────────────
+    #: Enforce Postgres row-level security by connecting through the restricted
+    #: `envelock_app` role and setting the per-request tenant GUC. Off by default
+    #: because it requires the RLS migration + role to be provisioned first; when
+    #: on, every session sets `envelock.tenant_id` so the DB backstops isolation
+    #: even if an application query forgets its `WHERE tenant_id`.
+    rls_enabled: bool = False
+
+    #: Require DNS domain-control verification before a mailbox on that domain can
+    #: be connected for live mail. On by default so nobody can sign up with a
+    #: company address they do not control and receive that company's alerts.
+    require_domain_verification: bool = True
+
+    # ── Sender-domain reputation (free feeds — user requirement #3) ──────────
+    #: DNSBL zones queried for the FROM domain's registrable domain. All free and
+    #: DNS-based (no API key). Spamhaus DBL is free for low-volume/non-commercial
+    #: — audit terms before high volume (README licensing note).
+    domain_reputation_enabled: bool = True
+    dnsbl_domain_zones: str = "dbl.spamhaus.org,multi.surbl.org"
+    reputation_cache_seconds: int = 3600
+
+    # ── Tier-4 forwarding ingest authentication (PRD §5.4 / security) ────────
+    #: Comma-separated CIDR/IP allowlist of forwarders permitted to submit to the
+    #: SMTP/HTTP ingest. Empty = allow any (dev only). A per-tenant token in the
+    #: RCPT address is necessary but not sufficient; pin the source too.
+    ingest_allowed_ips: str = ""
 
     # ── Billing (PRD §12) ────────────────────────────────────────────────────
     trial_days: int = 15
@@ -203,6 +252,14 @@ class Settings(BaseSettings):
     @property
     def egress_ip_pool(self) -> list[str]:
         return [ip.strip() for ip in self.imap_egress_ips.split(",") if ip.strip()]
+
+    @property
+    def dnsbl_domain_zone_list(self) -> list[str]:
+        return [z.strip() for z in self.dnsbl_domain_zones.split(",") if z.strip()]
+
+    @property
+    def ingest_allowed_ip_list(self) -> list[str]:
+        return [ip.strip() for ip in self.ingest_allowed_ips.split(",") if ip.strip()]
 
     @model_validator(mode="after")
     def _reject_leaked_comments(self) -> Settings:

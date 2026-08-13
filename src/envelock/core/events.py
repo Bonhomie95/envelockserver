@@ -75,6 +75,14 @@ class AttachmentRef(_Base):
     is_encrypted: bool = False
     """Password-protected archive — often with the password in the body (B5)."""
 
+    extracted_text: str | None = None
+    """Text pulled from a PDF/DOCX/image attachment at parse time so A1 can find a
+    changed IBAN inside an attached invoice — the most common BEC delivery vector.
+    Transient (analysis-only); never persisted (E13 metadata-only holds)."""
+
+    qr_urls: tuple[str, ...] = ()
+    """URLs decoded from QR codes in an image attachment (B3 quishing)."""
+
 
 class AuthenticationResults(_Base):
     """Header-derived, free, and feeds B8."""

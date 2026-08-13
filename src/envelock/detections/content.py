@@ -344,6 +344,27 @@ _BRAND_BAIT = re.compile(
 )
 
 
+def score_url(url: str, *, sender: str, ctx: DetectionContext) -> list[str]:
+    """Reasons a single URL looks like phishing. Shared by B1 and B3 (quishing) so
+    a link is judged identically whether it arrived in the body or inside a QR
+    code. `ctx.malicious_domains` carries the merged free-feed + cross-tenant
+    reputation set."""
+    host = _host_of(url)
+    reg = registrable_domain(host)
+    reasons: list[str] = []
+    if reg in _SHORTENERS:
+        reasons.append("link shortener hides the destination")
+    if reg in ctx.malicious_domains:
+        reasons.append("on a threat feed")
+    if _BRAND_BAIT.search(url) and reg != sender:
+        reasons.append("brand name in a URL not owned by that brand")
+    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
+        reasons.append("bare IP address instead of a hostname")
+    if "@" in url.split("//", 1)[-1].split("/", 1)[0]:
+        reasons.append("credentials embedded in the URL")
+    return reasons
+
+
 @dataclass(frozen=True)
 class _B1PhishingUrls:
     service: str = "B1"
@@ -351,26 +372,22 @@ class _B1PhishingUrls:
 
     def evaluate(self, ctx: DetectionContext) -> list[FindingResult]:
         mail = ctx.mail
-        if mail is None or not _external(ctx) or not mail.urls:
+        if mail is None or not _external(ctx):
+            return []
+        # Consider body URLs *and* URLs decoded from QR codes in attachments — the
+        # latter is exactly the quishing evasion gateways miss.
+        qr_urls = tuple(u for a in mail.attachments for u in a.qr_urls)
+        all_urls = tuple(dict.fromkeys([*mail.urls, *qr_urls]))
+        if not all_urls:
             return []
 
         sender = registrable_domain(mail.sender.domain)
         suspicious: list[dict] = []
-        for url in mail.urls:
-            host = _host_of(url)
-            reg = registrable_domain(host)
-            reasons = []
-            if reg in _SHORTENERS:
-                reasons.append("link shortener hides the destination")
-            if reg in ctx.malicious_domains:
-                reasons.append("on a threat feed")
-            if _BRAND_BAIT.search(url) and reg != sender:
-                reasons.append("brand name in a URL not owned by that brand")
-            if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
-                reasons.append("bare IP address instead of a hostname")
-            if "@" in url.split("//", 1)[-1].split("/", 1)[0]:
-                reasons.append("credentials embedded in the URL")
+        for url in all_urls:
+            reasons = score_url(url, sender=sender, ctx=ctx)
             if reasons:
+                if url in qr_urls:
+                    reasons.append("decoded from a QR code")
                 suspicious.append({"url": url[:200], "reasons": reasons})
 
         if not suspicious:
@@ -437,8 +454,35 @@ class _B3QrPhishing:
         ]
         if not images:
             return []
-        # A QR code plus payment language is the quishing pattern; the decoded
-        # target is checked by B1 once the worker resolves it.
+
+        # Decode-and-check: any QR code we decoded from an image attachment is run
+        # through the same URL reputation logic as B1. A suspicious decoded target
+        # is High — this is the quishing case gateways miss.
+        sender = registrable_domain(mail.sender.domain)
+        decoded_bad: list[dict] = []
+        decoded_any = False
+        for att in images:
+            for url in att.qr_urls:
+                decoded_any = True
+                reasons = score_url(url, sender=sender, ctx=ctx)
+                if reasons:
+                    decoded_bad.append({"url": url[:200], "reasons": reasons})
+        if decoded_bad:
+            return [
+                FindingResult(
+                    service="B3",
+                    tier=AlertTier.HIGH,
+                    score=80,
+                    summary=(
+                        f"QR code in an image attachment points to a suspicious "
+                        f"link ({len(decoded_bad)} flagged) — quishing."
+                    ),
+                    evidence={"decoded": decoded_bad[:5]},
+                )
+            ]
+
+        # No decoder available (system zbar missing) or a clean-but-present QR
+        # alongside payment/sign-in language is still worth a Medium glance.
         if not has_payment_context(_body(ctx)) and not _BRAND_BAIT.search(_body(ctx)):
             return []
         return [
@@ -448,7 +492,8 @@ class _B3QrPhishing:
                 score=45,
                 summary=(
                     f"{len(images)} image attachment(s) alongside payment or "
-                    f"sign-in language — queued for QR decoding."
+                    f"sign-in language"
+                    + (" — QR decoded, target clean" if decoded_any else "")
                 ),
                 evidence={"images": [a.filename for a in images][:5]},
             )

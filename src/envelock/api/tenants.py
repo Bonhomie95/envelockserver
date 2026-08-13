@@ -209,6 +209,133 @@ async def bootstrap(req: BootstrapRequest, principal: CurrentUser, session: Sess
     }
 
 
+# ── Domain-control verification (PRD signup funnel) ──────────────────────────
+#: Test seam: the suite injects a fake so verification runs without live DNS.
+_DOMAIN_VERIFIER = None
+
+
+def set_domain_verifier(fn) -> None:  # noqa: ANN001
+    """Override the DNS verifier (tests). `fn(domain, token, method=...) -> bool`."""
+    global _DOMAIN_VERIFIER
+    _DOMAIN_VERIFIER = fn
+
+
+def _verify_domain_control(domain: str, token: str, *, method: str) -> bool:
+    if _DOMAIN_VERIFIER is not None:
+        return _DOMAIN_VERIFIER(domain, token, method=method)
+    from envelock.util.dns_verify import verify
+
+    return verify(domain, token, method=method)
+
+
+async def _require_verified_domain(
+    session: AsyncSession, tenant_id: UUID, address: str
+) -> None:
+    """Block connecting a mailbox for live mail until its domain is DNS-verified.
+
+    Free-mail addresses (gmail.com, qq.com…) have no domain to verify and are the
+    no-domain segment (PRD §12.6), so they are exempt. Everything else must prove
+    control first."""
+    from envelock.config import get_settings
+    from envelock.util.domains import is_free_mail
+
+    if not get_settings().require_domain_verification:
+        return
+    reg = registrable_domain(address.split("@", 1)[-1])
+    if not reg or is_free_mail(reg):
+        return
+    row = (
+        await session.execute(
+            select(Domain).where(
+                Domain.tenant_id == tenant_id, Domain.registrable_domain == reg
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None or row.verified_at is None:
+        raise HTTPException(
+            403,
+            f"verify control of {reg} first — add the DNS record from "
+            f"GET /domains/{reg}/verification and POST /domains/{reg}/verify. "
+            "This stops anyone connecting a mailbox on a domain they don't own.",
+        )
+
+
+async def _load_domain(session: AsyncSession, tenant_id: UUID, domain: str) -> Domain | None:
+    reg = registrable_domain(domain)
+    return (
+        await session.execute(
+            select(Domain).where(
+                Domain.tenant_id == tenant_id, Domain.registrable_domain == reg
+            )
+        )
+    ).scalar_one_or_none()
+
+
+@router.get("/domains/{domain}/verification")
+async def domain_verification_challenge(
+    domain: str, principal: CurrentUser, session: Session
+) -> dict:
+    """The DNS record to add to prove control of the domain. Idempotent — safe to
+    poll while the customer configures DNS."""
+    from envelock.util.dns_verify import challenge_host, cname_target, txt_record_value
+
+    row = await _load_domain(session, principal.tenant_id, domain)
+    if row is None:
+        raise HTTPException(404, "domain not found on this account")
+    if not row.verification_token:
+        row.verification_token = new_ingest_token()
+        await session.commit()
+    reg = row.registrable_domain
+    token = row.verification_token
+    return {
+        "domain": reg,
+        "verified": row.verified_at is not None,
+        "txt": {"host": challenge_host(reg), "type": "TXT", "value": txt_record_value(token)},
+        "cname": {"host": challenge_host(reg), "type": "CNAME", "value": cname_target(token)},
+    }
+
+
+@router.post("/domains/{domain}/verify")
+async def verify_domain(
+    domain: str, principal: AdminUser, session: Session
+) -> dict:
+    """Check the DNS challenge and mark the domain verified. Until a domain is
+    verified, no mailbox on it can be connected for live mail (see mailbox
+    connect), which stops someone signing up with a company address they do not
+    control."""
+    row = await _load_domain(session, principal.tenant_id, domain)
+    if row is None:
+        raise HTTPException(404, "domain not found on this account")
+    if row.verified_at is not None:
+        return {"domain": row.registrable_domain, "verified": True, "already": True}
+    if not row.verification_token:
+        raise HTTPException(409, "no verification challenge issued — request one first")
+
+    ok = _verify_domain_control(
+        row.registrable_domain, row.verification_token, method=row.verification_method or "txt"
+    )
+    if not ok:
+        raise HTTPException(
+            422,
+            "DNS record not found yet. Add the TXT (or CNAME) record shown at "
+            "GET /domains/{domain}/verification, then try again — DNS can take a "
+            "few minutes to propagate.",
+        )
+    row.verified_at = datetime.now(UTC)
+    session.add(
+        AuditEvent(
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            action="domain.verified",
+            target_type="domain",
+            target_id=row.id,
+            detail={"domain": row.registrable_domain},
+        )
+    )
+    await session.commit()
+    return {"domain": row.registrable_domain, "verified": True}
+
+
 @router.get("/tenant")
 async def current_tenant(principal: CurrentUser, session: Session) -> dict:
     """The signed-in user's tenant — its name, plan and registered domains.
@@ -615,6 +742,7 @@ async def connect_imap(
     mail. Protected mailboxes hold an IDLE connection (quarantine latency is the
     product); Monitored mailboxes poll (PRD §12.11D)."""
     mailbox = await _mailbox_or_404(session, mailbox_id, principal.tenant_id)
+    await _require_verified_domain(session, principal.tenant_id, mailbox.address)
 
     # Prove the credentials work before storing them. Reporting "connected" on a
     # wrong password (then silently ingesting nothing) is worse than an error.
@@ -735,6 +863,7 @@ async def connect_forward(
     not a bug.
     """
     mailbox = await _mailbox_or_404(session, mailbox_id, principal.tenant_id)
+    await _require_verified_domain(session, principal.tenant_id, mailbox.address)
     mailbox.sources = sorted(
         set(mailbox.sources or []) | {SourceMechanism.FORWARD_INGEST.value}
     )

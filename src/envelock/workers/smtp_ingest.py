@@ -37,6 +37,18 @@ class ForwardingSMTPHandler:
         self._ingest = ingest or build_forwarding_ingest()
 
     async def handle_RCPT(self, server, session, envelope, address, rcpt_options):  # noqa: N802, ANN001, ARG002
+        # Pin the source: only the customer's known forwarders (or our inbound
+        # provider) may submit. The token in the address proves the tenant, not the
+        # sender — without this, a leaked token lets anyone inject mail.
+        from envelock.security.ipfilter import ingest_ip_allowed
+
+        peer_ip = None
+        peer = getattr(session, "peer", None)
+        if isinstance(peer, (tuple, list)) and peer:
+            peer_ip = peer[0]
+        if not ingest_ip_allowed(peer_ip):
+            logger.warning("rejected forwarded mail from disallowed source %s", peer_ip)
+            return "550 sender not permitted"
         result = await self._ingest.handle_rcpt(address)
         if not result.accepted:
             return result.reason  # e.g. "550 unknown recipient"

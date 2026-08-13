@@ -153,11 +153,22 @@ async def build_context(
 
     counterparty = None
     baseline: dict[str, float] = {}
+    #: The cross-tenant graph plus anything the free reputation feeds flag on this
+    #: message's sender domain (user requirement #3).
+    malicious_domains: set[str] = set(GRAPH.known_bad())
     if isinstance(event, MailEvent) and event.direction is MailDirection.INBOUND:
         sender_domain = registrable_domain(event.sender.domain)
         counterparty = await _counterparty_state(
             session, tenant_id=tenant_id, domain=sender_domain
         )
+        # Check the FROM domain against free public blocklists. A hit adds it to the
+        # malicious set so B1 (URLs) and B7 (sender reputation) fire on it.
+        if sender_domain and sender_domain not in owned_domains:
+            from envelock.channels.external.reputation import check_sender_domain
+
+            rep = await check_sender_domain(sender_domain)
+            if rep.listed:
+                malicious_domains.add(sender_domain)
         profile = (
             await session.execute(
                 select(SenderProfile).where(
@@ -192,7 +203,7 @@ async def build_context(
         known_devices=frozenset(known_devices),
         previous_session=previous,
         sender_baseline=baseline,
-        malicious_domains=GRAPH.known_bad(),
+        malicious_domains=frozenset(malicious_domains),
         attachment_verdicts=attachment_verdicts or {},
         sender_domain_age_days=sender_domain_age_days,
         mfa_enabled=mfa_enabled,
@@ -255,9 +266,14 @@ async def learn(session: AsyncSession, event: MailEvent, *, tenant_id: UUID) -> 
         .all()
     )
     if not existing:
-        for bank in extract_bank_identifiers(
-            " ".join(filter(None, [event.subject, event.body_text]))
-        ):
+        _learn_text = " ".join(
+            filter(
+                None,
+                [event.subject, event.body_text,
+                 *(a.extracted_text for a in event.attachments if a.extracted_text)],
+            )
+        )
+        for bank in extract_bank_identifiers(_learn_text):
             session.add(
                 BankRecord(
                     tenant_id=tenant_id,

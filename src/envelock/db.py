@@ -8,10 +8,11 @@ Native Postgres column types (ARRAY, JSONB) are used directly (see `types.py`).
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, MetaData
+from sqlalchemy import DateTime, MetaData, event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -21,6 +22,16 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from envelock.config import get_settings
+
+#: The tenant whose rows the current task may touch. Set by the auth dependency
+#: (per request) or explicitly by a worker acting for one tenant. When RLS is
+#: enabled, this drives the `envelock.tenant_id` GUC on every connection, so the
+#: database backstops isolation even if an application query forgets its filter.
+current_tenant_id: ContextVar[str | None] = ContextVar("current_tenant_id", default=None)
+
+
+def set_current_tenant(tenant_id: UUID | str | None) -> None:
+    current_tenant_id.set(str(tenant_id) if tenant_id else None)
 
 NAMING = {
     "ix": "ix_%(column_0_label)s",
@@ -83,7 +94,23 @@ def get_engine() -> AsyncEngine:
             # the test suite, which spins up many short-lived event loops.
             kwargs = {"poolclass": NullPool}
         _engine = create_async_engine(dsn, **kwargs)
+        if settings.rls_enabled:
+            _install_rls_guc(_engine)
     return _engine
+
+
+def _install_rls_guc(engine: AsyncEngine) -> None:
+    """Set the `envelock.tenant_id` GUC at the start of every transaction from the
+    `current_tenant_id` contextvar, so Postgres row-level security scopes every
+    query to the active tenant (PRD §11). A request with no tenant in context
+    (e.g. an unauthenticated call) sets an empty string, which the RLS policy
+    treats as "match nothing" — fail closed, never leak."""
+
+    @event.listens_for(engine.sync_engine, "begin")
+    def _set_tenant(conn) -> None:  # noqa: ANN001
+        tid = current_tenant_id.get() or ""
+        # Parameterised via set_config to avoid any SQL injection through the id.
+        conn.exec_driver_sql("SELECT set_config('envelock.tenant_id', %s, true)", (tid,))
 
 
 def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
@@ -113,6 +140,13 @@ _RUNTIME_COLUMNS: tuple[str, ...] = (
     "ALTER TABLE mailbox_credentials ADD COLUMN IF NOT EXISTS "
     "imap_security varchar(16) DEFAULT 'ssl'",
     "ALTER TABLE mailbox_credentials ADD COLUMN IF NOT EXISTS imap_username varchar(320)",
+    # OAuth access-token expiry, tracked in plaintext so the refresh scheduler can
+    # find due tokens without decrypting every credential.
+    "ALTER TABLE mailbox_credentials ADD COLUMN IF NOT EXISTS "
+    "token_expires_at timestamptz",
+    # Domain-verification challenge method (txt|cname) alongside the token.
+    "ALTER TABLE domains ADD COLUMN IF NOT EXISTS "
+    "verification_method varchar(8) NOT NULL DEFAULT 'txt'",
 )
 
 
@@ -120,7 +154,6 @@ async def create_all() -> None:
     """Create any missing tables, then backfill any newly added columns. Idempotent,
     so it is safe to run on every startup — this is what makes "just point at a
     fresh Postgres" work. Alembic remains available for managed migrations and RLS."""
-    from sqlalchemy import text
 
     from envelock import models  # noqa: F401  (register metadata)
 

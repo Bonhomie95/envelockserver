@@ -202,6 +202,10 @@ async def oauth_authorize(
     if mailbox is None:
         raise HTTPException(404, "mailbox not found")
 
+    from envelock.api.tenants import _require_verified_domain
+
+    await _require_verified_domain(session, principal.tenant_id, mailbox.address)
+
     state = oauth.issue_state(
         tenant_id=str(principal.tenant_id),
         mailbox=mailbox.address,
@@ -277,6 +281,9 @@ async def oauth_callback(
             select(MailboxCredential).where(MailboxCredential.mailbox_id == mailbox.id)
         )
     ).scalar_one_or_none()
+    from datetime import UTC, datetime, timedelta
+
+    token_expires_at = datetime.now(UTC) + timedelta(seconds=tokens.expires_in)
     if existing is None:
         session.add(
             MailboxCredential(
@@ -286,6 +293,7 @@ async def oauth_callback(
                 ciphertext=sealed.ciphertext,
                 wrapped_dek=sealed.wrapped_dek,
                 key_id=sealed.key_id,
+                token_expires_at=token_expires_at,
             )
         )
     else:
@@ -293,6 +301,7 @@ async def oauth_callback(
         existing.ciphertext = sealed.ciphertext
         existing.wrapped_dek = sealed.wrapped_dek
         existing.key_id = sealed.key_id
+        existing.token_expires_at = token_expires_at
 
     # The mailbox is now Tier-1: record the sources so coverage is derived, not
     # declared (PRD P4). Preserve any existing sensor source.
@@ -505,6 +514,59 @@ async def flag_changed(req: FlagChanged, principal: CurrentUser, session: Sessio
         ],
         "alerted": result.alerted,
     }
+
+
+# ── L1 Web Push subscription (PRD §8.1) ──────────────────────────────────────
+class PushSubscribeRequest(BaseModel):
+    endpoint: str = Field(min_length=8, max_length=2000)
+    p256dh: str = Field(min_length=8, max_length=255)
+    auth: str = Field(min_length=8, max_length=255)
+
+
+@router.post("/push/subscribe")
+async def push_subscribe(
+    req: PushSubscribeRequest, principal: CurrentUser, session: Session
+) -> dict:
+    """Register this browser for L1 Web Push. Without this write path the free push
+    rung can never fire — the sender has no one to send to (PRD §8.1)."""
+    existing = (
+        await session.execute(
+            select(PushSubscription).where(PushSubscription.endpoint == req.endpoint)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        existing.user_id = principal.user_id
+        existing.tenant_id = principal.tenant_id
+        existing.p256dh = req.p256dh
+        existing.auth = req.auth
+    else:
+        session.add(
+            PushSubscription(
+                tenant_id=principal.tenant_id,
+                user_id=principal.user_id,
+                endpoint=req.endpoint,
+                p256dh=req.p256dh,
+                auth=req.auth,
+            )
+        )
+    await session.commit()
+    return {"subscribed": True}
+
+
+@router.post("/push/unsubscribe")
+async def push_unsubscribe(
+    req: PushSubscribeRequest, principal: CurrentUser, session: Session
+) -> dict:
+    from sqlalchemy import delete as sql_delete
+
+    await session.execute(
+        sql_delete(PushSubscription).where(
+            PushSubscription.endpoint == req.endpoint,
+            PushSubscription.user_id == principal.user_id,
+        )
+    )
+    await session.commit()
+    return {"subscribed": False}
 
 
 @router.get("/sensor/config")

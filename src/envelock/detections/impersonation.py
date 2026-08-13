@@ -29,7 +29,14 @@ def _body(ctx: DetectionContext) -> str:
     mail = ctx.mail
     if mail is None:
         return ""
-    return " ".join(filter(None, [mail.subject, mail.body_text]))
+    parts = [mail.subject, mail.body_text]
+    # A1's most common real case: the changed IBAN lives inside an attached PDF or
+    # Word invoice, or an image. The parser extracted that text; fold it in so the
+    # payment-fraud detections see it exactly as if it were in the body.
+    for att in mail.attachments:
+        if att.extracted_text:
+            parts.append(att.extracted_text)
+    return " ".join(filter(None, parts))
 
 
 def _is_external(ctx: DetectionContext) -> bool:

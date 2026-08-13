@@ -249,3 +249,37 @@ async def exchange_code(
         scope=body.get("scope"),
         raw=body,
     )
+
+
+async def refresh_tokens(
+    provider: OAuthProvider,
+    *,
+    refresh_token: str,
+    transport: Transport | None = None,
+) -> OAuthTokens:
+    """Exchange a refresh token for a fresh access token (PRD §17.1 — without this,
+    Tier-1 mailboxes go dark ~1h after connection).
+
+    Some providers rotate the refresh token on use (Google can); others return
+    none, in which case the caller keeps the existing one.
+    """
+    if not is_configured(provider):
+        raise OAuthError(f"{provider.id} OAuth is not configured")
+    transport = transport or _DEFAULT_TRANSPORT or HttpxTransport()
+    data = {
+        "client_id": provider.client_id(),
+        "client_secret": provider.client_secret(),
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+    body = await transport.post_form(provider.token_endpoint, data)
+    if "access_token" not in body:
+        raise OAuthError(f"token refresh returned no access_token: {body!r}")
+    return OAuthTokens(
+        access_token=body["access_token"],
+        # Keep the durable token if the provider didn't rotate it.
+        refresh_token=body.get("refresh_token") or refresh_token,
+        expires_in=int(body.get("expires_in", 3600)),
+        scope=body.get("scope"),
+        raw=body,
+    )

@@ -9,7 +9,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from envelock.api import admin, auth, billing, channels, governance, health, tenants, v1
+from envelock.api import (
+    admin,
+    auth,
+    billing,
+    channels,
+    governance,
+    health,
+    tenants,
+    v1,
+    webhooks,
+)
 from envelock.config import get_settings
 from envelock.detections import (  # noqa: F401  (registers detections)
     content,
@@ -110,15 +120,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         logger.info("imap poll worker enabled (%ss)", settings.imap_poll_worker_seconds)
 
+    # The periodic scheduler (PRD §8.1 E6, §15.2 retention, §17 watchers). This is
+    # what makes escalation fire, data actually get purged, OAuth tokens stay alive,
+    # and the free Guard tier's CT-log watcher run. One instance owns it.
+    scheduler_stop = asyncio.Event()
+    scheduler_tasks: list[asyncio.Task] = []
+    if settings.scheduler_enabled:
+        from envelock.workers import scheduler as sched
+
+        scheduler_tasks = sched.start(scheduler_stop)
+
     yield
 
+    scheduler_stop.set()
     if imap_task is not None:
         imap_stop.set()
         imap_task.cancel()
-        import contextlib
+    import contextlib
 
+    for task in [imap_task, *scheduler_tasks]:
+        if task is None:
+            continue
+        task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await imap_task
+            await task
 
     logger.info("envelock stopped")
 
@@ -161,6 +186,7 @@ def create_app() -> FastAPI:
     app.include_router(governance.router)
     app.include_router(tenants.router)
     app.include_router(channels.router)
+    app.include_router(webhooks.router)
     app.include_router(admin.router)
     return app
 

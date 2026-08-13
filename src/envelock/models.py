@@ -106,6 +106,8 @@ class Domain(Base, UUIDMixin, TimestampMixin):
     registrable_domain: Mapped[str] = mapped_column(String(253), index=True)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     verification_token: Mapped[str | None] = mapped_column(String(64))
+    #: How the challenge is proven: a DNS TXT record or a CNAME (PRD signup funnel).
+    verification_method: Mapped[str] = mapped_column(String(8), default="txt")
     #: Defensive/parked domains are monitored free and unlimited (PRD §12.5).
     is_defensive: Mapped[bool] = mapped_column(Boolean, default=False)
     integration_tier: Mapped[int | None] = mapped_column(Integer)
@@ -240,6 +242,9 @@ class MailboxCredential(Base, UUIDMixin, TimestampMixin):
     #: Last time the broker successfully polled this mailbox (distinct from the
     #: mailbox's own last_sync_at, which the UI shows).
     imap_last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: OAuth access-token expiry (Tier 1). Plaintext so the refresh scheduler can
+    #: find due tokens without decrypting the sealed credential.
+    token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -467,6 +472,39 @@ class UsageMeter(Base, UUIDMixin, TimestampMixin):
     __table_args__ = (UniqueConstraint("tenant_id", "day"),)
 
 
+class ExportToken(Base, UUIDMixin, TimestampMixin):
+    """A persisted, read-only export/SIEM API token (PRD §15.3).
+
+    Only a SHA-256 hash is stored — the plaintext is shown once at creation. The
+    `prefix` lets a presented token be looked up without a table scan; `scopes`
+    are read-only by construction."""
+
+    __tablename__ = "export_tokens"
+
+    tenant_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    prefix: Mapped[str] = mapped_column(String(16), index=True)
+    hashed: Mapped[str] = mapped_column(String(64))
+    scopes: Mapped[list[str]] = mapped_column(StringList, default=list)
+    created_by: Mapped[UUID | None] = mapped_column(Uuid)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WebhookEndpoint(Base, UUIDMixin, TimestampMixin):
+    """A registered outbound SIEM webhook (PRD §15.3). Deliveries are HMAC-signed
+    with `secret` and retried on the backoff schedule."""
+
+    __tablename__ = "webhook_endpoints"
+
+    tenant_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    url: Mapped[str] = mapped_column(Text)
+    secret: Mapped[str] = mapped_column(String(128))
+    events: Mapped[list[str]] = mapped_column(StringList, default=list)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_delivery_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_status: Mapped[str | None] = mapped_column(String(32))
+
+
 class Invoice(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "invoices"
 
@@ -491,6 +529,8 @@ __all__ = [
     "Counterparty",
     "Decimal",
     "Domain",
+    "ExportToken",
+    "WebhookEndpoint",
     "DomainTrialLedger",
     "Finding",
     "GraphVerdict",

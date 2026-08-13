@@ -32,6 +32,10 @@ dependencies = [
     "google-api-python-client>=2.150",
     "google-auth>=2.36",
 
+    # Notifications
+    "aiosmtplib>=3.0",           # L2 async SMTP delivery
+    "dkimpy>=1.1",               # DKIM-sign outbound alert email (we must pass D5)
+
     # Channel 2 — identity
     "pywebpush>=2.0",            # L1 push, self-hosted VAPID
     "user-agents>=2.2",
@@ -49,6 +53,10 @@ dependencies = [
     "oletools>=0.60",              # macro extraction
     "pdfminer.six>=20240706",
     "pypdf>=5.1",
+    "python-docx>=1.1",            # A1 — extract bank details from .docx invoices
+    "pyzbar>=0.1.9",               # B3 — decode QR codes ("quishing")
+    "pytesseract>=0.3.13",         # A1 — OCR bank details from image attachments
+    "pillow>=11.0",                # image decoding for OCR + QR
     "schwifty>=2024.11",           # IBAN validation — A1
     "python-stdnum>=1.20",         # SWIFT/BIC, sort codes — A1
 

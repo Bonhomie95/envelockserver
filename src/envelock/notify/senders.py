@@ -23,6 +23,13 @@ from envelock.core.enums import AlertTier
 from envelock.notify.ladder import Rung
 
 
+async def _to_thread(fn, *args, **kwargs):  # noqa: ANN001, ANN201
+    """Run a blocking provider SDK call (pywebpush, requests) off the event loop."""
+    import asyncio
+
+    return await asyncio.to_thread(lambda: fn(*args, **kwargs))
+
+
 @dataclass(frozen=True, slots=True)
 class Notification:
     alert_id: UUID
@@ -115,11 +122,35 @@ class PushSender(Sender):
             }
         )
 
-    async def send(self, notification: Notification, *, to: str) -> SendResult:
+    async def send(
+        self, notification: Notification, *, to: str, keys: dict | None = None
+    ) -> SendResult:
+        """Live Web Push via VAPID. `to` is the push endpoint; `keys` carries the
+        subscription's p256dh/auth. Without keys we cannot encrypt, so we record the
+        intent and report skipped rather than pretending delivery."""
         if not self.configured:
             return self._unconfigured()
-        self.sent.append({"endpoint": to, "payload": self.payload(notification)})
-        return SendResult(self.rung, True, "web push queued", sent_at=datetime.now(UTC))
+        payload = self.payload(notification)
+        if not keys or not keys.get("p256dh") or not keys.get("auth"):
+            return SendResult(self.rung, False, "push subscription missing encryption keys")
+        try:
+            from pywebpush import webpush
+
+            await _to_thread(
+                webpush,
+                subscription_info={
+                    "endpoint": to,
+                    "keys": {"p256dh": keys["p256dh"], "auth": keys["auth"]},
+                },
+                data=payload,
+                vapid_private_key=self.private_key,
+                vapid_claims={"sub": self.subject},
+                ttl=notification.tier is AlertTier.CRITICAL and 86400 or 3600,
+            )
+        except Exception as exc:  # noqa: BLE001 — a dead subscription is not fatal
+            return SendResult(self.rung, False, f"web push failed: {exc}")
+        self.sent.append({"endpoint": to, "payload": payload})
+        return SendResult(self.rung, True, "web push sent", sent_at=datetime.now(UTC))
 
 
 # ── L2: email ────────────────────────────────────────────────────────────────
@@ -151,6 +182,10 @@ class EmailSender(Sender):
     def has_fallback(self) -> bool:
         return bool(self.relay_dsn)
 
+    @property
+    def dkim_key_path(self) -> str | None:
+        return get_settings().smtp_dkim_private_key_path
+
     def build(self, notification: Notification, *, to: str) -> EmailMessage:
         msg = EmailMessage()
         msg["Subject"] = f"[{notification.tier.value.upper()}] {notification.title}"
@@ -178,19 +213,87 @@ class EmailSender(Sender):
         message = self.build(notification, to=to)
         try:
             await self._deliver(message)
-        except (smtplib.SMTPException, OSError) as exc:
+        except (smtplib.SMTPException, OSError, RuntimeError) as exc:
             if notification.tier is AlertTier.CRITICAL and self.has_fallback:
+                try:
+                    await self._deliver_via_relay(message)
+                except Exception as relay_exc:  # noqa: BLE001
+                    return SendResult(
+                        self.rung, False,
+                        f"primary failed ({exc}); relay also failed ({relay_exc})",
+                    )
                 return SendResult(
                     self.rung, True, f"primary failed ({exc}); sent via relay fallback",
                     sent_at=datetime.now(UTC),
                 )
             return SendResult(self.rung, False, f"smtp error: {exc}")
-        self.sent.append(message)
         return SendResult(self.rung, True, "sent", sent_at=datetime.now(UTC))
 
+    def _sign_dkim(self, message: EmailMessage) -> None:
+        """DKIM-sign the message so it passes at the providers we monitor. We of
+        all companies must pass our own D5 posture check (PRD §8.3). Best-effort:
+        an unavailable signer or key is logged upstream, not fatal."""
+        key_path = self.dkim_key_path
+        if not key_path:
+            return
+        try:
+            import dkim  # type: ignore[import-untyped]
+
+            domain = self.from_addr.split("@", 1)[-1].encode()
+            with open(key_path, "rb") as fh:
+                private_key = fh.read()
+            sig = dkim.sign(
+                message=message.as_bytes(),
+                selector=self.dkim_selector.encode(),
+                domain=domain,
+                privkey=private_key,
+                include_headers=[b"from", b"to", b"subject"],
+            )
+            header, _, value = sig.decode().partition(":")
+            message[header.strip()] = value.strip()
+        except Exception:  # noqa: BLE001, S110 — never let signing block a Critical alert
+            pass
+
     async def _deliver(self, message: EmailMessage) -> None:
-        """Overridden in tests; the live path uses aiosmtplib."""
+        """Live SMTP delivery via aiosmtplib, with DKIM signing. Overridden in
+        tests. A network failure here raises so `send` can invoke the relay
+        fallback for Critical alerts."""
+        self._sign_dkim(message)
+        import aiosmtplib
+
+        await aiosmtplib.send(
+            message,
+            hostname=self.host,
+            port=self.port,
+            username=self.username or None,
+            password=self.password or None,
+            start_tls=self.port in (587, 25),
+            use_tls=self.port == 465,
+            timeout=20,
+        )
         self.sent.append(message)
+
+    async def _deliver_via_relay(self, message: EmailMessage) -> None:
+        """Relay fallback for Critical alerts when the primary is degraded
+        (PRD §8.3 — ship the fallback from day one, not after the first incident).
+        `relay_dsn` is smtp[s]://user:pass@host:port."""
+        if not self.relay_dsn:
+            raise RuntimeError("no relay fallback configured")
+        from urllib.parse import urlparse
+
+        import aiosmtplib
+
+        u = urlparse(self.relay_dsn)
+        await aiosmtplib.send(
+            message,
+            hostname=u.hostname,
+            port=u.port or 587,
+            username=u.username,
+            password=u.password,
+            start_tls=u.scheme != "smtps",
+            use_tls=u.scheme == "smtps",
+            timeout=20,
+        )
 
 
 # ── L3: SMS ──────────────────────────────────────────────────────────────────
@@ -229,8 +332,41 @@ class SmsSender(Sender):
         if not self.configured:
             return self._unconfigured()
         cost = _SMS_COST_MICROS.get(self.provider or "", 20000)
-        self.sent.append({"to": to, "text": self.compose(notification)})
+        text = self.compose(notification)
+        try:
+            await self._deliver_sms(to, text)
+        except Exception as exc:  # noqa: BLE001 — SMS is a nudge, never the only rung
+            return SendResult(self.rung, False, f"sms failed: {exc}")
+        self.sent.append({"to": to, "text": text})
         return SendResult(self.rung, True, f"sent via {self.provider}", cost, datetime.now(UTC))
+
+    async def _deliver_sms(self, to: str, text: str) -> None:
+        """Live SMS. Twilio's form-POST is the default shape; a generic provider
+        with `sms_api_url` receives the same form body. Overridable in tests."""
+        import httpx
+
+        s = get_settings()
+        if self.provider == "twilio" and s.sms_account_sid:
+            url = (
+                f"https://api.twilio.com/2010-04-01/Accounts/"
+                f"{s.sms_account_sid}/Messages.json"
+            )
+            auth = (s.sms_account_sid, self.api_key or "")
+            data = {"To": to, "From": self.sender_id, "Body": text}
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(url, data=data, auth=auth)
+                resp.raise_for_status()
+            return
+        # Generic provider: POST form to the configured endpoint with a bearer key.
+        if not s.sms_api_url:
+            raise RuntimeError("sms_api_url not configured for a non-Twilio provider")
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                s.sms_api_url,
+                json={"to": to, "from": self.sender_id, "text": text},
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            )
+            resp.raise_for_status()
 
 
 # ── Dispatcher ───────────────────────────────────────────────────────────────
