@@ -176,6 +176,24 @@ _RUNTIME_COLUMNS: tuple[str, ...] = (
     "phone_verified boolean NOT NULL DEFAULT false",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_otp_hash varchar(64)",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_otp_expires_at timestamptz",
+    # ── Widen columns that an older schema sized too small ───────────────────
+    # `ADD COLUMN IF NOT EXISTS` cannot fix a column that already exists with the
+    # wrong TYPE. An old `users.password_hash varchar(32)` truncates a scrypt hash
+    # (~76 chars) and 500s every registration. Widening varchar is a metadata-only,
+    # data-safe change in Postgres; setting a column to the size it already has is a
+    # harmless no-op. These run after the ADDs above, so the column always exists.
+    "ALTER TABLE users ALTER COLUMN password_hash TYPE varchar(255)",
+    "ALTER TABLE users ALTER COLUMN email TYPE varchar(320)",
+    "ALTER TABLE users ALTER COLUMN name TYPE varchar(255)",
+    "ALTER TABLE users ALTER COLUMN role TYPE varchar(16)",
+    "ALTER TABLE users ALTER COLUMN status TYPE varchar(16)",
+    "ALTER TABLE users ALTER COLUMN totp_secret TYPE varchar(64)",
+    "ALTER TABLE users ALTER COLUMN out_of_band_email TYPE varchar(320)",
+    "ALTER TABLE users ALTER COLUMN phone TYPE varchar(32)",
+    "ALTER TABLE users ALTER COLUMN phone_otp_hash TYPE varchar(64)",
+    "ALTER TABLE tenants ALTER COLUMN name TYPE varchar(255)",
+    "ALTER TABLE tenants ALTER COLUMN plan TYPE varchar(32)",
+    "ALTER TABLE tenants ALTER COLUMN billing_term TYPE varchar(16)",
 )
 
 
@@ -184,12 +202,25 @@ async def create_all() -> None:
     so it is safe to run on every startup — this is what makes "just point at a
     fresh Postgres" work. Alembic remains available for managed migrations and RLS."""
 
+    import logging
+
     from envelock import models  # noqa: F401  (register metadata)
+
+    logger = logging.getLogger("envelock.db")
 
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        for stmt in _RUNTIME_COLUMNS:
-            await conn.execute(text(stmt))
+
+    # Each self-heal statement runs in its OWN transaction and is tolerant: a
+    # single ALTER that can't apply (e.g. a legacy column with unexpected data)
+    # is logged and skipped rather than aborting startup and taking the whole
+    # service down. The rest still apply.
+    for stmt in _RUNTIME_COLUMNS:
+        try:
+            async with get_engine().begin() as conn:
+                await conn.execute(text(stmt))
+        except Exception as exc:  # noqa: BLE001 — one bad stmt must not block boot
+            logger.warning("runtime schema statement skipped: %s — %s", stmt, exc)
 
 
 async def dispose() -> None:
