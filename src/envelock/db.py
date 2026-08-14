@@ -147,6 +147,35 @@ _RUNTIME_COLUMNS: tuple[str, ...] = (
     # Domain-verification challenge method (txt|cname) alongside the token.
     "ALTER TABLE domains ADD COLUMN IF NOT EXISTS "
     "verification_method varchar(8) NOT NULL DEFAULT 'txt'",
+    # ── Auth self-heal ──────────────────────────────────────────────────────
+    # A database first built by an older release can be missing columns that
+    # register/login/MFA write. Bringing them up to date here means a plain
+    # redeploy fixes a drifted schema WITHOUT dropping data (the old, lossy path
+    # was ENVELOCK_RESET_SCHEMA_ON_STARTUP). All nullable or defaulted so they
+    # apply cleanly to a populated table.
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS plan varchar(32) NOT NULL DEFAULT 'guard'",
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS "
+    "billing_term varchar(16) NOT NULL DEFAULT 'monthly'",
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS trial_started_at timestamptz",
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS trial_ends_at timestamptz",
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS "
+    "payment_method_ok boolean NOT NULL DEFAULT false",
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id uuid",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS name varchar(255)",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash varchar(255)",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS role varchar(16) NOT NULL DEFAULT 'member'",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin boolean NOT NULL DEFAULT false",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret varchar(64)",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_enabled boolean NOT NULL DEFAULT false",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+    "recovery_hashes varchar[] NOT NULL DEFAULT '{}'",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS out_of_band_email varchar(320)",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone varchar(32)",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+    "phone_verified boolean NOT NULL DEFAULT false",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_otp_hash varchar(64)",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_otp_expires_at timestamptz",
 )
 
 

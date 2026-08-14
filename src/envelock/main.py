@@ -194,6 +194,30 @@ def create_app() -> FastAPI:
         max_age=600,
     )
 
+    # A 500 raised inside a handler is turned into a response by Starlette's
+    # ServerErrorMiddleware, which sits *outside* the CORS layer — so that error
+    # never gets an Access-Control-Allow-Origin header, and the browser reports it
+    # as a misleading "CORS policy" block instead of the real error. Attaching the
+    # CORS header here means a real 500 surfaces as a real 500 the client can read.
+    from fastapi import Request
+    from fastapi.responses import JSONResponse
+
+    @app.exception_handler(Exception)
+    async def _unhandled(request: Request, exc: Exception) -> JSONResponse:  # noqa: ANN001
+        logger.exception(
+            "unhandled error on %s %s", request.method, request.url.path
+        )
+        resp = JSONResponse(
+            status_code=500,
+            content={"detail": "internal server error", "path": request.url.path},
+        )
+        origin = request.headers.get("origin")
+        if origin and origin in settings.cors_origin_list:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Vary"] = "Origin"
+        return resp
+
     app.include_router(health.router, tags=["health"])
     app.include_router(v1.router, tags=["v1"])
     app.include_router(auth.router)
