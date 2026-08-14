@@ -197,10 +197,60 @@ _RUNTIME_COLUMNS: tuple[str, ...] = (
 )
 
 
+def _reconcile_plan(sync_conn) -> list[str]:  # noqa: ANN001
+    """Compare every mapped table to the live database and return the DDL needed to
+    bring the database up to the models — WITHOUT dropping anything.
+
+    Two kinds of drift on a long-running database bite `create_all` (which only ever
+    creates whole *missing tables*): a column the models added later that the live
+    table lacks, and a column the live table sized too small for what the app now
+    writes (the real Render failure: `users.password_hash varchar(32)` truncating a
+    scrypt hash). This introspects the DB and emits, per table that already exists:
+
+      * `ADD COLUMN` for every model column missing on the live table — always
+        NULLABLE (never NOT NULL), so it applies cleanly to a populated table; the
+        ORM supplies values on write.
+      * `ALTER COLUMN … TYPE varchar(N)` for every text column the DB sized SMALLER
+        than the model. Only ever *widens* — never shrinks (which could truncate) —
+        and widening a varchar in Postgres is a metadata-only, data-safe change.
+
+    Purely additive and non-destructive: no DROP, no NOT NULL, no narrowing.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    insp = sa_inspect(sync_conn)
+    dialect = sync_conn.dialect
+    existing_tables = set(insp.get_table_names())
+    stmts: list[str] = []
+
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue  # a brand-new table — create_all already built it in full
+        db_cols = {c["name"]: c for c in insp.get_columns(table.name)}
+        for col in table.columns:
+            if col.name not in db_cols:
+                type_sql = col.type.compile(dialect=dialect)
+                stmts.append(
+                    f'ALTER TABLE "{table.name}" '
+                    f'ADD COLUMN IF NOT EXISTS "{col.name}" {type_sql}'
+                )
+                continue
+            model_len = getattr(col.type, "length", None)
+            db_len = getattr(db_cols[col.name]["type"], "length", None)
+            if isinstance(model_len, int) and isinstance(db_len, int) and db_len < model_len:
+                stmts.append(
+                    f'ALTER TABLE "{table.name}" '
+                    f'ALTER COLUMN "{col.name}" TYPE varchar({model_len})'
+                )
+    return stmts
+
+
 async def create_all() -> None:
-    """Create any missing tables, then backfill any newly added columns. Idempotent,
-    so it is safe to run on every startup — this is what makes "just point at a
-    fresh Postgres" work. Alembic remains available for managed migrations and RLS."""
+    """Create any missing tables, then reconcile the live schema to the models
+    (add missing columns, widen under-sized ones). Idempotent, so it is safe to run
+    on every startup — this is what makes "just point at a Postgres, even a drifted
+    one" work without dropping data. Alembic remains available for managed
+    migrations and RLS."""
 
     import logging
 
@@ -211,16 +261,33 @@ async def create_all() -> None:
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    # Each self-heal statement runs in its OWN transaction and is tolerant: a
-    # single ALTER that can't apply (e.g. a legacy column with unexpected data)
-    # is logged and skipped rather than aborting startup and taking the whole
-    # service down. The rest still apply.
-    for stmt in _RUNTIME_COLUMNS:
+    # Generic, whole-schema reconcile: introspect the live DB and fix ANY table that
+    # is missing columns or has an under-sized one — not just the hand-listed few.
+    # This is what catches drift on tables we didn't anticipate here.
+    try:
+        async with get_engine().connect() as conn:
+            plan = await conn.run_sync(_reconcile_plan)
+    except Exception as exc:  # noqa: BLE001 — introspection failure must not block boot
+        logger.warning("schema reconcile introspection skipped: %s", exc)
+        plan = []
+
+    # Specific defaults/types first (some columns want a server DEFAULT the generic
+    # ADD can't infer), then the generic reconcile as the catch-all. Each statement
+    # runs in its OWN transaction and is tolerant: a single ALTER that can't apply
+    # (e.g. a legacy column with unexpected data) is logged and skipped rather than
+    # aborting startup and taking the whole service down. The rest still apply.
+    applied = 0
+    for stmt in (*_RUNTIME_COLUMNS, *plan):
         try:
             async with get_engine().begin() as conn:
                 await conn.execute(text(stmt))
+            if stmt in plan:
+                logger.info("schema reconcile: %s", stmt)
+                applied += 1
         except Exception as exc:  # noqa: BLE001 — one bad stmt must not block boot
             logger.warning("runtime schema statement skipped: %s — %s", stmt, exc)
+    if applied:
+        logger.warning("schema reconcile applied %d drift-fix statement(s)", applied)
 
 
 async def dispose() -> None:
