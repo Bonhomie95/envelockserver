@@ -339,3 +339,33 @@ async def test_poll_cycle_covers_all_connected_imap_mailboxes(session):
     assert totals["mailboxes"] == 1
     assert totals["alerted"] == 1
     assert totals["quarantined"] == 1
+
+
+async def test_backfill_analyses_recent_history(session):
+    """E11 onboarding backfill actually pulls history and runs it through the
+    pipeline (seeding A9/A12 baselines), and never quarantines old mail."""
+    from envelock.workers.imap_fetch import backfill_mailbox
+
+    mailbox = await _connected_mailbox(
+        session, cls=MailboxClass.PROTECTED, source=SourceMechanism.IMAP_POLL
+    )
+    # Two historical messages waiting in the mailbox.
+    client = FakeImapClient(messages={5: _benign_raw(), 9: _phishing_raw("9")})
+
+    result = await backfill_mailbox(
+        session, mailbox, days=30, client_factory=_factory_for(client)
+    )
+    assert result["ok"] is True
+    assert result["analysed"] == 2
+
+    # Messages were persisted (baselines seeded) and the mailbox is marked.
+    msgs = (
+        await session.execute(select(Message).where(Message.mailbox_id == mailbox.id))
+    ).scalars().all()
+    assert len(msgs) == 2
+    await session.refresh(mailbox)
+    assert mailbox.backfilled_at is not None
+
+    # Backfill never quarantines historical mail, even the phishing one.
+    assert client.moved == []
+    assert 9 in client.messages

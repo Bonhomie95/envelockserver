@@ -63,6 +63,10 @@ class DetectionContext:
     sender_domain_age_days: int | None = None
     #: Whether the mailbox has MFA enabled, for C13.
     mfa_enabled: bool | None = None
+    #: Display names of the tenant's own people (mailbox owners), for exec /
+    #: staff impersonation (a sender using a colleague's name from an outside
+    #: address — classic CEO fraud). Lower-cased.
+    internal_names: frozenset[str] = frozenset()
     now: datetime | None = None
 
     @property

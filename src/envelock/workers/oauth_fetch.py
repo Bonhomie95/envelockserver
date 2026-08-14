@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from envelock.channels.mail.api_fetch import gmail_fetch, graph_fetch
+from envelock.channels.mail.forward_runner import _recipients
 from envelock.channels.mail.oauth_refresh import current_access_token
 from envelock.core.enums import SourceMechanism
 from envelock.db import get_sessionmaker
@@ -43,15 +44,6 @@ async def _owned_domains(session: AsyncSession, tenant_id: UUID) -> frozenset[st
         )
     ).all()
     return frozenset(d for (d,) in rows)
-
-
-async def _recipients(session: AsyncSession, tenant_id: UUID) -> frozenset[str]:
-    rows = (
-        await session.execute(
-            select(Mailbox.address).where(Mailbox.tenant_id == tenant_id)
-        )
-    ).all()
-    return frozenset(a for (a,) in rows)
 
 
 async def sync_oauth_mailbox(

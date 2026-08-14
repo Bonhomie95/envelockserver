@@ -202,6 +202,57 @@ def fetch_new(
                 client.logout()
 
 
+def fetch_since(
+    *,
+    host: str,
+    port: int,
+    security: str,
+    username: str,
+    password: str,
+    since_date,  # noqa: ANN001 — datetime.date
+    folder: str = "INBOX",
+    limit: int = DEFAULT_LIMIT,
+    timeout: float = 30.0,
+    client_factory: ClientFactory | None = None,
+) -> FetchResult:
+    """Pull messages received on or after ``since_date`` — onboarding backfill (E11).
+
+    Distinct from ``fetch_new``: it searches by date rather than a UID cursor, so it
+    can reach back over history the day a mailbox is connected. The caller runs each
+    returned message through the pipeline to seed A9 stylometry and A12 baselines,
+    then does NOT advance the live cursor from this (a subsequent poll owns that).
+    """
+    client: ImapClientLike | None = None
+    try:
+        client = _open(
+            host=host, port=port, security=security, username=username,
+            password=password, timeout=timeout, client_factory=client_factory,
+        )
+        info = client.select_folder(folder, readonly=True)
+        server_uidvalidity = _as_int(info.get(b"UIDVALIDITY") or info.get("UIDVALIDITY"))
+        # IMAP SINCE takes a date; the server returns everything on/after it.
+        criteria = ["SINCE", since_date.strftime("%d-%b-%Y")]
+        wanted = sorted(_as_int_list(client.search(criteria)))[-limit:]
+        if not wanted:
+            return FetchResult(messages=[], uidvalidity=server_uidvalidity, ok=True)
+        raw_by_uid = client.fetch(wanted, ["RFC822"])
+        messages: list[FetchedMessage] = []
+        for uid in wanted:
+            entry = raw_by_uid.get(uid) or {}
+            raw = entry.get(b"RFC822") or entry.get("RFC822")
+            if raw:
+                messages.append(FetchedMessage(uid=int(uid), raw=bytes(raw)))
+        return FetchResult(messages=messages, uidvalidity=server_uidvalidity, ok=True)
+    except _AuthError as exc:
+        return FetchResult(ok=False, error=f"login rejected: {exc}", auth_failed=True)
+    except Exception as exc:  # noqa: BLE001
+        return FetchResult(ok=False, error=_reason(exc))
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.logout()
+
+
 def quarantine_message(
     *,
     host: str,

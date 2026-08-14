@@ -130,7 +130,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         scheduler_tasks = sched.start(scheduler_stop)
 
+    # Tier-4 forwarding ingest (SMTP). Optional in-app listener so forwarding works
+    # without a separate process; production may instead point MX at a dedicated host.
+    smtp_stop = asyncio.Event()
+    smtp_task: asyncio.Task | None = None
+    if settings.ingest_smtp_in_app:
+        from envelock.workers.smtp_ingest import run_forever as smtp_run
+
+        smtp_task = asyncio.create_task(smtp_run(smtp_stop))
+        logger.info(
+            "smtp forwarding ingest enabled in-app (%s:%s)",
+            settings.ingest_smtp_host, settings.ingest_smtp_port,
+        )
+
     yield
+
+    smtp_stop.set()
 
     scheduler_stop.set()
     if imap_task is not None:
@@ -138,7 +153,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         imap_task.cancel()
     import contextlib
 
-    for task in [imap_task, *scheduler_tasks]:
+    for task in [imap_task, smtp_task, *scheduler_tasks]:
         if task is None:
             continue
         task.cancel()

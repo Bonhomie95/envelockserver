@@ -217,6 +217,84 @@ async def sync_mailbox(
     }
 
 
+async def backfill_mailbox(
+    session: AsyncSession,
+    mailbox: Mailbox,
+    *,
+    days: int,
+    limit: int | None = None,
+    client_factory=None,  # noqa: ANN001
+) -> dict:
+    """Onboarding backfill (E11): pull the last ``days`` of history and run each
+    message through the pipeline so A9 stylometry and A12 baselines work on day one,
+    not day ninety. Analysis + learning only — old mail is never quarantined.
+
+    ``days`` is the look-back window and ``limit`` the message ceiling (defaults to
+    ENVELOCK_BACKFILL_MAX_MESSAGES) — a large ``days`` scans effectively all history."""
+    from datetime import timedelta
+
+    from envelock.config import get_settings
+
+    if limit is None:
+        limit = get_settings().backfill_max_messages
+
+    from envelock.channels.mail.parser import parse_message
+
+    cred = (
+        await session.execute(
+            select(MailboxCredential).where(MailboxCredential.mailbox_id == mailbox.id)
+        )
+    ).scalar_one_or_none()
+    if cred is None or cred.kind != "imap_password" or not cred.imap_host:
+        return {"ok": False, "reason": "no imap credential", "analysed": 0}
+
+    from envelock.db import set_current_tenant
+
+    set_current_tenant(mailbox.tenant_id)
+    try:
+        password = _decrypt_password(cred)
+    except CryptoError:
+        return {"ok": False, "reason": "credential could not be decrypted", "analysed": 0}
+
+    since_date = (datetime.now(UTC) - timedelta(days=days)).date()
+    result = await asyncio.to_thread(
+        imap_sync.fetch_since,
+        host=cred.imap_host,
+        port=cred.imap_port or 993,
+        security=cred.imap_security or "ssl",
+        username=(cred.imap_username or mailbox.address).strip(),
+        password=password,
+        since_date=since_date,
+        limit=limit,
+        client_factory=client_factory,
+    )
+    if not result.ok:
+        return {"ok": False, "reason": result.error, "analysed": 0}
+
+    owned = await _owned_domains(session, mailbox.tenant_id)
+    recipients = await _recipients(session, mailbox.tenant_id)
+    analysed = 0
+    for msg in result.messages:
+        event = parse_message(
+            msg.raw,
+            tenant_id=mailbox.tenant_id,
+            mailbox_id=mailbox.id,
+            source=SourceMechanism.IMAP_POLL,
+            owned_domains=owned,
+            remediable=False,  # never quarantine historical mail
+            source_ref=str(msg.uid),
+        )
+        await analyse_event(
+            session, event, tenant_id=mailbox.tenant_id,
+            owned_domains=owned, recipients=recipients,
+        )
+        analysed += 1
+
+    mailbox.backfilled_at = datetime.now(UTC)
+    await session.commit()
+    return {"ok": True, "analysed": analysed, "days": days}
+
+
 async def _imap_mailboxes(session: AsyncSession) -> list[Mailbox]:
     """Every active mailbox that has an IMAP source and a stored credential."""
     rows = (

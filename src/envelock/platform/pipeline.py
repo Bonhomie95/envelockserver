@@ -191,6 +191,19 @@ async def build_context(
         ).all()
     }
 
+    # The tenant's own people's names — so we can catch a sender using a
+    # colleague's name from an outside address (CEO/staff impersonation).
+    internal_names: set[str] = set()
+    if isinstance(event, MailEvent) and event.direction is MailDirection.INBOUND:
+        name_rows = (
+            await session.execute(
+                select(Mailbox.display_name).where(
+                    Mailbox.tenant_id == tenant_id, Mailbox.display_name.isnot(None)
+                )
+            )
+        ).all()
+        internal_names = {n.strip().lower() for (n,) in name_rows if n and n.strip()}
+
     caps = capabilities_for(frozenset(sources))
     return DetectionContext(
         event=event,
@@ -198,6 +211,7 @@ async def build_context(
         capabilities=caps,
         owned_domains=owned_domains,
         known_counterparties=frozenset(known),
+        internal_names=frozenset(internal_names),
         counterparty=counterparty,
         active_sessions=active_sessions,
         known_devices=frozenset(known_devices),
@@ -370,6 +384,14 @@ async def analyse_event(
 
     findings = run_all(ctx)
     assessment = assess(findings)
+
+    # AI cascade (last rung): only the ambiguous payment/impersonation band reaches
+    # the LLM judge, capped per mailbox. It can confirm/escalate a verdict and
+    # annotate the alert; it never lowers a rule tier. Off unless a provider is set.
+    if persist:
+        from envelock.llm.cascade import refine
+
+        assessment, _verdict = await refine(session, event, assessment, tenant_id=tenant_id)
 
     message_id: UUID | None = None
     if persist and isinstance(event, MailEvent):

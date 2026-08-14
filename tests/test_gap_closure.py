@@ -361,3 +361,73 @@ async def test_scheduler_jobs_run(db) -> None:
     esc = await scheduler.escalation_job()
     ret = await scheduler.retention_job()
     assert "escalated" in esc and "purged" in ret
+
+
+# ── Plain-English, client-facing detection copy (no jargon, no numbers) ──────
+def _plain_ctx(raw: str, *, counterparty=None, known=frozenset(), internal=frozenset(),
+               owned=frozenset({"acme.com"}), age=None):
+    event = parse_message(
+        raw.encode(), tenant_id=uuid4(), mailbox_id=uuid4(),
+        source=SourceMechanism.IMAP_IDLE, owned_domains=owned, remediable=True,
+    )
+    return DetectionContext(
+        event=event, tenant_id="t",
+        capabilities=capabilities_for(frozenset({SourceMechanism.IMAP_IDLE})),
+        owned_domains=owned, known_counterparties=known, counterparty=counterparty,
+        internal_names=internal, sender_domain_age_days=age,
+    )
+
+
+def test_known_sender_lookalike_reads_plainly() -> None:
+    # A domain the client emails with (claude.ai) suddenly becomes ciaude.ai.
+    raw = (
+        "From: \"Claude\" <billing@ciaude.ai>\n"
+        "To: pay@acme.com\n"
+        "Subject: invoice\n"
+        "Message-ID: <x@ciaude.ai>\n"
+        "Content-Type: text/plain\n\n"
+        "Please pay the attached invoice.\n"
+    )
+    findings = run_all(_plain_ctx(raw, known=frozenset({"claude.ai"})))
+    look = next((f for f in findings if f.service in ("A3", "A4")), None)
+    assert look is not None
+    s = look.summary
+    # Names the real domain, the fake, frames it as someone they email with,
+    # and reads in plain English — no internal jargon or scores.
+    assert "ciaude.ai" in s and "claude.ai" in s and "email" in s.lower()
+    for banned in ("homoglyph", "cousin", "tld_swap", "similarity", "%", "score"):
+        assert banned not in s.lower()
+
+
+def test_first_contact_new_domain_reads_plainly() -> None:
+    raw = (
+        "From: \"Drome\" <accounts@drome.ai>\n"
+        "To: pay@acme.com\n"
+        "Subject: payment setup\n"
+        "Message-ID: <x@drome.ai>\n"
+        "Content-Type: text/plain\n\n"
+        "Please set up payment to our account for the invoice.\n"
+    )
+    # First contact, brand-new domain, no prior ties.
+    findings = run_all(_plain_ctx(raw, age=10))
+    a7 = next((f for f in findings if f.service == "A7"), None)
+    assert a7 is not None
+    assert "first email" in a7.summary.lower() and "drome.ai" in a7.summary
+    assert "recently" in a7.summary.lower()  # names the new-domain reason
+
+
+def test_exec_impersonation_from_outside_address() -> None:
+    # A sender uses a colleague's name but the mail came from outside — CEO fraud.
+    raw = (
+        "From: \"Jane Okafor\" <jane.okafor.ceo@gmail.com>\n"
+        "To: pay@acme.com\n"
+        "Subject: quick favor\n"
+        "Message-ID: <x@gmail.com>\n"
+        "Content-Type: text/plain\n\n"
+        "Can you process a wire for me? I'm in a meeting.\n"
+    )
+    findings = run_all(_plain_ctx(raw, internal=frozenset({"jane okafor"})))
+    a5 = next((f for f in findings if f.service == "A5"), None)
+    assert a5 is not None
+    assert "your company" in a5.summary.lower() and "gmail.com" in a5.summary
+    assert a5.tier is AlertTier.HIGH

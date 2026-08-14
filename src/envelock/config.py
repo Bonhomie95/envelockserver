@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     ingest_domain: str = "in.envelock.io"
     ingest_smtp_host: str = "0.0.0.0"  # noqa: S104
     ingest_smtp_port: int = 2525
+    #: Start the forwarding SMTP listener inside the API process so Tier-4
+    #: forwarding works without deploying a separate process. Off by default and
+    #: in tests; a dedicated MX host is still the production-scale option.
+    ingest_smtp_in_app: bool = False
 
     # ── Channel 2 ────────────────────────────────────────────────────────────
     vapid_public_key: str | None = None
@@ -106,6 +110,35 @@ class Settings(BaseSettings):
     # ── Detection cascades (PRD §12.12) ──────────────────────────────────────
     safebrowsing_api_key: SecretStr | None = None
     urlhaus_enabled: bool = True
+
+    # ── AI cascade (last rung — LLM BEC-intent judge, PRD §12.11 §12.12) ─────
+    #: Provider for the LLM judge: "none" (off, default), "anthropic", "openai",
+    #: or "local" (any OpenAI-compatible endpoint — Ollama, vLLM, llama.cpp).
+    #: The judge only runs on the small fraction of mail the rules already flag as
+    #: ambiguous/risky (the cascade gate), and is capped per mailbox, so cost stays
+    #: near-zero. It can confirm or escalate a verdict, never silently suppress one.
+    llm_provider: Literal["none", "anthropic", "openai", "local"] = "none"
+    #: Hard monthly cap on judge calls per mailbox (COGS guardrail).
+    llm_max_calls_per_mailbox_month: int = 200
+    #: Confidence (0-1) the judge must reach before it acts on a verdict.
+    llm_min_confidence: float = 0.75
+    llm_timeout_seconds: float = 20.0
+
+    # Anthropic — cheap, fast Haiku is the right last-rung triage default; raise to
+    # a larger model only if the fall-through data justifies it (§12.12D).
+    anthropic_api_key: SecretStr | None = None
+    anthropic_model: str = "claude-haiku-4-5"
+    anthropic_base_url: str = "https://api.anthropic.com"
+
+    # OpenAI (also the shape used by "local"). gpt-4o-mini is the cost default.
+    openai_api_key: SecretStr | None = None
+    openai_model: str = "gpt-4o-mini"
+    openai_base_url: str = "https://api.openai.com/v1"
+
+    # Local / self-hosted OpenAI-compatible server (Ollama default port shown).
+    local_llm_base_url: str = "http://localhost:11434/v1"
+    local_llm_model: str = "llama3.1"
+    local_llm_api_key: SecretStr | None = None
 
     clamav_host: str = "localhost"
     clamav_port: int = 3310
@@ -186,6 +219,10 @@ class Settings(BaseSettings):
     trial_days: int = 15
     trial_backfill_days: int = 30
     backfill_days: int = 90
+    #: Max messages a single backfill sweep will pull per mailbox. Generous so
+    #: onboarding can scan the whole recent history, bounded so a pathologically
+    #: huge mailbox can't stall a worker. A "scan everything" backfill uses this.
+    backfill_max_messages: int = 5000
 
     # Public origin of the web app, used to build Stripe Checkout return URLs
     # (success/cancel). Server-built rather than client-supplied so a caller can't

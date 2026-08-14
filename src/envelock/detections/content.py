@@ -138,8 +138,9 @@ class _A5DisplayNameSpoof:
                         tier=AlertTier.HIGH if free else AlertTier.MEDIUM,
                         score=70,
                         summary=(
-                            f'Display name "{mail.sender.display}" claims {known} '
-                            f"but the message came from {sender}."
+                            f'The sender name says "{mail.sender.display}", suggesting '
+                            f"{known}, but the email actually came from {sender}, which "
+                            f"isn't theirs. Don't trust it without checking."
                         ),
                         evidence={
                             "display_name": mail.sender.display,

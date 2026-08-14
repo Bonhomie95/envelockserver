@@ -33,6 +33,7 @@ from envelock.models import (
     MailboxCredential,
     PushSubscription,
     SensorSession,
+    Tenant,
     User,
 )
 from envelock.notify.dispatch import deliver_pending
@@ -779,17 +780,48 @@ async def ingest_message(
 
 # ── E11 — backfill ───────────────────────────────────────────────────────────
 @router.post("/mailboxes/{mailbox_id}/backfill")
-async def backfill(mailbox_id: UUID, principal: AdminUser, session: Session) -> dict:
+async def backfill(
+    mailbox_id: UUID,
+    principal: AdminUser,
+    session: Session,
+    full: bool = False,
+    days: int | None = None,
+) -> dict:
+    """Onboarding backfill (E11). Pulls previous mail and runs it through the
+    pipeline so A9 stylometry and A12 baselines work on day one. For an IMAP
+    mailbox this actually executes; other tiers return the plan (their history
+    arrives via the provider's own backfill or forwarding).
+
+    `full=true` scans essentially all available history (10 years back, up to the
+    per-mailbox message ceiling); `days=N` sets a specific look-back window."""
     mailbox = await session.get(Mailbox, mailbox_id)
     if mailbox is None or mailbox.tenant_id != principal.tenant_id:
         raise HTTPException(404, "mailbox not found")
-    plan = plan_backfill(mailbox_id=mailbox_id, in_trial=True)
+
+    tenant = await session.get(Tenant, principal.tenant_id)
+    in_trial = bool(
+        tenant and tenant.trial_ends_at and not tenant.payment_method_ok
+    )
+    plan = plan_backfill(mailbox_id=mailbox_id, in_trial=in_trial)
+    window = 3650 if full else (days if days and days > 0 else plan.days)
+
+    is_imap = any(
+        s in {SourceMechanism.IMAP_IDLE.value, SourceMechanism.IMAP_POLL.value}
+        for s in (mailbox.sources or [])
+    )
+    executed = None
+    if is_imap and not mailbox.needs_reconnect:
+        from envelock.workers.imap_fetch import backfill_mailbox
+
+        executed = await backfill_mailbox(session, mailbox, days=window)
+
     return {
         "mailbox": mailbox.address,
-        "days": plan.days,
+        "days": window,
         "since": plan.since.isoformat(),
         "estimated_batches": plan.estimated_batches,
         "reason": plan.reason,
+        "executed": executed,
     }
 
 
@@ -810,10 +842,37 @@ async def channel_status(principal: CurrentUser) -> dict:
 
 
 @router.get("/status/cost")
-async def cost_status(principal: AdminUser) -> dict:
+async def cost_status(principal: AdminUser, session: Session) -> dict:
     """Fall-through is the number that predicts COGS (PRD §12.12D)."""
+    from datetime import UTC, datetime
+
+    from sqlalchemy import func
+
+    from envelock.config import get_settings
+    from envelock.llm.providers import get_provider
+    from envelock.models import LlmUsage
+
+    settings = get_settings()
+    period = datetime.now(UTC).strftime("%Y-%m")
+    calls, cost = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(LlmUsage.calls), 0),
+                func.coalesce(func.sum(LlmUsage.cost_micros), 0),
+            ).where(LlmUsage.tenant_id == principal.tenant_id, LlmUsage.period == period)
+        )
+    ).one()
+    prov = get_provider()
     return {
         "attachments": _CASCADE.metrics.payload(),
         "urls": _URLS.metrics.payload(),
         "detonation_enabled": _CASCADE.detonation_enabled,
+        "ai_cascade": {
+            "provider": settings.llm_provider,
+            "configured": bool(prov and prov.configured),
+            "model": getattr(prov, "model", None),
+            "cap_per_mailbox_month": settings.llm_max_calls_per_mailbox_month,
+            "calls_this_month": int(calls),
+            "cost_micros_this_month": int(cost),
+        },
     }

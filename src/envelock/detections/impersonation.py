@@ -24,6 +24,15 @@ from envelock.util.payments import (
 
 _INBOUND = frozenset({Capability.READ_INBOUND})
 
+#: Plain-English explanation of *why* two domains look alike — no jargon reaches
+#: the client (PRD §16 keeps the internal technique codes out of view).
+_LOOKALIKE_PLAIN: dict[str, str] = {
+    "homoglyph": "letters swapped for look-alikes (like the letter i for l)",
+    "cousin": "extra or rearranged letters in the name",
+    "typosquat": "a slight misspelling of the name",
+    "tld_swap": "the same name with a different ending (like .com vs .co)",
+}
+
 
 def _body(ctx: DetectionContext) -> str:
     mail = ctx.mail
@@ -123,19 +132,31 @@ class _A3A4A5Impersonation:
             if result is None:
                 continue
             technique, score = result
-            tier = AlertTier.HIGH if score >= 0.9 else AlertTier.MEDIUM
+            # Say it the way a person would: name the real domain, name the fake,
+            # and whether it's someone they email with or their own name.
+            you_know = protected not in ctx.owned_domains
+            # A near-copy of a domain the client actually corresponds with — or a
+            # very close visual match — is High: it's impersonating a real relationship.
+            tier = AlertTier.HIGH if (score >= 0.9 or you_know) else AlertTier.MEDIUM
+            who = (
+                f"a company you exchange email with ({protected})"
+                if you_know
+                else f"your own domain ({protected})"
+            )
             findings.append(
                 FindingResult(
                     service="A4" if technique == "homoglyph" else "A3",
                     tier=tier,
                     score=int(score * 90),
                     summary=(
-                        f"{sender_domain} closely resembles {protected} "
-                        f"({technique.replace('_', ' ')})."
+                        f"This email address, {sender_domain}, is a near-copy of "
+                        f"{who} — {_LOOKALIKE_PLAIN.get(technique, 'a look-alike')}. "
+                        f"Confirm it's really them before trusting it."
                     ),
                     evidence={
                         "sender_domain": sender_domain,
                         "resembles": protected,
+                        "resembles_a_correspondent": you_know,
                         "technique": technique,
                         "similarity": round(score, 3),
                     },
@@ -143,29 +164,30 @@ class _A3A4A5Impersonation:
             )
             break  # closest single explanation is enough for the alert
 
-        # A5 — display name claims a counterparty, domain says otherwise.
+        # Brand display-name spoofing ("Gemini Accounts" from a non-Gemini domain)
+        # is handled by the dedicated A5 detection in content.py — not duplicated
+        # here. What this adds is the *internal* case below.
+
+        # CEO / staff impersonation: the sender uses the name of someone at the
+        # client's own company, but the email came from outside. This is the classic
+        # "urgent request from the boss" fraud, and it isn't a brand lookalike.
         display = (mail.sender.display or "").strip().lower()
-        if display and not findings:
-            for known in comparison:
-                brand = known.partition(".")[0]
-                if len(brand) >= 4 and brand in display and sender_domain != known:
-                    tier = (
-                        AlertTier.HIGH
-                        if is_free_mail(sender_domain)
-                        else AlertTier.MEDIUM
-                    )
+        if display and not findings and ctx.internal_names:
+            for name in ctx.internal_names:
+                if len(name) >= 4 and name in display:
                     findings.append(
                         FindingResult(
                             service="A5",
-                            tier=tier,
-                            score=70,
+                            tier=AlertTier.HIGH,
+                            score=80,
                             summary=(
-                                f'Display name "{mail.sender.display}" claims {known} '
-                                f"but the message was sent from {sender_domain}."
+                                f'This email uses the name of someone at your company '
+                                f'("{mail.sender.display}") but was sent from an outside '
+                                f"address, {sender_domain}. Verify before acting on it."
                             ),
                             evidence={
                                 "display_name": mail.sender.display,
-                                "claims": known,
+                                "impersonates_internal_name": name,
                                 "actual_domain": sender_domain,
                                 "free_mail": is_free_mail(sender_domain),
                             },
@@ -228,18 +250,32 @@ class _A7FirstContact:
         if not payment:
             return []
 
+        dom = registrable_domain(mail.sender.domain)
+        # If the domain is also newly registered, say so — a brand-new domain
+        # emailing you for the first time about money is the classic setup.
+        age = ctx.sender_domain_age_days
+        new_domain = age is not None and age <= 45
+        if new_domain:
+            summary = (
+                f"This is the first email you've ever had from {dom}, it's about "
+                f"payment, and the domain was only registered recently. Treat any "
+                f"request to pay or share details with caution."
+            )
+        else:
+            summary = (
+                f"This is the first email you've ever had from {dom}, and it's about "
+                f"payment. Confirm who they are before acting."
+            )
         return [
             FindingResult(
                 service="A7",
-                tier=AlertTier.HIGH if has_bank else AlertTier.MEDIUM,
-                score=70 if has_bank else 40,
-                summary=(
-                    f"First message ever from {registrable_domain(mail.sender.domain)}, "
-                    f"and it discusses payment."
-                ),
+                tier=AlertTier.HIGH if (has_bank or new_domain) else AlertTier.MEDIUM,
+                score=70 if (has_bank or new_domain) else 40,
+                summary=summary,
                 evidence={
-                    "sender_domain": registrable_domain(mail.sender.domain),
+                    "sender_domain": dom,
                     "contains_bank_details": has_bank,
+                    "domain_age_days": age,
                 },
             )
         ]

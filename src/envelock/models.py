@@ -505,6 +505,21 @@ class WebhookEndpoint(Base, UUIDMixin, TimestampMixin):
     last_status: Mapped[str | None] = mapped_column(String(32))
 
 
+class LlmUsage(Base, UUIDMixin, TimestampMixin):
+    """Per-mailbox monthly LLM-judge usage (AI cascade). Backs the cost cap and
+    the fall-through/COGS view — the number that predicts spend (PRD §12.12D)."""
+
+    __tablename__ = "llm_usage"
+
+    tenant_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    mailbox_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
+    period: Mapped[str] = mapped_column(String(7))  # YYYY-MM
+    calls: Mapped[int] = mapped_column(Integer, default=0)
+    cost_micros: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = (UniqueConstraint("mailbox_id", "period"),)
+
+
 class Invoice(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "invoices"
 
@@ -530,6 +545,7 @@ __all__ = [
     "Decimal",
     "Domain",
     "ExportToken",
+    "LlmUsage",
     "WebhookEndpoint",
     "DomainTrialLedger",
     "Finding",
