@@ -79,10 +79,70 @@ def verify(domain: str, token: str, *, method: str = "txt") -> bool:
     return verify_txt(domain, token) or verify_cname(domain, token)
 
 
+def _resolve_status(host: str, rdtype: str) -> tuple[str, list[str]]:
+    """Like `_resolve`, but tells apart a DEFINITIVE 'the record is not there'
+    (NXDOMAIN / NoAnswer from a working resolver) from a TRANSIENT failure
+    (timeout, no resolver, network down). Returns ('ok'|'absent'|'unknown', values).
+
+    This distinction is the whole safety of re-verification: a transient DNS blip
+    must never be read as 'the customer deleted their record' and used to revoke."""
+    try:
+        import dns.resolver
+
+        resolver = dns.resolver.Resolver()
+        resolver.lifetime = 8.0
+        answers = resolver.resolve(host, rdtype)
+        out: list[str] = []
+        for rdata in answers:
+            if rdtype == "TXT":
+                out.append(b"".join(rdata.strings).decode("utf-8", "ignore"))
+            elif hasattr(rdata, "target"):
+                out.append(str(rdata.target).rstrip("."))
+            else:
+                out.append(str(rdata))
+        return ("ok", out)
+    except Exception as exc:  # noqa: BLE001
+        name = type(exc).__name__
+        # NXDOMAIN (no such name) and NoAnswer (name exists, no such record) are
+        # authoritative "it's not there". Everything else — Timeout, NoNameservers,
+        # a missing dnspython — is inconclusive and must NOT trigger revocation.
+        if name in {"NXDOMAIN", "NoAnswer"}:
+            return ("absent", [])
+        logger.debug("dns resolve %s/%s inconclusive: %s", host, rdtype, exc)
+        return ("unknown", [])
+
+
+def verification_status(domain: str, token: str, *, method: str = "txt") -> str:
+    """Tri-state control check for the re-verification job: 'present' (a matching
+    record is live), 'absent' (a working resolver says no matching record exists),
+    or 'unknown' (couldn't determine — never revoke on this).
+
+    'absent' requires BOTH proofs to resolve definitively without a match, so a
+    single transient lookup keeps the domain verified until we can actually tell."""
+    if not token:
+        return "unknown"
+    want_txt = txt_record_value(token)
+    want_cname = cname_target(token).lower()
+    host = challenge_host(domain)
+
+    txt_status, txt_vals = _resolve_status(host, "TXT")
+    if any(want_txt == v.strip().strip('"') for v in txt_vals):
+        return "present"
+    cname_status, cname_vals = _resolve_status(host, "CNAME")
+    if any(v.lower().rstrip(".") == want_cname for v in cname_vals):
+        return "present"
+
+    # No match found. Only call it a real deletion if BOTH lookups were conclusive.
+    if txt_status in {"ok", "absent"} and cname_status in {"ok", "absent"}:
+        return "absent"
+    return "unknown"
+
+
 __all__ = [
     "challenge_host",
     "cname_target",
     "txt_record_value",
+    "verification_status",
     "verify",
     "verify_cname",
     "verify_txt",

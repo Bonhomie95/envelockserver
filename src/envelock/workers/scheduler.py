@@ -91,6 +91,16 @@ async def oauth_fetch_job() -> dict:
     return await fetch_all_oauth_mailboxes()
 
 
+async def domain_reverify_job() -> dict:
+    """Revoke a domain's verification if its DNS proof was deleted — so a domain we
+    once trusted can't stay trusted after the customer loses control of it. Only a
+    conclusive 'record absent' revokes; transient DNS failures are ignored."""
+    from envelock.api.tenants import revalidate_verified_domains
+
+    async with get_sessionmaker()() as session:
+        return await revalidate_verified_domains(session)
+
+
 # ── Channel-3 CT-log watcher ──────────────────────────────────────────────────
 async def _load_protected_domains() -> frozenset[str]:
     from sqlalchemy import select
@@ -186,6 +196,12 @@ def start(stop: asyncio.Event) -> list[asyncio.Task]:
             _run_forever(
                 "oauth_fetch", oauth_fetch_job,
                 interval=settings.oauth_refresh_seconds, stop=stop,
+            )
+        ),
+        asyncio.create_task(
+            _run_forever(
+                "domain_reverify", domain_reverify_job,
+                interval=settings.domain_reverify_seconds, stop=stop,
             )
         ),
     ]

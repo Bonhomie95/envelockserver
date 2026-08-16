@@ -262,10 +262,12 @@ def test_tenant_endpoint_returns_the_registered_domain(client: TestClient) -> No
     """The dashboard shows the tenant's real domain, so /tenant must return it
     after bootstrap — not leave the UI guessing from a mailbox."""
     h = _auth_header(client, email="owner@globex.com")
-    # Before bootstrap there is a tenant but no domain.
-    empty = client.get("/api/v1/tenant", headers=h).json()
-    assert empty["name"] is not None
-    assert empty["primary_domain"] is None
+    # The domain record is created at registration (from the owner's email), so it
+    # is present — unverified — before bootstrap is ever called. This is what makes
+    # onboarding resumable and the dashboard's verify-gate reliable.
+    early = client.get("/api/v1/tenant", headers=h).json()
+    assert early["name"] is not None
+    assert early["primary_domain"] == "globex.com"
 
     client.post(
         "/api/v1/tenants/bootstrap",
@@ -334,8 +336,11 @@ def test_bootstrap_rejects_a_company_name_as_domain(client: TestClient) -> None:
     )
     assert bad.status_code == 422
 
-    # No garbage domain was persisted.
-    assert client.get("/api/v1/tenant", headers=h).json()["primary_domain"] is None
+    # No garbage domain was persisted: the only domain is the legit one created at
+    # registration (validco.dev), never the "Valid Co" company name.
+    after_bad = client.get("/api/v1/tenant", headers=h).json()
+    assert after_bad["primary_domain"] == "validco.dev"
+    assert all(" " not in d["registrable_domain"] for d in after_bad["domains"])
 
     # The real domain still works.
     ok = client.post(

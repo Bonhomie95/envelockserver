@@ -109,16 +109,16 @@ def test_imap_connect_succeeds_when_credentials_verify(
 
 # ── Bulk add (issue 3) ────────────────────────────────────────────────────────
 def test_bulk_add_creates_many_and_skips_dupes(client: TestClient) -> None:
-    h = _session(client, "admin@bulkco.example", domain="bulkco.example")
+    h = _session(client, "admin@bulkpaste.example", domain="bulkpaste.example")
     out = client.post(
         "/api/v1/mailboxes/bulk",
         json={
             "addresses": [
-                "finance@bulkco.example",
-                "payroll@bulkco.example",
-                "finance@bulkco.example",  # duplicate within the paste
+                "finance@bulkpaste.example",
+                "payroll@bulkpaste.example",
+                "finance@bulkpaste.example",  # duplicate within the paste
                 "not-an-email",  # invalid
-                "  execs@bulkco.example  ",  # whitespace tolerated
+                "  execs@bulkpaste.example  ",  # whitespace tolerated
             ],
             "mailbox_class": "protected",
         },
@@ -130,4 +130,4 @@ def test_bulk_add_creates_many_and_skips_dupes(client: TestClient) -> None:
     assert body["skipped_count"] == 2
     listed = client.get("/api/v1/mailboxes", headers=h).json()["mailboxes"]
     addresses = {m["address"] for m in listed}
-    assert {"finance@bulkco.example", "payroll@bulkco.example", "execs@bulkco.example"} <= addresses
+    assert {"finance@bulkpaste.example", "payroll@bulkpaste.example", "execs@bulkpaste.example"} <= addresses

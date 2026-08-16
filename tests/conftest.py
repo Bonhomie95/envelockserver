@@ -78,6 +78,19 @@ def _schema() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_settings_cache() -> Iterator[None]:
+    """`get_settings()` is lru_cached and several tests flip env-driven flags
+    (e.g. ENVELOCK_REQUIRE_DOMAIN_VERIFICATION). Clearing the cache around every
+    test means a Settings object cached while one test had a flag flipped can't
+    leak into the next — each test re-reads the conftest env baseline fresh."""
+    from envelock.config import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_security_state() -> Iterator[None]:
     """Rate limits, lockouts and replay guards are process-global.
 

@@ -182,6 +182,10 @@ class Settings(BaseSettings):
     escalation_cycle_seconds: int = 60
     retention_purge_seconds: int = 3600
     oauth_refresh_seconds: int = 1800
+    #: How often to re-check that verified domains still have their DNS proof, and
+    #: revoke verification if the record was deleted (so access re-gates on the
+    #: verify step). Hourly — deletion is rare and revocation is high-impact.
+    domain_reverify_seconds: int = 3600
     #: Channel-3 CT-log watcher (certstream). The free Guard tier and the S12
     #: pre-signup demo depend on this running.
     ct_watcher_enabled: bool = True

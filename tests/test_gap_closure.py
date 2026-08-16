@@ -72,7 +72,74 @@ def test_domain_verification_challenge_and_verify(client: TestClient, monkeypatc
     tenants.set_domain_verifier(None)
 
 
-def test_unverified_domain_blocks_forward_connect(client: TestClient, monkeypatch) -> None:
+def test_revalidation_revokes_a_domain_whose_dns_record_was_deleted(
+    client: TestClient,
+) -> None:
+    """Ownership is not permanent: if the DNS proof is later deleted, the scheduled
+    re-check must revoke verification so the dashboard re-gates on the verify step."""
+    import asyncio
+
+    from envelock.api import tenants
+    from envelock.db import get_sessionmaker
+
+    h = _auth_header(client, "revoke@revokeco.example")
+    _bootstrap(client, h, name="Revoke", domain="revokeco.example")
+
+    tenants.set_domain_verifier(lambda domain, token, method="txt": True)
+    assert (
+        client.post("/api/v1/domains/revokeco.example/verify", headers=h).json()["verified"]
+        is True
+    )
+    body = client.get("/api/v1/tenant", headers=h).json()
+    assert any(
+        d["registrable_domain"] == "revokeco.example" and d["verified"]
+        for d in body["domains"]
+    )
+
+    # The record is now gone — the verifier reports it absent.
+    tenants.set_domain_verifier(lambda domain, token, method="txt": False)
+
+    async def _run() -> dict:
+        async with get_sessionmaker()() as session:
+            return await tenants.revalidate_verified_domains(session)
+
+    result = asyncio.run(_run())
+    tenants.set_domain_verifier(None)
+
+    assert "revokeco.example" in result["revoked"]
+    body2 = client.get("/api/v1/tenant", headers=h).json()
+    assert all(
+        not d["verified"]
+        for d in body2["domains"]
+        if d["registrable_domain"] == "revokeco.example"
+    )
+
+
+def test_verification_status_never_revokes_on_a_transient_dns_failure(monkeypatch) -> None:
+    """The re-check must tell a real deletion apart from a network blip: only a
+    conclusive 'absent' revokes; a transient/unknown lookup keeps the domain."""
+    from envelock.util import dns_verify
+
+    want = dns_verify.txt_record_value("tok")
+
+    # A live matching record → present.
+    monkeypatch.setattr(
+        dns_verify,
+        "_resolve_status",
+        lambda host, rd: ("ok", [want]) if rd == "TXT" else ("ok", []),
+    )
+    assert dns_verify.verification_status("acme.com", "tok") == "present"
+
+    # Both proofs conclusively empty → a real deletion.
+    monkeypatch.setattr(dns_verify, "_resolve_status", lambda host, rd: ("absent", []))
+    assert dns_verify.verification_status("acme.com", "tok") == "absent"
+
+    # A transient failure (timeout / no resolver) → unknown, never 'absent'.
+    monkeypatch.setattr(dns_verify, "_resolve_status", lambda host, rd: ("unknown", []))
+    assert dns_verify.verification_status("acme.com", "tok") == "unknown"
+
+
+def test_unverified_domain_blocks_mailbox_add(client: TestClient, monkeypatch) -> None:
     monkeypatch.setenv("ENVELOCK_REQUIRE_DOMAIN_VERIFICATION", "true")
     from envelock.config import get_settings
 
@@ -82,13 +149,14 @@ def test_unverified_domain_blocks_forward_connect(client: TestClient, monkeypatc
         # tenant to Guard (which has no mailbox capacity).
         h = _auth_header(client, "gate@gatecorp.com")
         _bootstrap(client, h, name="Gate", domain="gatecorp.com")
-        mb = client.post(
+        # The trust boundary now applies at ADD, not only at connect: a mailbox on
+        # a domain the tenant hasn't verified is refused up front, so a bogus record
+        # can't even be created (you can't point Envelock at an address you don't own).
+        resp = client.post(
             "/api/v1/mailboxes",
             json={"address": "pay@gatecorp.com", "mailbox_class": "protected", "sources": []},
             headers=h,
-        ).json()
-        # Domain not verified → connecting for live mail is refused.
-        resp = client.post(f"/api/v1/mailboxes/{mb['id']}/connect/forward", headers=h)
+        )
         assert resp.status_code == 403
         assert "verify control" in resp.json()["detail"]
     finally:

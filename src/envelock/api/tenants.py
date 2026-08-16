@@ -153,6 +153,45 @@ async def _require_mailbox_capacity(
         )
 
 
+async def _verified_registrable_domains(
+    session: AsyncSession, tenant_id: UUID
+) -> set[str]:
+    """The registrable domains this tenant has PROVEN it controls (DNS-verified).
+
+    This is the trust boundary for protecting a mailbox. Without it, anyone could
+    verify a $1 throwaway domain they own and then point Envelock at a victim's
+    address on a domain they DON'T own — silently monitoring someone else's mail.
+    Fetched once so the bulk path can check a whole paste in memory."""
+    rows = (
+        await session.execute(
+            select(Domain.registrable_domain).where(
+                Domain.tenant_id == tenant_id,
+                Domain.verified_at.is_not(None),
+            )
+        )
+    ).all()
+    return {r[0] for r in rows if r[0]}
+
+
+def _mail_domain_allowed(address: str, verified: set[str]) -> bool:
+    """Whether a mailbox on `address` may be protected — the single source of truth
+    for the domain-ownership boundary, shared by add, bulk-add and connect.
+
+    Honors the require_domain_verification setting (off → allow, for dev/tests) and
+    exempts free-mail addresses (gmail.com, qq.com…), which have no domain to verify
+    and are the no-domain segment (PRD §12.6). Everything else must sit on a domain
+    the tenant has verified."""
+    from envelock.config import get_settings
+    from envelock.util.domains import is_free_mail
+
+    if not get_settings().require_domain_verification:
+        return True
+    reg = registrable_domain(address.rsplit("@", 1)[-1] if "@" in address else "")
+    if not reg or is_free_mail(reg):
+        return True
+    return reg in verified
+
+
 # ── Bootstrap ────────────────────────────────────────────────────────────────
 class BootstrapRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
@@ -228,6 +267,62 @@ def _verify_domain_control(domain: str, token: str, *, method: str) -> bool:
     return verify(domain, token, method=method)
 
 
+def _domain_control_status(domain: str, token: str, *, method: str) -> str:
+    """Tri-state control check for re-verification: 'present' | 'absent' | 'unknown'.
+
+    Honors the same test seam as _verify_domain_control: an injected verifier
+    returning True/False maps to present/absent so tests can simulate a deleted
+    record without live DNS."""
+    if _DOMAIN_VERIFIER is not None:
+        return "present" if _DOMAIN_VERIFIER(domain, token, method=method) else "absent"
+    from envelock.util.dns_verify import verification_status
+
+    return verification_status(domain, token, method=method)
+
+
+async def revalidate_verified_domains(session: AsyncSession) -> dict:
+    """Re-check every DNS-verified domain and REVOKE (verified_at → None) any whose
+    proof-of-control record has definitively disappeared.
+
+    Ownership is not a one-time gate: if the DNS record we verified is later deleted
+    — the domain lapsed, was transferred, or the record was pulled — we must stop
+    trusting that control and make the tenant prove it again. Once revoked, the
+    dashboard's verify-gate blocks the tenant until they re-verify. Only a
+    conclusive 'absent' revokes; a transient/unknown DNS result is left alone so a
+    network blip can never lock a paying customer out. Runs on the scheduler."""
+    rows = (
+        (await session.execute(select(Domain).where(Domain.verified_at.is_not(None))))
+        .scalars()
+        .all()
+    )
+    revoked: list[str] = []
+    for row in rows:
+        if not row.verification_token:
+            continue  # nothing to check against — leave it verified
+        status = _domain_control_status(
+            row.registrable_domain,
+            row.verification_token,
+            method=row.verification_method or "txt",
+        )
+        if status != "absent":
+            continue  # 'present' or 'unknown' → never revoke
+        row.verified_at = None
+        revoked.append(row.registrable_domain)
+        session.add(
+            AuditEvent(
+                tenant_id=row.tenant_id,
+                actor_id=None,
+                action="domain.verification_revoked",
+                target_type="domain",
+                target_id=row.id,
+                detail={"domain": row.registrable_domain, "reason": "dns_record_missing"},
+            )
+        )
+    if revoked:
+        await session.commit()
+    return {"revoked": revoked}
+
+
 async def _require_verified_domain(
     session: AsyncSession, tenant_id: UUID, address: str
 ) -> None:
@@ -235,29 +330,17 @@ async def _require_verified_domain(
 
     Free-mail addresses (gmail.com, qq.com…) have no domain to verify and are the
     no-domain segment (PRD §12.6), so they are exempt. Everything else must prove
-    control first."""
-    from envelock.config import get_settings
-    from envelock.util.domains import is_free_mail
-
-    if not get_settings().require_domain_verification:
+    control first. Shares its rule with add/bulk-add via _mail_domain_allowed."""
+    verified = await _verified_registrable_domains(session, tenant_id)
+    if _mail_domain_allowed(address, verified):
         return
-    reg = registrable_domain(address.split("@", 1)[-1])
-    if not reg or is_free_mail(reg):
-        return
-    row = (
-        await session.execute(
-            select(Domain).where(
-                Domain.tenant_id == tenant_id, Domain.registrable_domain == reg
-            )
-        )
-    ).scalar_one_or_none()
-    if row is None or row.verified_at is None:
-        raise HTTPException(
-            403,
-            f"verify control of {reg} first — add the DNS record from "
-            f"GET /domains/{reg}/verification and POST /domains/{reg}/verify. "
-            "This stops anyone connecting a mailbox on a domain they don't own.",
-        )
+    reg = registrable_domain(address.rsplit("@", 1)[-1] if "@" in address else "")
+    raise HTTPException(
+        403,
+        f"verify control of {reg} first — add the DNS record from "
+        f"GET /domains/{reg}/verification and POST /domains/{reg}/verify. "
+        "This stops anyone connecting a mailbox on a domain they don't own.",
+    )
 
 
 async def _load_domain(session: AsyncSession, tenant_id: UUID, domain: str) -> Domain | None:
@@ -549,6 +632,10 @@ def _mailbox_payload(m: Mailbox) -> dict:
 @router.post("/mailboxes", status_code=201)
 async def add_mailbox(req: MailboxRequest, principal: AdminUser, session: Session) -> dict:
     tenant = await _tenant_or_404(session, principal.tenant_id)
+    # Trust boundary: only mailboxes on a domain the tenant has DNS-verified can be
+    # added, so no one can point Envelock at an address they don't own. Same rule
+    # the connect step enforces — applied here so a bogus record can't even be made.
+    await _require_verified_domain(session, principal.tenant_id, req.address)
     # Don't charge a seat for a mailbox we already have (idempotent re-add).
     existing = (
         await session.execute(
@@ -603,6 +690,11 @@ async def add_mailboxes_bulk(
     tenant = await _tenant_or_404(session, principal.tenant_id)
     _require_mailbox_entitlement(tenant)
 
+    # Trust boundary (see _verified_registrable_domains): every pasted address must
+    # sit on a domain the tenant has verified. Foreign-domain addresses are skipped
+    # with a reason, never added — one paste can't smuggle in someone else's mail.
+    verified = await _verified_registrable_domains(session, principal.tenant_id)
+
     existing = {
         addr.lower()
         for (addr,) in (
@@ -629,6 +721,11 @@ async def add_mailboxes_bulk(
             continue
         if "@" not in addr or "." not in addr.split("@")[-1]:
             skipped.append({"address": raw.strip(), "reason": "not a valid email address"})
+            continue
+        if not _mail_domain_allowed(addr, verified):
+            skipped.append(
+                {"address": addr, "reason": "domain not verified — you can only add mailboxes on a domain you control"}
+            )
             continue
         if addr in existing or addr in seen:
             skipped.append({"address": addr, "reason": "already added"})

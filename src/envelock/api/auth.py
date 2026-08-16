@@ -371,6 +371,25 @@ async def register(req: RegisterRequest, session: Session) -> dict:
                     is_admin=True,  # owner has admin oversight (PRD §15.1)
                 )
             )
+            # Create the (unverified) domain record now, at registration — not later
+            # at bootstrap. This is what makes onboarding resumable and the
+            # dashboard's verify-gate reliable: however early the owner quits (before
+            # MFA, before verifying), the domain already exists, so on their next
+            # sign-in the gate has a domain to prompt them to verify. reg is empty
+            # only for a free-mail address, which has no domain to verify.
+            reg = registrable_domain(email.rsplit("@", 1)[-1] if "@" in email else "")
+            if reg:
+                from envelock.channels.mail.ingest import new_ingest_token
+
+                session.add(
+                    Domain(
+                        id=uuid4(),
+                        tenant_id=tenant.id,
+                        name=reg,
+                        registrable_domain=reg,
+                        verification_token=new_ingest_token(),
+                    )
+                )
         try:
             await session.commit()
         except IntegrityError:
