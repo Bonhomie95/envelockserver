@@ -48,6 +48,18 @@ def upgrade() -> None:
     if op.get_bind().dialect.name != "postgresql":
         return
 
+    # RLS is OPT-IN. ENABLE + FORCE row-level security only when the operator has
+    # explicitly asked for it (ENVELOCK_APPLY_RLS=true) AND arranged for the app to
+    # connect as envelock_app with the tenant GUC set. Otherwise a plain
+    # `alembic upgrade head` would force RLS on an app that connects as the owner
+    # without the GUC — making every query return zero rows (a full outage). The
+    # default deploy uses create_all (which never touches RLS); this keeps running
+    # migrations safe on that path too. See ENVELOCK_RLS_ENABLED / .env.example.
+    import os
+
+    if os.environ.get("ENVELOCK_APPLY_RLS", "").strip().lower() not in {"1", "true", "yes"}:
+        return
+
     # The application connects as this role; it never bypasses RLS.
     op.execute("DO $$ BEGIN CREATE ROLE envelock_app NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$;")
 
