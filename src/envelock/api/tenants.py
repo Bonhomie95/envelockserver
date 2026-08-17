@@ -153,9 +153,7 @@ async def _require_mailbox_capacity(
         )
 
 
-async def _verified_registrable_domains(
-    session: AsyncSession, tenant_id: UUID
-) -> set[str]:
+async def _verified_registrable_domains(session: AsyncSession, tenant_id: UUID) -> set[str]:
     """The registrable domains this tenant has PROVEN it controls (DNS-verified).
 
     This is the trust boundary for protecting a mailbox. Without it, anyone could
@@ -323,9 +321,7 @@ async def revalidate_verified_domains(session: AsyncSession) -> dict:
     return {"revoked": revoked}
 
 
-async def _require_verified_domain(
-    session: AsyncSession, tenant_id: UUID, address: str
-) -> None:
+async def _require_verified_domain(session: AsyncSession, tenant_id: UUID, address: str) -> None:
     """Block connecting a mailbox for live mail until its domain is DNS-verified.
 
     Free-mail addresses (gmail.com, qq.com…) have no domain to verify and are the
@@ -335,20 +331,14 @@ async def _require_verified_domain(
     if _mail_domain_allowed(address, verified):
         return
     reg = registrable_domain(address.rsplit("@", 1)[-1] if "@" in address else "")
-    raise HTTPException(
-        403,
-        f"Verify {reg} before connecting a mailbox on it. Add the DNS record "
-        "shown on your dashboard — we'll finish automatically once it's live.",
-    )
+    raise HTTPException(403, f"Verify {reg} before connecting a mailbox on it. Add the DNS record ")
 
 
 async def _load_domain(session: AsyncSession, tenant_id: UUID, domain: str) -> Domain | None:
     reg = registrable_domain(domain)
     return (
         await session.execute(
-            select(Domain).where(
-                Domain.tenant_id == tenant_id, Domain.registrable_domain == reg
-            )
+            select(Domain).where(Domain.tenant_id == tenant_id, Domain.registrable_domain == reg)
         )
     ).scalar_one_or_none()
 
@@ -378,9 +368,7 @@ async def domain_verification_challenge(
 
 
 @router.post("/domains/{domain}/verify")
-async def verify_domain(
-    domain: str, principal: AdminUser, session: Session
-) -> dict:
+async def verify_domain(domain: str, principal: AdminUser, session: Session) -> dict:
     """Check the DNS challenge and mark the domain verified. Until a domain is
     verified, no mailbox on it can be connected for live mail (see mailbox
     connect), which stops someone signing up with a company address they do not
@@ -440,9 +428,7 @@ async def current_tenant(principal: CurrentUser, session: Session) -> dict:
     if ends is not None and ends.tzinfo is None:
         ends = ends.replace(tzinfo=UTC)
     trial_days_left = (
-        max(0, (ends - now).days + (1 if (ends - now).seconds else 0))
-        if ends
-        else None
+        max(0, (ends - now).days + (1 if (ends - now).seconds else 0)) if ends else None
     )
     trial_active = bool(ends and ends > now)
     paid = tenant.payment_method_ok if tenant else False
@@ -496,9 +482,7 @@ class ChangePlanRequest(BaseModel):
 
 
 @router.post("/tenant/plan")
-async def change_plan(
-    req: ChangePlanRequest, principal: OwnerUser, session: Session
-) -> dict:
+async def change_plan(req: ChangePlanRequest, principal: OwnerUser, session: Session) -> dict:
     """Change the tenant's subscribed plan (upgrade/downgrade).
 
     Only the owner can change what the company pays for. Moving to any paid tier
@@ -548,9 +532,7 @@ class DeleteTenantRequest(BaseModel):
 
 
 @router.delete("/tenant")
-async def delete_tenant(
-    req: DeleteTenantRequest, principal: OwnerUser, session: Session
-) -> dict:
+async def delete_tenant(req: DeleteTenantRequest, principal: OwnerUser, session: Session) -> dict:
     """Full account deletion (PRD §15.2). Confirmed with the current password (and
     a TOTP code when MFA is on), then removes the tenant and every row scoped to
     it — mailboxes, credentials, messages, alerts, the audit trail, users.
@@ -722,7 +704,10 @@ async def add_mailboxes_bulk(
             continue
         if not _mail_domain_allowed(addr, verified):
             skipped.append(
-                {"address": addr, "reason": "domain not verified — you can only add mailboxes on a domain you control"}
+                {
+                    "address": addr,
+                    "reason": "domain not verified — you can only add mailboxes on a domain you control",
+                }
             )
             continue
         if addr in existing or addr in seen:
@@ -916,9 +901,7 @@ async def connect_imap(
 
 
 @router.post("/mailboxes/{mailbox_id}/sync")
-async def sync_mailbox_now(
-    mailbox_id: UUID, principal: AdminUser, session: Session
-) -> dict:
+async def sync_mailbox_now(mailbox_id: UUID, principal: AdminUser, session: Session) -> dict:
     """Poll a connected IMAP mailbox immediately instead of waiting for the next
     background cycle. This is the "Sync now" button — connect a mailbox, send a
     test message, click this, and any new mail is fetched and run through the full
@@ -946,9 +929,7 @@ async def sync_mailbox_now(
 
 
 @router.post("/mailboxes/{mailbox_id}/connect/forward")
-async def connect_forward(
-    mailbox_id: UUID, principal: AdminUser, session: Session
-) -> dict:
+async def connect_forward(mailbox_id: UUID, principal: AdminUser, session: Session) -> dict:
     """Mark a mailbox as connected by mail forwarding.
 
     The customer has set a forwarding rule to their ingest address; this records
@@ -959,9 +940,7 @@ async def connect_forward(
     """
     mailbox = await _mailbox_or_404(session, mailbox_id, principal.tenant_id)
     await _require_verified_domain(session, principal.tenant_id, mailbox.address)
-    mailbox.sources = sorted(
-        set(mailbox.sources or []) | {SourceMechanism.FORWARD_INGEST.value}
-    )
+    mailbox.sources = sorted(set(mailbox.sources or []) | {SourceMechanism.FORWARD_INGEST.value})
     mailbox.integration_tier = int(IntegrationTier.FORWARDING)
     mailbox.last_sync_at = datetime.now(UTC)
     caps = capabilities_for(frozenset(SourceMechanism(s) for s in mailbox.sources))
@@ -982,9 +961,7 @@ async def connect_forward(
 
 
 @router.get("/mailboxes/{mailbox_id}/activity")
-async def mailbox_activity(
-    mailbox_id: UUID, actor: ActiveUser, session: Session
-) -> dict:
+async def mailbox_activity(mailbox_id: UUID, actor: ActiveUser, session: Session) -> dict:
     """What has actually happened on this mailbox — so IT can see it is protected,
     not just wait for an alert. Connection events, coverage, and running counts of
     messages scanned and alerts raised."""
@@ -1018,9 +995,7 @@ async def mailbox_activity(
         )
     ).scalar_one()
 
-    caps = capabilities_for(
-        frozenset(SourceMechanism(s) for s in (mailbox.sources or []) if s)
-    )
+    caps = capabilities_for(frozenset(SourceMechanism(s) for s in (mailbox.sources or []) if s))
     connected = any(s in _MAIL_SOURCES for s in (mailbox.sources or []))
     return {
         "address": mailbox.address,
@@ -1032,16 +1007,13 @@ async def mailbox_activity(
         "messages_scanned": messages_scanned,
         "alerts_raised": alerts_raised,
         "events": [
-            {"action": e.action, "at": e.created_at.isoformat(), "detail": e.detail}
-            for e in events
+            {"action": e.action, "at": e.created_at.isoformat(), "detail": e.detail} for e in events
         ],
     }
 
 
 @router.delete("/mailboxes/{mailbox_id}")
-async def remove_mailbox(
-    mailbox_id: UUID, principal: AdminUser, session: Session
-) -> dict:
+async def remove_mailbox(mailbox_id: UUID, principal: AdminUser, session: Session) -> dict:
     """Disconnect and remove a mailbox and everything that hangs off it.
 
     A mailbox is the parent of messages, findings, sensor sessions and its stored
@@ -1058,17 +1030,13 @@ async def remove_mailbox(
     # ones tagged with this mailbox and any tied to its messages.
     msg_ids = select(Message.id).where(Message.mailbox_id == mid)
     await session.execute(
-        delete(Finding).where(
-            or_(Finding.mailbox_id == mid, Finding.message_id.in_(msg_ids))
-        )
+        delete(Finding).where(or_(Finding.mailbox_id == mid, Finding.message_id.in_(msg_ids)))
     )
     await session.execute(delete(Message).where(Message.mailbox_id == mid))
     await session.execute(delete(SensorSession).where(SensorSession.mailbox_id == mid))
     await session.execute(delete(MailboxCredential).where(MailboxCredential.mailbox_id == mid))
     # Preserve the incident record — detach alerts instead of deleting them.
-    await session.execute(
-        update(Alert).where(Alert.mailbox_id == mid).values(mailbox_id=None)
-    )
+    await session.execute(update(Alert).where(Alert.mailbox_id == mid).values(mailbox_id=None))
     await session.delete(mailbox)
     await alert_svc.record_audit(
         session,
@@ -1176,9 +1144,7 @@ async def _assert_can_grant_login(
             f"all {seats['cap']} paid seat{'' if seats['cap'] == 1 else 's'} are in "
             "use — add a protected mailbox to open another login",
         )
-    if role == Role.MEMBER.value and not await _is_protected_mailbox(
-        session, tenant.id, email
-    ):
+    if role == Role.MEMBER.value and not await _is_protected_mailbox(session, tenant.id, email):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             f"{email} isn't a protected mailbox in your account. Add it as a "
@@ -1193,9 +1159,7 @@ class CreateMemberRequest(BaseModel):
 
 
 @router.post("/members", status_code=201)
-async def create_member(
-    req: CreateMemberRequest, principal: AdminUser, session: Session
-) -> dict:
+async def create_member(req: CreateMemberRequest, principal: AdminUser, session: Session) -> dict:
     """Owner-provisioned access (PRD §15.1). The owner (or an admin) creates a
     teammate and hands them a one-time temporary password; they must set their own
     on first sign-in. Seat-limited by plan — see `_seat_usage`."""
@@ -1255,9 +1219,9 @@ async def list_members(principal: AdminUser, session: Session) -> dict:
     rows = (
         (
             await session.execute(
-                select(User).where(User.tenant_id == principal.tenant_id).order_by(
-                    User.created_at.asc()
-                )
+                select(User)
+                .where(User.tenant_id == principal.tenant_id)
+                .order_by(User.created_at.asc())
             )
         )
         .scalars()
@@ -1434,9 +1398,7 @@ async def quarantine(alert_id: UUID, actor: ActiveUser, session: Session) -> dic
             caps = capabilities_for(sources)
             source = next(iter(sources))
 
-    result = plan_remediation(
-        action=RemediationAction.QUARANTINE, capabilities=caps, source=source
-    )
+    result = plan_remediation(action=RemediationAction.QUARANTINE, capabilities=caps, source=source)
     if result.succeeded:
         await alert_svc.record_audit(
             session,
@@ -1680,9 +1642,7 @@ async def report_lookalike(
         tenant_id=principal.tenant_id,
     )
     # Write through so the moat survives a restart and is shared across instances.
-    await graph_store.persist_report(
-        session, entry, GRAPH.reporters_of(candidate)
-    )
+    await graph_store.persist_report(session, entry, GRAPH.reporters_of(candidate))
     await alert_svc.record_audit(
         session,
         tenant_id=principal.tenant_id,
