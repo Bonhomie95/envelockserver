@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -50,6 +51,7 @@ from envelock.workers.watchers import (
     ZoneFileWatcher,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["channels"])
 Session = Annotated[AsyncSession, Depends(get_session)]
 
@@ -188,8 +190,8 @@ async def oauth_authorize(
     if not oauth.is_configured(prov):
         raise HTTPException(
             503,
-            f"{provider} OAuth is not configured on this deployment — the app "
-            "registration credentials are unset",
+            f"Connecting with {provider} isn't available right now. "
+            "Use IMAP or forwarding instead, or contact support.",
         )
 
     mailbox = (
@@ -246,7 +248,11 @@ async def oauth_callback(
     try:
         claims = oauth.verify_state(state, provider=provider)
     except oauth.OAuthError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        logger.warning("oauth state verification failed for %s: %s", provider, exc)
+        raise HTTPException(
+            400,
+            "This connection link is invalid or has expired. Please start again.",
+        ) from exc
 
     tenant_id = UUID(claims["t"])
     mailbox = (
@@ -263,7 +269,11 @@ async def oauth_callback(
     try:
         tokens = await oauth.exchange_code(prov, code=code)
     except oauth.OAuthError as exc:
-        raise HTTPException(502, f"token exchange failed: {exc}") from exc
+        logger.warning("oauth token exchange failed for %s: %s", provider, exc)
+        raise HTTPException(
+            502,
+            "We couldn't finish connecting to your email provider. Please try again.",
+        ) from exc
 
     # Seal the refresh token (the durable secret) bound to this mailbox.
     import json as _json

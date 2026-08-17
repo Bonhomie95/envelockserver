@@ -12,6 +12,7 @@ payment method attached — cost is incurred only after the gate is passed.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
@@ -28,6 +29,7 @@ from envelock.db import get_session
 from envelock.models import Domain, DomainTrialLedger, Tenant, User
 from envelock.util.domains import is_free_mail, registrable_domain
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/billing", tags=["billing"])
 Session = Annotated[AsyncSession, Depends(get_session)]
 
@@ -63,9 +65,7 @@ async def confirm_payment_method(
     if provider is None:
         raise HTTPException(404, "unknown payment provider")
     if not provider.is_configured():
-        raise HTTPException(
-            503, f"{req.provider} is not configured on this deployment"
-        )
+        raise HTTPException(503, f"{req.provider} isn't available right now.")
 
     tenant = await session.get(Tenant, principal.tenant_id)
     if tenant is None:
@@ -74,7 +74,11 @@ async def confirm_payment_method(
     try:
         instrument = await provider.verify_instrument(req.reference)
     except payments.PaymentError as exc:
-        raise HTTPException(402, f"could not verify payment method: {exc}") from exc
+        logger.warning("payment instrument verification failed: %s", exc)
+        raise HTTPException(
+            402,
+            "We couldn't verify that payment method. Check the details and try again.",
+        ) from exc
 
     key = trial.trial_key(req.identifier, instrument.fingerprint)
     reg = registrable_domain(req.identifier)
@@ -195,14 +199,18 @@ async def buy_mailbox_seats(
     is sent to when a mailbox add hits the plan cap."""
     provider = payments.provider_for(req.provider)
     if provider is None or not provider.is_configured():
-        raise HTTPException(503, f"{req.provider} is not available on this deployment")
+        raise HTTPException(503, f"{req.provider} isn't available right now.")
     tenant = await session.get(Tenant, principal.tenant_id)
     if tenant is None:
         raise HTTPException(404, "tenant not found")
     try:
         await provider.verify_instrument(req.reference)
     except payments.PaymentError as exc:
-        raise HTTPException(402, f"could not verify payment method: {exc}") from exc
+        logger.warning("payment instrument verification failed: %s", exc)
+        raise HTTPException(
+            402,
+            "We couldn't verify that payment method. Check the details and try again.",
+        ) from exc
 
     tenant.extra_mailbox_seats = (tenant.extra_mailbox_seats or 0) + req.count
     tenant.payment_method_ok = True
@@ -253,10 +261,15 @@ async def create_checkout(
 
     stripe = payments.provider_for("stripe")
     if stripe is None or not stripe.is_configured():
-        raise HTTPException(503, "card checkout isn't enabled on this deployment yet")
+        raise HTTPException(503, "Card checkout isn't available right now.")
     price_id = _price_for(plan)
     if not price_id:
-        raise HTTPException(503, f"no Stripe price is configured for the {plan} plan")
+        logger.warning("no checkout price configured for plan %s", plan)
+        raise HTTPException(
+            503,
+            f"The {plan.capitalize()} plan isn't available for checkout right now — "
+            "please contact support.",
+        )
 
     user = await session.get(User, principal.user_id)
     domain = await _primary_domain(session, principal.tenant_id)

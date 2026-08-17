@@ -158,7 +158,11 @@ def test_unverified_domain_blocks_mailbox_add(client: TestClient, monkeypatch) -
             headers=h,
         )
         assert resp.status_code == 403
-        assert "verify control" in resp.json()["detail"]
+        detail = resp.json()["detail"]
+        # Plain, user-facing guidance — names the domain, tells them to verify.
+        assert "verify" in detail.lower() and "gatecorp.com" in detail
+        # ...and NEVER leaks internal API paths to the user.
+        assert "GET /" not in detail and "POST /" not in detail
     finally:
         monkeypatch.delenv("ENVELOCK_REQUIRE_DOMAIN_VERIFICATION", raising=False)
         get_settings.cache_clear()

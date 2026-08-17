@@ -895,7 +895,8 @@ async def refresh(req: TokenRequest, session: Session) -> dict:
         )
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
-            "refresh token reuse detected — all sessions revoked",
+            "For your security, you've been signed out of all devices. "
+            "Please sign in again.",
         )
 
     await active_revocations().arevoke_jti(claims.jti, expires_at=float(claims.exp))

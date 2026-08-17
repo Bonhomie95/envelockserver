@@ -337,9 +337,8 @@ async def _require_verified_domain(
     reg = registrable_domain(address.rsplit("@", 1)[-1] if "@" in address else "")
     raise HTTPException(
         403,
-        f"verify control of {reg} first — add the DNS record from "
-        f"GET /domains/{reg}/verification and POST /domains/{reg}/verify. "
-        "This stops anyone connecting a mailbox on a domain they don't own.",
+        f"Verify {reg} before connecting a mailbox on it. Add the DNS record "
+        "shown on your dashboard — we'll finish automatically once it's live.",
     )
 
 
@@ -400,9 +399,8 @@ async def verify_domain(
     if not ok:
         raise HTTPException(
             422,
-            "DNS record not found yet. Add the TXT (or CNAME) record shown at "
-            "GET /domains/{domain}/verification, then try again — DNS can take a "
-            "few minutes to propagate.",
+            "We can't see the DNS record yet. Double-check it matches the one shown "
+            "on your dashboard — new DNS records can take a few minutes to appear.",
         )
     row.verified_at = datetime.now(UTC)
     session.add(
