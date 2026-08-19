@@ -211,16 +211,20 @@ def test_login_is_rate_limited(client: TestClient) -> None:
     assert 429 in codes, "login must throttle — otherwise it is a brute-force oracle"
 
 
-def test_registration_does_not_leak_existing_accounts(client: TestClient) -> None:
+def test_registering_an_existing_account_is_reported_clearly(client: TestClient) -> None:
+    """Product decision: for this business tool, telling the user their email is
+    already registered (so they sign in instead of silently no-op'ing) beats the
+    marginal account-enumeration hardening of an identical response. Re-registering
+    an existing address returns a clear 409."""
     body = {
         "email": "dup@acme.com",
         "password": "a-long-enough-passphrase",
         "tenant_name": "Acme",
     }
-    first = client.post("/api/v1/auth/register", json=body)
+    assert client.post("/api/v1/auth/register", json=body).status_code == 201
     second = client.post("/api/v1/auth/register", json=body)
-    assert first.status_code == second.status_code == 201
-    assert first.json() == second.json()
+    assert second.status_code == 409
+    assert "already registered" in second.json()["detail"]
 
 
 def test_login_failure_is_indistinguishable_for_unknown_vs_wrong_password(
