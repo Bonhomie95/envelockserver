@@ -346,73 +346,84 @@ async def register(req: RegisterRequest, session: Session) -> dict:
                 "check the spelling of your address.",
             )
 
-    # Identical response whether or not the address exists — a 409 here would
-    # turn signup into an account-enumeration endpoint.
-    if await _user_by_email(session, email) is None:
-        try:
-            assess_passphrase(req.password)
-            password_hash = hash_password(req.password)
-        except ValueError as exc:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)
-            ) from exc
+    # Tell the caller plainly that the address is already registered rather than
+    # silently "succeeding". (This trades a little account-enumeration hardening for
+    # clarity — acceptable for a business tool where the domain is already known and
+    # a confusing silent no-op is the bigger problem.)
+    if await _user_by_email(session, email) is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "this email is already registered — sign in instead, or reset your "
+            "password if you've forgotten it.",
+        )
 
-        existing_tenant_id = await _existing_tenant_for_domain(session, email)
-        if existing_tenant_id is not None:
-            # A colleague — join the company's existing tenant as a member, but
-            # PENDING: an admin must approve before they see anything. No new
-            # tenant, so no second trial for the same domain either.
-            session.add(
-                User(
-                    id=uuid4(),
-                    tenant_id=existing_tenant_id,
-                    email=email,
-                    password_hash=password_hash,
-                    role=Role.MEMBER.value,
-                    is_admin=False,
-                    status="pending",
-                )
+    try:
+        assess_passphrase(req.password)
+        password_hash = hash_password(req.password)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    existing_tenant_id = await _existing_tenant_for_domain(session, email)
+    if existing_tenant_id is not None:
+        # A colleague — join the company's existing tenant as a member, but
+        # PENDING: an admin must approve before they see anything (and approval
+        # then adds them as a protected mailbox). No new tenant → no second trial,
+        # and no second owner/admin: the domain's first registrant is the admin.
+        session.add(
+            User(
+                id=uuid4(),
+                tenant_id=existing_tenant_id,
+                email=email,
+                password_hash=password_hash,
+                role=Role.MEMBER.value,
+                is_admin=False,
+                status="pending",
             )
-        else:
-            # First from this domain (or a free-mail signup) → new owner tenant.
-            tenant = Tenant(id=uuid4(), name=req.tenant_name)
-            session.add(tenant)
-            await _start_signup_trial(session, tenant, email)
+        )
+    else:
+        # First from this domain (or a free-mail signup) → new owner tenant. This
+        # is the single admin for the company; everyone else joins pending.
+        tenant = Tenant(id=uuid4(), name=req.tenant_name)
+        session.add(tenant)
+        await _start_signup_trial(session, tenant, email)
+        session.add(
+            User(
+                id=uuid4(),
+                tenant_id=tenant.id,
+                email=email,
+                password_hash=password_hash,
+                role=Role.OWNER.value,
+                is_admin=True,  # owner has admin oversight (PRD §15.1)
+            )
+        )
+        # Create the (unverified) domain record now, at registration — not later
+        # at bootstrap. This is what makes onboarding resumable and the
+        # dashboard's verify-gate reliable: however early the owner quits (before
+        # MFA, before verifying), the domain already exists, so on their next
+        # sign-in the gate has a domain to prompt them to verify. reg is empty
+        # only for a free-mail address, which has no domain to verify.
+        reg = registrable_domain(email.rsplit("@", 1)[-1] if "@" in email else "")
+        if reg:
+            from envelock.channels.mail.ingest import new_ingest_token
+
             session.add(
-                User(
+                Domain(
                     id=uuid4(),
                     tenant_id=tenant.id,
-                    email=email,
-                    password_hash=password_hash,
-                    role=Role.OWNER.value,
-                    is_admin=True,  # owner has admin oversight (PRD §15.1)
+                    name=reg,
+                    registrable_domain=reg,
+                    verification_token=new_ingest_token(),
                 )
             )
-            # Create the (unverified) domain record now, at registration — not later
-            # at bootstrap. This is what makes onboarding resumable and the
-            # dashboard's verify-gate reliable: however early the owner quits (before
-            # MFA, before verifying), the domain already exists, so on their next
-            # sign-in the gate has a domain to prompt them to verify. reg is empty
-            # only for a free-mail address, which has no domain to verify.
-            reg = registrable_domain(email.rsplit("@", 1)[-1] if "@" in email else "")
-            if reg:
-                from envelock.channels.mail.ingest import new_ingest_token
-
-                session.add(
-                    Domain(
-                        id=uuid4(),
-                        tenant_id=tenant.id,
-                        name=reg,
-                        registrable_domain=reg,
-                        verification_token=new_ingest_token(),
-                    )
-                )
-        try:
-            await session.commit()
-        except IntegrityError:
-            # Lost a race to another concurrent signup of the same address.
-            # Idempotent by design — surface the same response either way.
-            await session.rollback()
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        # Lost a race to a concurrent signup of the same address → it now exists.
+        await session.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "this email is already registered — sign in instead.",
+        ) from exc
 
     return {
         "status": "registration_received",

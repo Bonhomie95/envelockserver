@@ -1173,6 +1173,52 @@ async def _assert_can_grant_login(
         )
 
 
+async def _ensure_login_mailbox(
+    session: AsyncSession, tenant: Tenant, *, email: str, role: str
+) -> None:
+    """Every approved teammate is one of the mailboxes the company is paying for:
+    granting access ADDS them as a protected mailbox (counted against the plan's
+    seats) if they aren't one already. So "has access" always equals "a counted
+    mailbox", and the seat cap is simply the plan's mailbox allowance.
+
+    The owner is the account holder and is exempt. The email must be on the
+    company's own (verified) domain — a login is never for an outside address.
+    """
+    if role == Role.OWNER.value:
+        return
+    # Must be a company address on a domain the tenant controls.
+    reg = registrable_domain(email.rsplit("@", 1)[-1] if "@" in email else "")
+    domains = {
+        d
+        for (d,) in (
+            await session.execute(
+                select(Domain.registrable_domain).where(Domain.tenant_id == tenant.id)
+            )
+        ).all()
+    }
+    if domains and reg not in domains:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{email} isn't on your company's domain "
+            f"({', '.join(sorted(domains))}). Team logins must use a company address.",
+        )
+    if await _is_protected_mailbox(session, tenant.id, email):
+        return  # already a counted mailbox — nothing to add
+    # Adding a mailbox is what counts them; gated by the plan's mailbox seats.
+    await _require_mailbox_capacity(session, tenant, adding=1)
+    caps = capabilities_for(frozenset())
+    session.add(
+        Mailbox(
+            tenant_id=tenant.id,
+            address=email.lower(),
+            mailbox_class=MailboxClass.PROTECTED.value,
+            sources=[],
+            protection_level=protection_level(caps).value,
+            inactive_detections=inactive_for(caps),
+        )
+    )
+
+
 class CreateMemberRequest(BaseModel):
     email: EmailStr
     role: Literal["member", "admin"] = "member"
@@ -1279,7 +1325,12 @@ async def approve_member(user_id: UUID, principal: AdminUser, session: Session) 
     around the seat cap and the protection pool."""
     user = await _member_or_404(session, user_id, principal.tenant_id)
     tenant = await _tenant_or_404(session, principal.tenant_id)
-    await _assert_can_grant_login(session, tenant, email=user.email, role=user.role)
+    if user.status == "active":
+        return {"id": str(user.id), "email": user.email, "status": "active"}
+    # Approval both grants access AND counts them: they become a protected mailbox
+    # (added here if not already one), so an approved teammate always occupies one
+    # of the plan's mailbox seats. Over the cap → 402 (buy more seats / upgrade).
+    await _ensure_login_mailbox(session, tenant, email=user.email, role=user.role)
     user.status = "active"
     await alert_svc.record_audit(
         session,

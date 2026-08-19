@@ -222,11 +222,11 @@ def test_login_must_be_on_the_company_domain(client: TestClient) -> None:
     assert ok.status_code == 201
 
 
-def test_approval_is_gated_by_the_protection_pool(client: TestClient) -> None:
-    """Self-registration can't be a way around the pool: approving a pending
-    colleague is refused until they're a protected mailbox (someone paid for)."""
-    h = _owner(client, "apco.example")
-    _add_protected(client, h, "cfo@apco.example")  # cap 1
+def test_approval_adds_the_member_as_a_counted_mailbox(client: TestClient) -> None:
+    """Approving a pending colleague grants access AND counts them: they become a
+    protected mailbox occupying one of the plan's seats — the admin no longer has
+    to add the mailbox separately first."""
+    h = _owner(client, "apco.example")  # trial → cap 7
 
     # A colleague self-registers on the company domain → pending member.
     client.post(
@@ -240,11 +240,9 @@ def test_approval_is_gated_by_the_protection_pool(client: TestClient) -> None:
     )
     assert bob["status"] == "pending"
 
-    # Refused — bob isn't in the protection pool.
-    assert client.post(f"/api/v1/members/{bob['id']}/approve", headers=h).status_code == 422
+    before = len(client.get("/api/v1/mailboxes", headers=h).json()["mailboxes"])
 
-    # Add bob as a protected mailbox → in the pool, seat available → approval works.
-    _add_protected(client, h, "bob@apco.example")  # cap 2
+    # Approval succeeds and adds bob as a protected mailbox (no pre-add needed).
     assert client.post(f"/api/v1/members/{bob['id']}/approve", headers=h).status_code == 200
     active = next(
         m
@@ -252,6 +250,10 @@ def test_approval_is_gated_by_the_protection_pool(client: TestClient) -> None:
         if m["email"] == "bob@apco.example"
     )
     assert active["status"] == "active"
+
+    boxes = client.get("/api/v1/mailboxes", headers=h).json()["mailboxes"]
+    assert len(boxes) == before + 1
+    assert any(b["address"] == "bob@apco.example" for b in boxes)
 
 
 def _mfa_owner(client: TestClient, domain: str) -> tuple[dict, str]:

@@ -193,6 +193,20 @@ def test_workspace_company_domain_is_allowed(client: TestClient) -> None:
     assert r.status_code == 201
 
 
+def test_registering_an_existing_email_is_rejected(client: TestClient) -> None:
+    """Re-registering an address that already exists tells the user plainly (409)
+    instead of silently 'succeeding'."""
+    body = {
+        "email": "dup@dupco-uniq.com",
+        "password": "a-long-enough-passphrase",
+        "tenant_name": "Dup Co",
+    }
+    assert client.post("/api/v1/auth/register", json=body).status_code == 201
+    again = client.post("/api/v1/auth/register", json=body)
+    assert again.status_code == 409
+    assert "already registered" in again.json()["detail"]
+
+
 def test_registration_rejects_a_nonexistent_email_domain(
     client: TestClient, monkeypatch
 ) -> None:
