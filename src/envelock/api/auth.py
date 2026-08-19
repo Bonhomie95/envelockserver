@@ -329,6 +329,23 @@ async def register(req: RegisterRequest, session: Session) -> dict:
             "own company address (you@yourcompany.com).",
         )
 
+    # Reject a domain that plainly doesn't exist (a typo / made-up address like
+    # test@hjsbcjsjs.com) before we ever create a tenant. Distinct from OWNERSHIP
+    # verification (that comes later, in the dashboard) — this is just "is this a
+    # real mail domain at all". Fails open on a transient DNS failure so a resolver
+    # blip never blocks a legitimate signup.
+    from envelock.config import get_settings
+    from envelock.util import dns_verify
+
+    if get_settings().check_email_domain_exists:
+        mail_domain = email.rsplit("@", 1)[-1] if "@" in email else ""
+        if dns_verify.deliverability_status(mail_domain) == "absent":
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "that email domain doesn't exist or can't receive email — "
+                "check the spelling of your address.",
+            )
+
     # Identical response whether or not the address exists — a 409 here would
     # turn signup into an account-enumeration endpoint.
     if await _user_by_email(session, email) is None:

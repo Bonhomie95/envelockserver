@@ -191,3 +191,40 @@ def test_workspace_company_domain_is_allowed(client: TestClient) -> None:
         },
     )
     assert r.status_code == 201
+
+
+def test_registration_rejects_a_nonexistent_email_domain(
+    client: TestClient, monkeypatch
+) -> None:
+    """A made-up domain (test@hjsbcjsjs.com) is refused before a tenant is created.
+    A resolvable domain still registers. 'unknown' (transient DNS) must NOT block —
+    the check fails open."""
+    monkeypatch.setenv("ENVELOCK_CHECK_EMAIL_DOMAIN_EXISTS", "true")
+    from envelock.config import get_settings
+    from envelock.util import dns_verify
+
+    get_settings.cache_clear()
+
+    monkeypatch.setattr(dns_verify, "deliverability_status", lambda d: "absent")
+    bad = client.post(
+        "/api/v1/auth/register",
+        json={"email": "test@hjsbcjsjs.com", "password": "a-long-enough-passphrase", "tenant_name": "X"},
+    )
+    assert bad.status_code == 422
+    assert "doesn't exist" in bad.json()["detail"]
+
+    # A resolvable domain registers.
+    monkeypatch.setattr(dns_verify, "deliverability_status", lambda d: "ok")
+    ok = client.post(
+        "/api/v1/auth/register",
+        json={"email": "cfo@realco-uniq.com", "password": "a-long-enough-passphrase", "tenant_name": "Real Co"},
+    )
+    assert ok.status_code == 201
+
+    # A transient DNS failure fails OPEN (does not block a legitimate signup).
+    monkeypatch.setattr(dns_verify, "deliverability_status", lambda d: "unknown")
+    inconclusive = client.post(
+        "/api/v1/auth/register",
+        json={"email": "cto@another-uniq.com", "password": "a-long-enough-passphrase", "tenant_name": "Another"},
+    )
+    assert inconclusive.status_code == 201

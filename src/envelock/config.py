@@ -205,6 +205,11 @@ class Settings(BaseSettings):
     #: company address they do not control and receive that company's alerts.
     require_domain_verification: bool = True
 
+    #: At registration, reject an email whose domain doesn't resolve in DNS (no MX
+    #: and no A/AAAA) — catches typos/made-up domains like test@hjsbcjsjs.com
+    #: before ownership verification. Fails open on a transient DNS failure.
+    check_email_domain_exists: bool = True
+
     # ── Sender-domain reputation (free feeds — user requirement #3) ──────────
     #: DNSBL zones queried for the FROM domain's registrable domain. All free and
     #: DNS-based (no API key). Spamhaus DBL is free for low-volume/non-commercial

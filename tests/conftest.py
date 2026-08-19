@@ -45,6 +45,9 @@ os.environ["ENVELOCK_SMS_ENABLED"] = "false"
 # Most connect-flow tests predate domain verification and connect mailboxes
 # directly; the enforcement has its own focused test that flips this on.
 os.environ["ENVELOCK_REQUIRE_DOMAIN_VERIFICATION"] = "false"
+# The suite registers made-up domains (acme.com, *.example) that don't resolve;
+# the real-domain-existence check has its own focused test that flips this on.
+os.environ["ENVELOCK_CHECK_EMAIL_DOMAIN_EXISTS"] = "false"
 # Sender-domain reputation does live DNSBL lookups; keep the suite hermetic and
 # fast. Its own test drives the checker directly.
 os.environ["ENVELOCK_DOMAIN_REPUTATION_ENABLED"] = "false"

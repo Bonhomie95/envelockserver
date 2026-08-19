@@ -138,9 +138,35 @@ def verification_status(domain: str, token: str, *, method: str = "txt") -> str:
     return "unknown"
 
 
+def deliverability_status(domain: str) -> str:
+    """Whether an email domain plausibly EXISTS and can receive mail:
+    'ok' (has MX, or an A/AAAA host mail can fall back to), 'absent' (a working
+    resolver says the domain / its records don't exist — a typo like
+    `test@hjsbcjsjs.com`), or 'unknown' (couldn't determine — never block on this).
+
+    Used at registration to reject made-up domains before ownership verification.
+    Fails OPEN: a transient DNS hiccup returns 'unknown' so real signups aren't
+    blocked by our own resolver being briefly unreachable."""
+    reg = registrable_domain(domain) or domain
+    if not reg:
+        return "unknown"
+    hosts = list(dict.fromkeys(h for h in (domain, reg) if h))  # dedupe, keep order
+    statuses: list[str] = []
+    for host in hosts:
+        for rdtype in ("MX", "A", "AAAA"):
+            status, vals = _resolve_status(host, rdtype)
+            if vals:
+                return "ok"
+            statuses.append(status)
+    # Only 'absent' when every lookup was conclusive (NXDOMAIN/NoAnswer), never on
+    # a timeout/resolver failure.
+    return "absent" if all(s in {"ok", "absent"} for s in statuses) else "unknown"
+
+
 __all__ = [
     "challenge_host",
     "cname_target",
+    "deliverability_status",
     "txt_record_value",
     "verification_status",
     "verify",
