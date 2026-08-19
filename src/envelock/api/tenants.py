@@ -439,11 +439,31 @@ async def current_tenant(principal: CurrentUser, session: Session) -> dict:
     effective_plan = subscribed_plan if (trial_active or paid) else "guard"
     mailbox_used = await _mailbox_count(session, principal.tenant_id) if tenant else 0
     mailbox_capacity = _mailbox_capacity(tenant) if tenant else 0
+    # Colleagues who self-registered and are awaiting an admin's approval. Surfaced
+    # so the dashboard can alert an admin that someone is waiting (the admin isn't
+    # otherwise told). 0 for members (they can't approve anyway).
+    pending_members = (
+        int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(User)
+                    .where(
+                        User.tenant_id == principal.tenant_id,
+                        User.status == "pending",
+                    )
+                )
+            ).scalar_one()
+        )
+        if tenant
+        else 0
+    )
     return {
         "tenant_id": str(principal.tenant_id),
         "name": tenant.name if tenant else None,
         "plan": effective_plan,
         "subscribed_plan": subscribed_plan,
+        "pending_members": pending_members,
         "trial_ended": bool(ends and not trial_active and not paid),
         "mailboxes": {
             "used": mailbox_used,
