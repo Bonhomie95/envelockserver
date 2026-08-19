@@ -236,11 +236,15 @@ PROVIDERS: tuple[Provider, ...] = (
         methods=(_ADMIN_API, _imap("imap.qiye.aliyun.com"), _FORWARD),
     ),
     Provider(
+        # Custom-domain / paid Zoho orgs (the only kind that reach us — free
+        # zoho.com is a consumer domain we reject at signup) use imapPRO, not
+        # imap.zoho.com. Non-US data centres swap the TLD (imappro.zoho.eu / .in /
+        # .com.au); the connect form lets the user edit the host for those.
         id="zoho",
         name="Zoho Mail",
         mx_patterns=("zoho.com", "zohomail.com", "zoho.eu"),
-        imap_host="imap.zoho.com",
-        methods=(_ADMIN_API, _imap("imap.zoho.com"), _FORWARD),
+        imap_host="imappro.zoho.com",
+        methods=(_ADMIN_API, _imap("imappro.zoho.com"), _FORWARD),
     ),
     Provider(
         id="zimbra",
