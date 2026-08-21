@@ -1,0 +1,37 @@
+# /etc/systemd/system/envelock-worker.service
+#
+# Only needed once credential key custody is split (deploy/README.md). This is
+# the ONLY process that should hold ENVELOCK_CREDENTIAL_PRIVATE_KEY: it decrypts
+# mailbox credentials in order to connect to mail servers, which is exactly what
+# the internet-facing API must not be able to do.
+#
+# Give it its own env file with both key halves, and give the API's env file the
+# public key only.
+[Unit]
+Description=Envelock mailbox worker (credential-holding)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=ubuntu
+WorkingDirectory=/home/ubuntu/apps/server
+EnvironmentFile=/home/ubuntu/apps/server/.env.worker
+# The worker runs the pollers and the scheduler; it serves no HTTP, so it binds
+# a loopback port nothing routes to and is never reachable from outside.
+ExecStart=/home/ubuntu/apps/server/.venv/bin/uvicorn envelock.main:app \
+    --host 127.0.0.1 --port 8011
+
+Restart=always
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/apps/server
+
+[Install]
+WantedBy=multi-user.target

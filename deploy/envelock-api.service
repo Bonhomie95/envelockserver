@@ -1,0 +1,32 @@
+# /etc/systemd/system/envelock-api.service
+[Unit]
+Description=Envelock API
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=ubuntu
+WorkingDirectory=/home/ubuntu/apps/server
+# Settings are read from this file. Keep it 0600 and owned by ubuntu — it holds
+# the credential key material and every provider secret.
+EnvironmentFile=/home/ubuntu/apps/server/.env
+ExecStart=/home/ubuntu/apps/server/.venv/bin/uvicorn envelock.main:app \
+    --host 127.0.0.1 --port 8010 --proxy-headers --forwarded-allow-ips 127.0.0.1
+
+Restart=always
+RestartSec=3
+# Do not thrash on a config error: five failures in a minute and it stays down,
+# so a broken deploy is a visible outage rather than a restart loop that hides
+# the real error at the top of the log.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/apps/server
+
+[Install]
+WantedBy=multi-user.target
