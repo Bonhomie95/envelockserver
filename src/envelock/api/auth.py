@@ -655,17 +655,14 @@ async def forgot_password(req: ForgotPasswordRequest, session: Session) -> dict:
         ttl=PASSWORD_RESET_TTL,
     )
 
-    if user.mfa_enabled:
-        # Reset in place with the second factor — no email round-trip.
-        return {
-            "method": "mfa",
-            "reset_token": token,
-            "message": "Enter your authenticator code and a new password to reset.",
-        }
-
     from envelock.config import get_settings
 
     settings = get_settings()
+    # Always the same shape of answer. Previously an MFA account answered
+    # `method: "mfa"` with a token inline while an unknown address answered
+    # `method: "email"` — a free oracle for "does this address have an account,
+    # and does it have two-factor on?". The link now always goes to the mailbox;
+    # an MFA account additionally has to enter its authenticator code to use it.
     link = f"{settings.web_base_url.rstrip('/')}/reset-password?token={token}"
     _send_password_reset_email(user.email, link)
     resp = dict(generic)
@@ -711,10 +708,30 @@ async def reset_password(req: ResetPasswordRequest, session: Session) -> dict:
             )
         await active_lockout().arecord_success(f"pwreset:{user.email}")
 
+    # A reset link must work exactly once. Without this it stays live for its
+    # whole 30-minute window, so a link recovered from a mailbox, a proxy log or
+    # a shared screenshot can be replayed to take the account back after the
+    # owner has already used it.
+    if await active_revocations().ais_revoked(claims.jti, str(claims.sub)):
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "this reset link has already been used — request a new one",
+        )
+    await active_revocations().arevoke_jti(claims.jti, expires_at=float(claims.exp))
+
     user.password_hash = hash_password(req.new_password)
     user.must_change_password = False
+    # Reset is the "I think I have been compromised" action, so it has to end
+    # every other session — otherwise the attacker's refresh token outlives it.
+    await active_revocations().arevoke_user(
+        str(user.id), until=time.time() + REFRESH_TTL.total_seconds()
+    )
     await session.commit()
-    return {"ok": True, "message": "Password updated — sign in with your new password."}
+    return {
+        "ok": True,
+        "sessions_revoked": True,
+        "message": "Password updated — sign in with your new password.",
+    }
 
 
 class MfaActivateRequest(BaseModel):
@@ -929,6 +946,14 @@ async def refresh(req: TokenRequest, session: Session) -> dict:
 
     await active_revocations().arevoke_jti(claims.jti, expires_at=float(claims.exp))
     user = await _user_by_id(session, claims.sub)
+    # A suspended or rejected account must not be able to mint fresh access
+    # tokens for the next fourteen days. Status is checked here, not only on the
+    # data routes, so suspension actually ends the session.
+    if user.status in {"suspended", "rejected", "disabled"}:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "this account has been suspended — contact your workspace admin",
+        )
     return issue_pair(
         user_id=user.id, tenant_id=user.tenant_id, role=_role_of(user)
     )

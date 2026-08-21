@@ -183,10 +183,14 @@ def test_protected_routes_reject_anonymous(client: TestClient) -> None:
     assert client.get("/api/v1/export/alerts.csv").status_code == 401
 
 
-def test_member_cannot_reach_admin_routes(client: TestClient) -> None:
+def test_a_token_for_an_account_that_does_not_exist_is_rejected(
+    client: TestClient,
+) -> None:
+    """A correctly signed token is not enough: role checks read the live account,
+    so a token whose subject has been deleted authenticates nothing."""
     from uuid import uuid4
 
-    member = issue_token(
+    forged = issue_token(
         user_id=uuid4(),
         tenant_id=uuid4(),
         role=Role.MEMBER,
@@ -194,7 +198,49 @@ def test_member_cannot_reach_admin_routes(client: TestClient) -> None:
         ttl=__import__("datetime").timedelta(minutes=5),
     )
     r = client.get(
-        "/api/v1/export/alerts.csv", headers={"Authorization": f"Bearer {member}"}
+        "/api/v1/export/alerts.csv", headers={"Authorization": f"Bearer {forged}"}
+    )
+    assert r.status_code == 401
+
+
+def test_member_cannot_reach_admin_routes(client: TestClient) -> None:
+    import asyncio
+    import time
+
+    from sqlalchemy import select
+
+    from envelock.auth.security import _totp_at
+    from envelock.db import get_sessionmaker
+    from envelock.models import User
+
+    email, pw = "member@memberco.example", "a-long-enough-passphrase"
+    client.post(
+        "/api/v1/auth/register",
+        json={"email": email, "password": pw, "tenant_name": "MemberCo"},
+    )
+
+    async def _demote() -> None:
+        async with get_sessionmaker()() as s:
+            user = (await s.execute(select(User).where(User.email == email))).scalar_one()
+            user.role = Role.MEMBER.value
+            user.is_admin = False
+            await s.commit()
+
+    asyncio.run(_demote())
+
+    login = client.post("/api/v1/auth/login", json={"email": email, "password": pw}).json()
+    setup = client.post("/api/v1/auth/mfa/setup", json={"token": login["mfa_token"]}).json()
+    tokens = client.post(
+        "/api/v1/auth/mfa/verify",
+        json={
+            "mfa_token": login["mfa_token"],
+            "code": _totp_at(setup["secret"], int(time.time()) // 30),
+        },
+    ).json()
+
+    r = client.get(
+        "/api/v1/export/alerts.csv",
+        headers={"Authorization": f"Bearer {tokens['access_token']}"},
     )
     assert r.status_code == 403
 

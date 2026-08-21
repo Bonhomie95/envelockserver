@@ -57,6 +57,13 @@ class Settings(BaseSettings):
     ms_redirect_uri: str | None = None
     ms_webhook_url: str | None = None
 
+    #: Shared secret a provider must present on the push endpoints. Graph carries
+    #: it in the subscription's signed `clientState`; Gmail Pub/Sub appends it to
+    #: the push URL as `?token=`. Without it those endpoints are unauthenticated
+    #: cross-tenant triggers, so an unset secret means "reject every push" in
+    #: production. Defaults to the app secret key when unset.
+    webhook_shared_secret: SecretStr | None = None
+
     google_client_id: str | None = None
     google_client_secret: SecretStr | None = None
     google_redirect_uri: str | None = None
@@ -79,6 +86,24 @@ class Settings(BaseSettings):
     #: Disabled in the test suite, which drives the worker directly.
     imap_poll_worker_enabled: bool = True
     imap_poll_worker_seconds: int = 60
+
+    #: Allow an IMAP connection to a loopback/private/link-local address. OFF by
+    #: default: the host comes straight from a customer form, so without this
+    #: guard "test connection" is a blind port scanner pointed at our own
+    #: infrastructure (including the cloud metadata endpoint). Turn it on only
+    #: for a self-hosted deployment whose mail server really is on the LAN.
+    imap_allow_private_hosts: bool = False
+
+    #: Extra ports the IMAP connector may dial, beyond 143/993/1143/2143 —
+    #: comma-separated. Restricting ports is what stops the connect form being
+    #: used as a general port scanner, so widen this deliberately.
+    imap_extra_allowed_ports: str = ""
+
+    #: Per-candidate connect+login budget while probing IMAP settings. The whole
+    #: ladder has to fit inside a request the customer is watching.
+    imap_probe_timeout_seconds: float = 8.0
+    #: How many discovered candidates one probe may dial.
+    imap_probe_max_candidates: int = 8
 
     # ── Channel 1: Tier 4 ────────────────────────────────────────────────────
     ingest_domain: str = "in.envelock.io"
@@ -298,6 +323,15 @@ class Settings(BaseSettings):
     @property
     def egress_ip_pool(self) -> list[str]:
         return [ip.strip() for ip in self.imap_egress_ips.split(",") if ip.strip()]
+
+    @property
+    def imap_extra_port_set(self) -> frozenset[int]:
+        ports: set[int] = set()
+        for raw in self.imap_extra_allowed_ports.split(","):
+            token = raw.strip()
+            if token.isdigit() and 1 <= int(token) <= 65535:
+                ports.add(int(token))
+        return frozenset(ports)
 
     @property
     def dnsbl_domain_zone_list(self) -> list[str]:

@@ -6,6 +6,7 @@ tenant on every access. Tenant isolation is verified, never assumed.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Literal
@@ -331,7 +332,12 @@ async def _require_verified_domain(session: AsyncSession, tenant_id: UUID, addre
     if _mail_domain_allowed(address, verified):
         return
     reg = registrable_domain(address.rsplit("@", 1)[-1] if "@" in address else "")
-    raise HTTPException(403, f"Verify {reg} before connecting a mailbox on it. Add the DNS record ")
+    raise HTTPException(
+        403,
+        f"Verify {reg} before connecting a mailbox on it. Add the DNS record shown "
+        "under Domains on your dashboard, then press Verify — it usually takes a "
+        "few minutes to propagate.",
+    )
 
 
 async def _load_domain(session: AsyncSession, tenant_id: UUID, domain: str) -> Domain | None:
@@ -602,9 +608,15 @@ async def delete_tenant(req: DeleteTenantRequest, principal: OwnerUser, session:
 class MailboxRequest(BaseModel):
     address: str
     mailbox_class: MailboxClass = MailboxClass.MONITORED
-    sources: list[SourceMechanism] = Field(default_factory=list)
     is_shared: bool = False
     known_user_count: int = 1
+
+    # NOTE: `sources` is deliberately NOT accepted here. Coverage is *derived*
+    # from what is actually connected (PRD P4), and letting the caller declare
+    # its own sources let a mailbox be created reading "Full protection, zero
+    # inactive detections" while nothing was ingesting a single message — the
+    # one thing this product must never show. Sources are written only by the
+    # connect endpoints, after a real credential has proven itself.
 
 
 def _mailbox_payload(m: Mailbox) -> dict:
@@ -648,12 +660,12 @@ async def add_mailbox(req: MailboxRequest, principal: AdminUser, session: Sessio
     if existing is not None:
         return _mailbox_payload(existing)  # idempotent — no new seat charged
     await _require_mailbox_capacity(session, tenant, adding=1)
-    caps = capabilities_for(frozenset(req.sources))
+    caps = capabilities_for(frozenset())  # no source yet — added, then connected
     mailbox = Mailbox(
         tenant_id=principal.tenant_id,
         address=req.address.lower(),
         mailbox_class=req.mailbox_class.value,
-        sources=[s.value for s in req.sources],
+        sources=[],  # earned by connecting, never declared (see MailboxRequest)
         protection_level=protection_level(caps).value,
         inactive_detections=inactive_for(caps),
         is_shared=req.is_shared,
@@ -726,7 +738,8 @@ async def add_mailboxes_bulk(
             skipped.append(
                 {
                     "address": addr,
-                    "reason": "domain not verified — you can only add mailboxes on a domain you control",
+                    "reason": "domain not verified — you can only add mailboxes "
+                    "on a domain you control",
                 }
             )
             continue
@@ -800,16 +813,97 @@ async def _mailbox_or_404(session: AsyncSession, mailbox_id: UUID, tenant_id: UU
 
 
 class ImapConnectRequest(BaseModel):
-    imap_host: str = Field(min_length=3, max_length=253)
-    imap_port: int = Field(default=993, ge=1, le=65535)
+    #: Optional. Left blank, we discover the server from the address (SRV records,
+    #: the provider's autoconfig, MX, then conventional names) and fall back
+    #: through the candidates until one signs in — the single biggest cause of a
+    #: failed IMAP connection is a hostname or TLS mode typed slightly wrong.
+    imap_host: str | None = Field(default=None, max_length=253)
+    imap_port: int | None = Field(default=None, ge=1, le=65535)
     #: Transport security — we don't assume 993/implicit-TLS, since many ISP servers
     #: use STARTTLS on 143. "ssl" | "starttls" | "none".
-    security: Literal["ssl", "starttls", "none"] = "ssl"
+    security: Literal["ssl", "starttls", "none"] | None = None
     #: Login username, when it isn't the mailbox address (some providers).
     username: str | None = Field(default=None, max_length=320)
     #: The mailbox password, or (preferred) an app-specific password. Sealed with
     #: envelope encryption and never returned or logged (PRD §5.2).
     password: str = Field(min_length=1, max_length=1024)
+    #: Set false to use ONLY the settings given above, with no fallback. Default
+    #: true: an explicit host is tried first, then the discovered alternatives.
+    autodiscover: bool = True
+
+
+def _preferred_candidate(req: ImapConnectRequest):  # noqa: ANN202 — Candidate | None
+    """The settings the customer typed, if they typed any."""
+    from envelock.channels.mail.imap_discovery import Candidate
+
+    host = (req.imap_host or "").strip().lower().rstrip(".")
+    if not host:
+        return None
+    security = req.security or ("starttls" if req.imap_port in (143, 1143) else "ssl")
+    port = req.imap_port or (993 if security == "ssl" else 143)
+    return Candidate(host=host, port=port, security=security, source="entered", confidence=1000)
+
+
+async def _probe_imap(mailbox: Mailbox, req: ImapConnectRequest):  # noqa: ANN202 — ProbeResult
+    """Run the connect ladder for this mailbox's address."""
+    from envelock.channels.mail import imap_probe
+    from envelock.config import get_settings
+
+    settings = get_settings()
+    preferred = _preferred_candidate(req)
+    if not req.autodiscover:
+        if preferred is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "enter an IMAP server, or leave it blank to detect it automatically",
+            )
+        return await asyncio.to_thread(
+            imap_probe.probe_sync,
+            [preferred],
+            email=mailbox.address,
+            username=req.username,
+            password=req.password,
+            timeout=settings.imap_probe_timeout_seconds,
+            max_candidates=1,
+        )
+    return await imap_probe.probe(
+        email=mailbox.address,
+        password=req.password,
+        username=req.username,
+        preferred=preferred,
+        timeout=settings.imap_probe_timeout_seconds,
+        max_candidates=settings.imap_probe_max_candidates,
+    )
+
+
+@router.get("/mailboxes/{mailbox_id}/connect/imap/settings")
+async def discover_imap_settings(
+    mailbox_id: UUID, principal: AdminUser, session: Session
+) -> dict:
+    """What IMAP settings this mailbox most likely needs — no password involved.
+
+    Powers the connect form's "Find my settings" button, so the customer sees the
+    right server prefilled instead of guessing and then failing to connect. The
+    full ladder is returned (not only the winner) because a support conversation
+    goes much faster when both sides can see what was tried.
+    """
+    mailbox = await _mailbox_or_404(session, mailbox_id, principal.tenant_id)
+    from envelock.channels.mail.imap_discovery import discover_safely
+
+    candidates = await discover_safely(mailbox.address)
+    best = candidates[0] if candidates else None
+    return {
+        "address": mailbox.address,
+        "detected": bool(candidates) and best is not None and best.source != "convention",
+        "settings": best.as_dict() if best else None,
+        "candidates": [c.as_dict() for c in candidates[:8]],
+        "note": (
+            "Detected from your domain's mail records."
+            if best is not None and best.source in ("dns-srv", "autoconfig", "autodiscover")
+            else "Best guess from your mail provider — we will try the alternatives "
+            "automatically if it doesn't work."
+        ),
+    }
 
 
 @router.post("/mailboxes/{mailbox_id}/connect/imap/test")
@@ -820,16 +914,15 @@ async def test_imap(
     anything — the connect form's "Test connection" button. Same tenant scoping
     as the real connect, so it can't probe another tenant's mailbox."""
     mailbox = await _mailbox_or_404(session, mailbox_id, principal.tenant_id)
-    from envelock.channels.mail import broker
-
-    check = await broker.verify_imap_credentials(
-        host=req.imap_host.strip().lower(),
-        port=req.imap_port,
-        username=(req.username or mailbox.address).strip(),
-        password=req.password,
-        security=req.security,
+    result = await _probe_imap(mailbox, req)
+    payload = result.as_dict()
+    # `reason` stays for older clients; `error` carries the code + fix.
+    payload["reason"] = (
+        "Signed in successfully."
+        if result.ok
+        else (result.failure.reason if result.failure else "")
     )
-    return {"ok": check.ok, "reason": check.reason}
+    return payload
 
 
 @router.post("/mailboxes/{mailbox_id}/connect/imap")
@@ -846,19 +939,23 @@ async def connect_imap(
 
     # Prove the credentials work before storing them. Reporting "connected" on a
     # wrong password (then silently ingesting nothing) is worse than an error.
-    from envelock.channels.mail import broker
+    # We store whatever settings actually SIGNED IN, which may not be the ones
+    # that were typed — that is the point of the fallback ladder.
+    result = await _probe_imap(mailbox, req)
+    if not result.ok or result.candidate is None:
+        failure = result.failure
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            failure.reason if failure else "could not connect to the mail server",
+            headers={"X-Envelock-Imap-Error": failure.code.value if failure else "unknown"},
+        )
 
-    host = req.imap_host.strip().lower()
-    login_user = (req.username or mailbox.address).strip()
-    check = await broker.verify_imap_credentials(
-        host=host,
-        port=req.imap_port,
-        username=login_user,
-        password=req.password,
-        security=req.security,
-    )
-    if not check.ok:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"could not connect — {check.reason}")
+    host = result.candidate.host
+    port = result.candidate.port
+    security = result.candidate.security
+    # The username that worked — the local part, when the full address did not.
+    login_user = result.username or (req.username or mailbox.address).strip()
+    stored_username = None if login_user == mailbox.address else login_user
 
     sealed = seal(req.password.encode(), aad=str(mailbox.id).encode())
     existing = (
@@ -873,20 +970,26 @@ async def connect_imap(
                 tenant_id=principal.tenant_id,
                 kind="imap_password",
                 imap_host=host,
-                imap_port=req.imap_port,
-                imap_security=req.security,
-                imap_username=req.username.strip() if req.username else None,
+                imap_port=port,
+                imap_security=security,
+                imap_username=stored_username,
                 ciphertext=sealed.ciphertext,
                 wrapped_dek=sealed.wrapped_dek,
                 key_id=sealed.key_id,
             )
         )
     else:
+        # A reconnect re-runs discovery and may land on a different server; a UID
+        # cursor is only meaningful for the server that issued it, so drop it
+        # when the host changes.
+        if existing.imap_host != host:
+            existing.imap_last_uid = None
+            existing.imap_uidvalidity = None
         existing.kind = "imap_password"
         existing.imap_host = host
-        existing.imap_port = req.imap_port
-        existing.imap_security = req.security
-        existing.imap_username = req.username.strip() if req.username else None
+        existing.imap_port = port
+        existing.imap_security = security
+        existing.imap_username = stored_username
         existing.ciphertext = sealed.ciphertext
         existing.wrapped_dek = sealed.wrapped_dek
         existing.key_id = sealed.key_id
@@ -914,10 +1017,25 @@ async def connect_imap(
         action=alert_svc.AuditAction.MAILBOX_CONNECTED,
         target_type="mailbox",
         target_id=mailbox.id,
-        detail={"address": mailbox.address, "method": "imap", "host": req.imap_host},
+        detail={
+            "address": mailbox.address,
+            "method": "imap",
+            "host": host,
+            "port": port,
+            "security": security,
+            "discovered_via": result.candidate.source,
+        },
     )
     await session.commit()
-    return _mailbox_payload(mailbox)
+    payload = _mailbox_payload(mailbox)
+    payload["imap"] = {
+        "host": host,
+        "port": port,
+        "security": security,
+        "username": login_user,
+        "discovered_via": result.candidate.source,
+    }
+    return payload
 
 
 @router.post("/mailboxes/{mailbox_id}/sync")

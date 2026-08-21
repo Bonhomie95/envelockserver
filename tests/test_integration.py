@@ -76,7 +76,9 @@ FRAUD = (
 )
 
 
-async def test_whole_journey_signup_to_acknowledged_alert(client: TestClient) -> None:
+async def test_whole_journey_signup_to_acknowledged_alert(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     token = sign_in(client)
     h = auth(token)
 
@@ -91,13 +93,47 @@ async def test_whole_journey_signup_to_acknowledged_alert(client: TestClient) ->
 
     mailbox = client.post(
         "/api/v1/mailboxes",
-        json={
-            "address": "pay@acme.com",
-            "mailbox_class": "protected",
-            "sources": ["imap_idle", "client_sensor"],
-        },
+        json={"address": "pay@acme.com", "mailbox_class": "protected"},
         headers=h,
     ).json()
+    # An address that has only been *added* protects nothing yet, and says so.
+    assert mailbox["protection_level"] == "limited"
+
+    # Connect it for real. Coverage is earned by a working connection, never
+    # declared by the caller — so the level only moves once this succeeds.
+    from envelock.channels.mail import imap_probe
+
+    monkeypatch.setattr(
+        imap_probe,
+        "try_login",
+        lambda candidate, *, username, **_: imap_probe.Attempt(
+            candidate, username, ok=True
+        ),
+    )
+    connected = client.post(
+        f"/api/v1/mailboxes/{mailbox['id']}/connect/imap",
+        json={"imap_host": "imap.acme.com", "imap_port": 993, "password": "app-pw"},
+        headers=h,
+    ).json()
+    assert "imap_idle" in connected["sources"]
+
+    # Roll out the sensor: that is what supplies Channel-2 telemetry for an IMAP
+    # mailbox, and it is what lifts this mailbox to Standard.
+    client.post(
+        "/api/v1/sensor/heartbeat",
+        json={
+            "mailbox_address": "pay@acme.com",
+            "device_fingerprint": "device-onboarding-0001",
+            "browser": "Firefox",
+            "os": "Windows",
+        },
+        headers=h,
+    )
+    mailbox = next(
+        m
+        for m in client.get("/api/v1/mailboxes", headers=h).json()["mailboxes"]
+        if m["address"] == "pay@acme.com"
+    )
     assert mailbox["protection_level"] == "standard"
     # IMAP cannot read server-side rules, and we say which detections that costs.
     assert {"C1", "C2", "C4"} <= set(mailbox["inactive_detections"])

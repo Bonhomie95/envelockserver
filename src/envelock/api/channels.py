@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -21,11 +21,16 @@ from envelock.channels.external.brand import (
 from envelock.channels.mail import oauth
 from envelock.channels.mail.broker import ImapBroker
 from envelock.channels.mail.providers import provider_status
-from envelock.core.capabilities import capabilities_for
-from envelock.core.enums import IdentityEventKind, IntegrationTier, SourceMechanism
+from envelock.core.capabilities import capabilities_for, protection_level
+from envelock.core.enums import (
+    IdentityEventKind,
+    IntegrationTier,
+    MailboxClass,
+    SourceMechanism,
+)
 from envelock.core.events import DeviceContext, IdentityEvent, NetworkContext
 from envelock.db import get_session
-from envelock.detections.base import CounterpartyState, DetectionContext, run_all
+from envelock.detections.base import CounterpartyState, DetectionContext, inactive_for, run_all
 from envelock.detections.cascade import AttachmentCascade, UrlCascade
 from envelock.models import (
     Domain,
@@ -160,6 +165,17 @@ _OAUTH_SOURCES: dict[str, list[SourceMechanism]] = {
 
 class OAuthAuthorizeRequest(BaseModel):
     mailbox_address: str
+    #: "api" asks for Graph/Gmail ingest consent. "imap" asks for the mailbox
+    #: IMAP scope instead — the way in for a provider that has switched password
+    #: authentication off, so IMAP still works without a password.
+    mode: Literal["api", "imap"] = "api"
+
+
+#: Where each provider's IMAP endpoint lives, for the XOAUTH2 fallback.
+_IMAP_ENDPOINTS: dict[str, tuple[str, int]] = {
+    "microsoft": ("outlook.office365.com", 993),
+    "google": ("imap.gmail.com", 993),
+}
 
 
 @router.get("/connect/oauth/providers")
@@ -209,14 +225,17 @@ async def oauth_authorize(
 
     await _require_verified_domain(session, principal.tenant_id, mailbox.address)
 
+    for_imap = req.mode == "imap"
     state = oauth.issue_state(
         tenant_id=str(principal.tenant_id),
         mailbox=mailbox.address,
         provider=provider,
+        mode=req.mode,
     )
     return {
         "provider": provider,
-        "authorize_url": oauth.authorization_url(prov, state=state),
+        "mode": req.mode,
+        "authorize_url": oauth.authorization_url(prov, state=state, for_imap=for_imap),
         "state": state,
         "expires_in": 600,
     }
@@ -266,6 +285,8 @@ async def oauth_callback(
     if mailbox is None:
         raise HTTPException(404, "mailbox not found")
 
+    mode = claims.get("k", "api")
+
     try:
         tokens = await oauth.exchange_code(prov, code=code)
     except oauth.OAuthError as exc:
@@ -295,6 +316,13 @@ async def oauth_callback(
     from datetime import UTC, datetime, timedelta
 
     token_expires_at = datetime.now(UTC) + timedelta(seconds=tokens.expires_in)
+
+    # An "imap" grant is the fallback path for a provider that has switched
+    # password authentication off: same IMAP worker, SASL XOAUTH2 instead of a
+    # password. Recording the IMAP endpoint on the credential is what tells the
+    # worker to use it.
+    imap_endpoint = _IMAP_ENDPOINTS.get(provider) if mode == "imap" else None
+
     if existing is None:
         session.add(
             MailboxCredential(
@@ -305,6 +333,9 @@ async def oauth_callback(
                 wrapped_dek=sealed.wrapped_dek,
                 key_id=sealed.key_id,
                 token_expires_at=token_expires_at,
+                imap_host=imap_endpoint[0] if imap_endpoint else None,
+                imap_port=imap_endpoint[1] if imap_endpoint else None,
+                imap_security="ssl" if imap_endpoint else None,
             )
         )
     else:
@@ -313,19 +344,43 @@ async def oauth_callback(
         existing.wrapped_dek = sealed.wrapped_dek
         existing.key_id = sealed.key_id
         existing.token_expires_at = token_expires_at
+        if imap_endpoint:
+            existing.imap_host, existing.imap_port = imap_endpoint
+            existing.imap_security = "ssl"
+            existing.imap_last_uid = None
+            existing.imap_uidvalidity = None
 
-    # The mailbox is now Tier-1: record the sources so coverage is derived, not
-    # declared (PRD P4). Preserve any existing sensor source.
-    unlocked = {s.value for s in _OAUTH_SOURCES[provider]}
-    mailbox.sources = sorted(set(mailbox.sources or []) | unlocked)
-    mailbox.integration_tier = int(IntegrationTier.FULL_API)
+    if mode == "imap":
+        # IMAP over OAuth reads and can quarantine, but gives no provider audit
+        # log, so it is a Tier-3 source — the capability model then derives an
+        # honest protection level rather than claiming Tier-1 coverage.
+        source = (
+            SourceMechanism.IMAP_IDLE
+            if mailbox.mailbox_class == MailboxClass.PROTECTED.value
+            else SourceMechanism.IMAP_POLL
+        )
+        mailbox.sources = sorted(set(mailbox.sources or []) | {source.value})
+        mailbox.integration_tier = int(IntegrationTier.IMAP)
+    else:
+        # The mailbox is now Tier-1: record the sources so coverage is derived,
+        # not declared (PRD P4). Preserve any existing sensor source.
+        unlocked = {s.value for s in _OAUTH_SOURCES[provider]}
+        mailbox.sources = sorted(set(mailbox.sources or []) | unlocked)
+        mailbox.integration_tier = int(IntegrationTier.FULL_API)
+
+    caps = capabilities_for(frozenset(SourceMechanism(s) for s in mailbox.sources))
+    mailbox.protection_level = protection_level(caps).value
+    mailbox.inactive_detections = inactive_for(caps)
+    mailbox.needs_reconnect = False
+    mailbox.connection_error = None
     await session.commit()
 
     return {
         "connected": True,
         "provider": provider,
+        "mode": mode,
         "mailbox": mailbox.address,
-        "integration_tier": int(IntegrationTier.FULL_API),
+        "integration_tier": mailbox.integration_tier,
         "sources": mailbox.sources,
         "has_refresh_token": tokens.refresh_token is not None,
     }
@@ -443,12 +498,24 @@ async def sensor_heartbeat(
     else:
         existing.last_seen_at = now
 
+    # A live sensor is a real source of Channel-2 telemetry, so record it on the
+    # mailbox: coverage is derived from sources (PRD P4), and without this the
+    # Group-C detections the sensor actually enables kept reading as inactive.
+    if SourceMechanism.CLIENT_SENSOR.value not in (mailbox.sources or []):
+        mailbox.sources = sorted(
+            set(mailbox.sources or []) | {SourceMechanism.CLIENT_SENSOR.value}
+        )
+        caps = capabilities_for(frozenset(SourceMechanism(x) for x in mailbox.sources))
+        mailbox.protection_level = protection_level(caps).value
+        mailbox.inactive_detections = inactive_for(caps)
+
     await session.commit()
     return {
         "acknowledged": True,
         "at": now.isoformat(),
         "alerted": alerted,
         "findings": findings,
+        "protection_level": mailbox.protection_level,
     }
 
 

@@ -48,11 +48,15 @@ class OAuthTokens:
 _STATE_TTL = 600  # 10 minutes to complete consent
 
 
-def issue_state(*, tenant_id: str, mailbox: str, provider: str) -> str:
+def issue_state(
+    *, tenant_id: str, mailbox: str, provider: str, mode: str = "api"
+) -> str:
     payload = {
         "t": tenant_id,
         "m": mailbox,
         "p": provider,
+        # "api" = Graph/Gmail ingest; "imap" = XOAUTH2 mailbox connection.
+        "k": mode,
         "n": secrets.token_urlsafe(8),
         "exp": int(time.time()) + _STATE_TTL,
     }
@@ -123,6 +127,7 @@ class OAuthProvider(Protocol):
     authorize_endpoint: str
     token_endpoint: str
     scopes: tuple[str, ...]
+    imap_scopes: tuple[str, ...]
 
     def client_id(self) -> str | None: ...
     def client_secret(self) -> str | None: ...
@@ -142,6 +147,14 @@ class _Microsoft:
         "https://graph.microsoft.com/Mail.Read",
         "https://graph.microsoft.com/MailboxSettings.Read",
         "https://graph.microsoft.com/AuditLog.Read.All",
+    )
+    #: Requested separately when connecting a mailbox over IMAP with XOAUTH2.
+    #: Microsoft will not issue one token covering both Graph and Outlook IMAP
+    #: resources, so this is its own consent — and it is the ONLY way IMAP works
+    #: on Microsoft 365 now that basic authentication is switched off.
+    imap_scopes: tuple[str, ...] = (
+        "offline_access",
+        "https://outlook.office.com/IMAP.AccessAsUser.All",
     )
 
     def client_id(self) -> str | None:
@@ -164,6 +177,8 @@ class _Google:
         "https://www.googleapis.com/auth/gmail.readonly",
         "https://www.googleapis.com/auth/admin.reports.audit.readonly",
     )
+    #: Gmail's IMAP XOAUTH2 needs the full-mail scope; the API path does not.
+    imap_scopes: tuple[str, ...] = ("https://mail.google.com/",)
 
     def client_id(self) -> str | None:
         return get_settings().google_client_id
@@ -201,19 +216,28 @@ def configured_providers() -> list[str]:
 
 
 # ── Flow ─────────────────────────────────────────────────────────────────────
-def authorization_url(provider: OAuthProvider, *, state: str) -> str:
-    """The URL the admin's browser is redirected to for tenant consent."""
+def authorization_url(
+    provider: OAuthProvider, *, state: str, for_imap: bool = False
+) -> str:
+    """The URL the admin's browser is redirected to for tenant consent.
+
+    `for_imap` asks for the mailbox-IMAP scope instead of the API scopes — the
+    consent behind the "connect over IMAP with OAuth" fallback.
+    """
     if not is_configured(provider):
         raise OAuthError(
             f"{provider.id} OAuth is not configured — set its client id, secret "
             "and redirect URI in the environment"
         )
+    scopes = (
+        getattr(provider, "imap_scopes", provider.scopes) if for_imap else provider.scopes
+    )
     params = {
         "client_id": provider.client_id(),
         "response_type": "code",
         "redirect_uri": provider.redirect_uri(),
         "response_mode": "query",
-        "scope": " ".join(provider.scopes),
+        "scope": " ".join(scopes),
         "state": state,
         # Force a refresh token on Google; Microsoft returns one with offline_access.
         "access_type": "offline",

@@ -76,18 +76,52 @@ async def optional_principal(
     return Principal(user_id=claims.sub, tenant_id=claims.tenant, role=claims.role)
 
 
+async def _live_user(principal: Principal):  # noqa: ANN202 — models.User
+    """Load the caller's current row. The token is a 15-minute snapshot; every
+    authorisation decision has to be made against what is true now."""
+    from envelock.db import get_sessionmaker
+    from envelock.models import User
+
+    async with get_sessionmaker()() as session:
+        return await session.get(User, principal.user_id)
+
+
 def require_role(minimum: Role):
-    """Route dependency enforcing a minimum role."""
+    """Route dependency enforcing a minimum role, against the LIVE account.
+
+    Checking the token's role alone made suspension a paper control: an access
+    token issued before a suspension kept full admin powers until it expired,
+    and `/auth/refresh` would mint fresh ones from a 14-day refresh token, so a
+    suspended admin could hold their access indefinitely. Both the role and the
+    account status are therefore read from the database on every request.
+    """
 
     async def _guard(
         principal: Annotated[Principal, Depends(current_principal)],
     ) -> Principal:
-        if not role_at_least(principal.role, minimum):
+        user = await _live_user(principal)
+        if user is None:
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED,
+                "invalid credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if user.status != "active":
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "this account is not active — ask a workspace admin to approve "
+                "or reinstate it",
+            )
+        live_role = Role(user.role)
+        if not role_at_least(live_role, minimum):
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
                 f"requires {minimum.value} role",
             )
-        return principal
+        # Return the live role, not the token's: a demotion takes effect now.
+        return Principal(
+            user_id=user.id, tenant_id=user.tenant_id, role=live_role
+        )
 
     return _guard
 

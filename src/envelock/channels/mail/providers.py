@@ -86,15 +86,22 @@ class GraphProvider(MailProvider):
             f"&redirect_uri={self.redirect_uri}&scope={scope}"
         )
 
-    def subscription_body(self, *, mailbox: str) -> dict:
+    def subscription_body(self, *, mailbox: str, tenant_id: object = "") -> dict:
         """Change notifications. Graph will not deliver to localhost, so the
-        webhook URL must be public HTTPS."""
+        webhook URL must be public HTTPS.
+
+        `clientState` carries an HMAC over the tenant and mailbox: Graph echoes
+        it on every notification, so it is both the receiver's authentication and
+        its authorisation to touch exactly this mailbox.
+        """
+        from envelock.api._webhook_auth import client_state
+
         return {
             "changeType": "created,updated",
             "notificationUrl": self.webhook_url,
             "resource": f"users/{mailbox}/mailFolders('inbox')/messages",
             "expirationDateTime": (datetime.now(UTC) + timedelta(days=2)).isoformat(),
-            "clientState": "envelock",
+            "clientState": client_state(tenant_id=tenant_id, mailbox=mailbox),
         }
 
     async def fetch(
@@ -206,6 +213,14 @@ class GmailProvider(MailProvider):
 
     def watch_body(self) -> dict:
         return {"topicName": self.pubsub_topic, "labelIds": ["INBOX"]}
+
+    @staticmethod
+    def push_endpoint(base_url: str) -> str:
+        """The Pub/Sub push URL to register, carrying the shared token Google
+        echoes on every delivery — the receiver's only proof the call is ours."""
+        from envelock.api._webhook_auth import push_token
+
+        return f"{base_url.rstrip('/')}/api/v1/webhooks/gmail?token={push_token()}"
 
     async def fetch(
         self, *, tenant_id: UUID, mailbox_id: UUID, window: FetchWindow

@@ -76,6 +76,23 @@ def _decrypt_password(cred: MailboxCredential) -> str:
     return open_secret(sealed, aad=str(cred.mailbox_id).encode()).decode()
 
 
+def _imap_secret(cred: MailboxCredential) -> tuple[str | None, str | None]:
+    """`(password, access_token)` for this credential.
+
+    A mailbox whose provider has switched password authentication off (Microsoft
+    365, and increasingly others) can still be reached over IMAP with SASL
+    XOAUTH2 using the OAuth access token we already hold. That is the fallback
+    layer: same IMAP code path, different credential.
+    """
+    if cred.kind == "oauth_token":
+        import json
+
+        payload = json.loads(_decrypt_password(cred))
+        token = payload.get("access_token")
+        return (None, token) if token else (None, None)
+    return (_decrypt_password(cred), None)
+
+
 async def sync_mailbox(
     session: AsyncSession,
     mailbox: Mailbox,
@@ -91,11 +108,18 @@ async def sync_mailbox(
             select(MailboxCredential).where(MailboxCredential.mailbox_id == mailbox.id)
         )
     ).scalar_one_or_none()
-    if cred is None or cred.kind != "imap_password" or not cred.imap_host:
+    if cred is None or cred.kind not in ("imap_password", "oauth_token") or not cred.imap_host:
         return {"ok": False, "reason": "no imap credential", "fetched": 0}
 
     try:
-        password = _decrypt_password(cred)
+        password, access_token = _imap_secret(cred)
+        if password is None and access_token is None:
+            return {
+                "ok": False,
+                "reason": "no usable IMAP credential on file — reconnect this mailbox",
+                "needs_reconnect": True,
+                "fetched": 0,
+            }
     except CryptoError:
         logger.warning("imap: could not decrypt credential for mailbox %s", mailbox.id)
         # The credential is dead (master key rotated, or ciphertext tampered). Flag
@@ -126,6 +150,7 @@ async def sync_mailbox(
         security=security,
         username=username,
         password=password,
+        access_token=access_token,
         since_uid=cred.imap_last_uid,
         uidvalidity=cred.imap_uidvalidity,
         limit=imap_sync.DEFAULT_LIMIT,
@@ -135,6 +160,7 @@ async def sync_mailbox(
 
     if not result.ok:
         logger.warning("imap: poll failed for mailbox %s — %s", mailbox.id, result.error)
+        mailbox.connection_error = result.error
         if result.auth_failed:
             # The server rejected the password — reconnect needed, not transient.
             mailbox.needs_reconnect = True
@@ -189,6 +215,7 @@ async def sync_mailbox(
                     security=security,
                     username=username,
                     password=password,
+                    access_token=access_token,
                     uid=msg.uid,
                     client_factory=client_factory,
                 )
@@ -245,14 +272,14 @@ async def backfill_mailbox(
             select(MailboxCredential).where(MailboxCredential.mailbox_id == mailbox.id)
         )
     ).scalar_one_or_none()
-    if cred is None or cred.kind != "imap_password" or not cred.imap_host:
+    if cred is None or cred.kind not in ("imap_password", "oauth_token") or not cred.imap_host:
         return {"ok": False, "reason": "no imap credential", "analysed": 0}
 
     from envelock.db import set_current_tenant
 
     set_current_tenant(mailbox.tenant_id)
     try:
-        password = _decrypt_password(cred)
+        password, access_token = _imap_secret(cred)
     except CryptoError:
         return {"ok": False, "reason": "credential could not be decrypted", "analysed": 0}
 
@@ -264,6 +291,7 @@ async def backfill_mailbox(
         security=cred.imap_security or "ssl",
         username=(cred.imap_username or mailbox.address).strip(),
         password=password,
+        access_token=access_token,
         since_date=since_date,
         limit=limit,
         client_factory=client_factory,
@@ -304,7 +332,8 @@ async def _imap_mailboxes(session: AsyncSession) -> list[Mailbox]:
                 .join(MailboxCredential, MailboxCredential.mailbox_id == Mailbox.id)
                 .where(
                     Mailbox.is_active.is_(True),
-                    MailboxCredential.kind == "imap_password",
+                    MailboxCredential.kind.in_(("imap_password", "oauth_token")),
+                    MailboxCredential.imap_host.is_not(None),
                 )
             )
         )

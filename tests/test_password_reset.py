@@ -71,8 +71,21 @@ async def test_mfa_account_resets_with_authenticator(client: TestClient):
     secret = _register_with_mfa(client, email, pw)
 
     forgot = client.post("/api/v1/auth/password/forgot", json={"email": email}).json()
-    assert forgot["method"] == "mfa"
-    token = forgot["reset_token"]
+    # Every account gets the same answer and the same emailed link — otherwise
+    # the response is a free "does this address exist, and does it have MFA?"
+    # oracle. An MFA account additionally has to supply its authenticator code.
+    assert forgot["method"] == "email"
+    assert "reset_token" not in forgot
+    token = forgot["reset_link"].split("token=", 1)[1]
+
+    # No code at all is rejected for an MFA account.
+    assert (
+        client.post(
+            "/api/v1/auth/password/reset",
+            json={"token": token, "new_password": "a-brand-new-passphrase-9"},
+        ).status_code
+        == 401
+    )
 
     # Wrong code is rejected.
     bad = client.post(
@@ -88,6 +101,18 @@ async def test_mfa_account_resets_with_authenticator(client: TestClient):
         json={"token": token, "new_password": new_pw, "code": _totp_now(secret)},
     )
     assert ok.status_code == 200
+    assert ok.json()["sessions_revoked"] is True
+
+    # The link is single-use: replaying it after a successful reset fails.
+    replay = client.post(
+        "/api/v1/auth/password/reset",
+        json={
+            "token": token,
+            "new_password": "yet-another-passphrase-3",
+            "code": _totp_now(secret),
+        },
+    )
+    assert replay.status_code == 401
 
     # The new password now logs in; the old one does not.
     assert (

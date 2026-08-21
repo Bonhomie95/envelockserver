@@ -361,16 +361,16 @@ def test_imap_connect_seals_credentials_and_marks_connected(
 
     from sqlalchemy import select
 
-    from envelock.channels.mail import broker
+    from envelock.channels.mail import imap_probe
     from envelock.db import get_sessionmaker
     from envelock.models import MailboxCredential
 
-    # No live IMAP server in the suite — stub the credential check as passing so
-    # this test covers storage/connect, not the network (see test_imap_verify).
-    async def _ok(**_: object) -> broker.ImapVerifyResult:
-        return broker.ImapVerifyResult(True, "signed in")
+    # No live IMAP server in the suite — stub the one socket boundary as signing
+    # in, so this test covers storage/connect, not the network.
+    def _ok(candidate, *, username, **_: object) -> imap_probe.Attempt:  # noqa: ANN001
+        return imap_probe.Attempt(candidate, username, ok=True)
 
-    monkeypatch.setattr(broker, "verify_imap_credentials", _ok)
+    monkeypatch.setattr(imap_probe, "try_login", _ok)
 
     h = _auth_header(client, email="admin@custommail.dev")
     client.post(
@@ -416,17 +416,22 @@ def test_imap_connect_honours_security_mode_and_username(
 
     from sqlalchemy import select
 
-    from envelock.channels.mail import broker
+    from envelock.channels.mail import imap_probe
     from envelock.db import get_sessionmaker
     from envelock.models import MailboxCredential
 
     seen: dict = {}
 
-    async def _capture(**kw: object) -> broker.ImapVerifyResult:
-        seen.update(kw)
-        return broker.ImapVerifyResult(True, "signed in")
+    def _capture(candidate, *, username, **_: object) -> imap_probe.Attempt:  # noqa: ANN001
+        seen.update(
+            host=candidate.host,
+            port=candidate.port,
+            security=candidate.security,
+            username=username,
+        )
+        return imap_probe.Attempt(candidate, username, ok=True)
 
-    monkeypatch.setattr(broker, "verify_imap_credentials", _capture)
+    monkeypatch.setattr(imap_probe, "try_login", _capture)
 
     h = _auth_header(client, email="admin@ispmail.dev")
     client.post(
@@ -478,14 +483,20 @@ def test_imap_test_endpoint_verifies_without_storing(
 
     from sqlalchemy import func, select
 
-    from envelock.channels.mail import broker
+    from envelock.channels.mail import imap_probe
+    from envelock.channels.mail.imap_errors import classify_login_failure
     from envelock.db import get_sessionmaker
     from envelock.models import MailboxCredential
 
-    async def _reject(**_: object) -> broker.ImapVerifyResult:
-        return broker.ImapVerifyResult(False, "the server rejected the password")
+    def _reject(candidate, *, username, **_: object) -> imap_probe.Attempt:  # noqa: ANN001
+        return imap_probe.Attempt(
+            candidate,
+            username,
+            ok=False,
+            failure=classify_login_failure("LOGIN failed", host=candidate.host),
+        )
 
-    monkeypatch.setattr(broker, "verify_imap_credentials", _reject)
+    monkeypatch.setattr(imap_probe, "try_login", _reject)
 
     h = _auth_header(client, email="admin@testconn.dev")
     client.post(
@@ -503,7 +514,10 @@ def test_imap_test_endpoint_verifies_without_storing(
         headers=h,
     )
     assert r.status_code == 200
-    assert r.json()["ok"] is False and "rejected" in r.json()["reason"]
+    body = r.json()
+    assert body["ok"] is False and "rejected" in body["reason"]
+    # The failure is machine-readable so the UI can show the right fix.
+    assert body["error"]["code"] == "auth_failed"
 
     async def _cred_count() -> int:
         async with get_sessionmaker()() as s:

@@ -25,6 +25,22 @@ _BUCKETS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _subject_of(token: str) -> str | None:
+    """The `sub` claim, without verifying the signature (see `client_identity`)."""
+    import base64
+    import json
+
+    payload_b64 = token.split(".", 1)[0]
+    if not payload_b64 or len(payload_b64) > 2048:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(payload_b64 + "=" * (-len(payload_b64) % 4))
+        subject = json.loads(raw).get("sub")
+    except (ValueError, TypeError):
+        return None
+    return subject if isinstance(subject, str) and len(subject) <= 64 else None
+
+
 def _bucket_for(path: str) -> str:
     for prefix, bucket in _BUCKETS:
         if path.startswith(prefix):
@@ -43,9 +59,15 @@ def client_identity(request: Request) -> str:
     """
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
-        # Bucket by token identity without parsing it: a stable hash is enough
-        # and avoids doing crypto work before the limiter has run.
-        return f"tok:{hash(auth[7:60]) & 0xFFFFFFFF:08x}"
+        # Bucket by the *subject*, not the token string. Hashing the token meant
+        # every rotation produced a fresh bucket, so anyone holding a refresh
+        # token could reset their own limit at will. The subject is read from the
+        # unverified payload — no signature check and no crypto before the
+        # limiter runs — which is fine here: a forged subject can only throttle
+        # itself, and an unparseable token falls back to the peer address.
+        subject = _subject_of(auth[7:].strip())
+        if subject:
+            return f"sub:{subject}"
 
     if get_settings().trust_forwarded_for:
         forwarded = request.headers.get("x-forwarded-for", "")

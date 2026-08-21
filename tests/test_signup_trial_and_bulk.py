@@ -8,7 +8,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from envelock.api.auth import _reset_store
-from envelock.channels.mail import broker
+from envelock.channels.mail import imap_probe
+from envelock.channels.mail.imap_errors import classify_login_failure
 from envelock.main import app
 
 
@@ -71,10 +72,15 @@ def test_imap_connect_rejects_a_bad_password(
     h = _session(client, "it@imaprej.example", domain="imaprej.example")
     mb_id = _add_mailbox(client, h, "ceo@imaprej.example")
 
-    async def _reject(**_: object) -> broker.ImapVerifyResult:
-        return broker.ImapVerifyResult(False, "the server rejected the address or password")
+    def _reject(candidate, *, username, **_: object) -> imap_probe.Attempt:  # noqa: ANN001
+        return imap_probe.Attempt(
+            candidate,
+            username,
+            ok=False,
+            failure=classify_login_failure("LOGIN failed", host=candidate.host),
+        )
 
-    monkeypatch.setattr(broker, "verify_imap_credentials", _reject)
+    monkeypatch.setattr(imap_probe, "try_login", _reject)
 
     out = client.post(
         f"/api/v1/mailboxes/{mb_id}/connect/imap",
@@ -93,10 +99,10 @@ def test_imap_connect_succeeds_when_credentials_verify(
     h = _session(client, "it2@imapok.example", domain="imapok.example")
     mb_id = _add_mailbox(client, h, "cfo@imapok.example")
 
-    async def _ok(**_: object) -> broker.ImapVerifyResult:
-        return broker.ImapVerifyResult(True, "signed in")
+    def _ok(candidate, *, username, **_: object) -> imap_probe.Attempt:  # noqa: ANN001
+        return imap_probe.Attempt(candidate, username, ok=True)
 
-    monkeypatch.setattr(broker, "verify_imap_credentials", _ok)
+    monkeypatch.setattr(imap_probe, "try_login", _ok)
 
     out = client.post(
         f"/api/v1/mailboxes/{mb_id}/connect/imap",
