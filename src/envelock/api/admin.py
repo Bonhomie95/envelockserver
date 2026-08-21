@@ -1,12 +1,19 @@
-"""Platform (super-admin) console API — cross-tenant operations.
+"""Platform console API — cross-tenant operations.
 
-Every endpoint sits behind `SuperAdmin` (an email allowlist set at deployment,
-never grantable in-app). This is the only place tenant isolation is deliberately
-crossed, so it is deliberately narrow: it exposes operational metadata and a few
-support actions, and never secrets — no password hashes, TOTP secrets, mailbox
-credentials or card fingerprints are returned by anything here.
+This is the only place tenant isolation is deliberately crossed, so it is
+deliberately narrow: operational metadata and a few support actions, never
+secrets — no password hashes, TOTP secrets, mailbox credentials or card
+fingerprints are returned by anything here.
 
-Mutations are written to the audit log with the operator's id.
+Access is per-permission, not all-or-nothing. Each endpoint declares the one
+permission it needs (`auth/staff.py`), so a support agent can approve a customer
+user without also being able to suspend a tenant, and a billing clerk can change
+a plan without reading anyone's alert queue. The deployment email allowlist
+remains as break-glass and carries every permission.
+
+Every mutation is written to both the customer's tenant audit log (so they can
+see that we acted on their account) and the staff audit log (so we can see who
+did it).
 """
 
 from __future__ import annotations
@@ -15,18 +22,29 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from envelock.auth.deps import SuperAdmin
+from envelock.api.staff_auth import CurrentOperator, record_staff_audit, requires
 from envelock.auth.security import Role, role_at_least
+from envelock.auth.staff import Operator, Permission
 from envelock.db import get_session
 from envelock.models import Alert, AuditEvent, Domain, Mailbox, Tenant, User
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
 Session = Annotated[AsyncSession, Depends(get_session)]
+
+# One alias per permission the console needs, so a route reads as its own
+# authorisation statement rather than deferring to a comment.
+PlatformReader = Annotated[Operator, Depends(requires(Permission.PLATFORM_READ))]
+TenantReader = Annotated[Operator, Depends(requires(Permission.TENANT_READ))]
+UserReader = Annotated[Operator, Depends(requires(Permission.USER_READ))]
+BillingOperator = Annotated[Operator, Depends(requires(Permission.TENANT_BILLING))]
+SuspendOperator = Annotated[Operator, Depends(requires(Permission.TENANT_SUSPEND))]
+UserOperator = Annotated[Operator, Depends(requires(Permission.USER_MANAGE))]
+RoleOperator = Annotated[Operator, Depends(requires(Permission.USER_ROLE))]
 
 _PLANS = {"guard", "essential", "complete", "solo"}
 _ROLES = {"member", "admin", "owner"}
@@ -57,33 +75,57 @@ def _trial_view(tenant: Tenant) -> dict:
 
 async def _audit(
     session: AsyncSession,
-    actor: SuperAdmin,
+    actor: Operator,
     *,
     tenant_id: UUID,
     action: str,
     target_type: str,
     target_id: UUID,
     detail: dict,
+    request: Request | None = None,
 ) -> None:
+    """Write the action to both logs.
+
+    The tenant's own log, so a customer can see that Envelock touched their
+    account — a platform action invisible to the customer is not acceptable in a
+    product sold on oversight. And the staff log, which the customer cannot see
+    and an operator cannot reach through a tenant view.
+    """
+    try:
+        actor_id: UUID | None = UUID(actor.id)
+    except ValueError:
+        actor_id = None
     session.add(
         AuditEvent(
             tenant_id=tenant_id,
-            actor_id=actor.user_id,
+            actor_id=actor_id,
             action=action,
             target_type=target_type,
             target_id=target_id,
-            detail={"by": actor.email, **detail},
+            detail={"by": actor.email, "department": actor.department, **detail},
         )
+    )
+    await record_staff_audit(
+        session,
+        actor,
+        action=action,
+        target_type=target_type,
+        target_id=str(target_id),
+        tenant_id=tenant_id,
+        ip=request.client.host if request and request.client else None,
+        detail=detail,
     )
 
 
 @router.get("/whoami")
-async def whoami(actor: SuperAdmin) -> dict:
-    return {"email": actor.email, "is_superadmin": True}
+async def whoami(actor: CurrentOperator) -> dict:
+    """Who the console is talking to, and exactly what they may do — the client
+    hides what it must not offer, and the server still enforces every check."""
+    return {**actor.as_dict(), "is_superadmin": True}
 
 
 @router.get("/overview")
-async def overview(actor: SuperAdmin, session: Session) -> dict:
+async def overview(actor: PlatformReader, session: Session) -> dict:
     """Platform-wide counts for the console home."""
     now = datetime.now(UTC)
 
@@ -161,7 +203,7 @@ async def _counts_by_tenant(session: AsyncSession) -> tuple[dict, dict, dict]:
 
 @router.get("/tenants")
 async def list_tenants(
-    actor: SuperAdmin,
+    actor: TenantReader,
     session: Session,
     query: str = "",
     limit: int = Query(default=100, ge=1, le=500),
@@ -223,7 +265,7 @@ async def list_tenants(
 
 
 @router.get("/tenants/{tenant_id}")
-async def tenant_detail(tenant_id: UUID, actor: SuperAdmin, session: Session) -> dict:
+async def tenant_detail(tenant_id: UUID, actor: TenantReader, session: Session) -> dict:
     tenant = await session.get(Tenant, tenant_id)
     if tenant is None:
         raise HTTPException(404, "tenant not found")
@@ -307,7 +349,7 @@ async def tenant_detail(tenant_id: UUID, actor: SuperAdmin, session: Session) ->
 
 @router.get("/users")
 async def list_users(
-    actor: SuperAdmin,
+    actor: UserReader,
     session: Session,
     query: str = "",
     limit: int = Query(default=100, ge=1, le=500),
@@ -360,7 +402,11 @@ class SetRoleRequest(BaseModel):
 
 @router.post("/tenants/{tenant_id}/plan")
 async def set_tenant_plan(
-    tenant_id: UUID, req: SetPlanRequest, actor: SuperAdmin, session: Session
+    tenant_id: UUID,
+    req: SetPlanRequest,
+    actor: BillingOperator,
+    session: Session,
+    request: Request,
 ) -> dict:
     plan = req.plan.strip().lower()
     if plan not in _PLANS:
@@ -373,6 +419,7 @@ async def set_tenant_plan(
     await _audit(
         session, actor, tenant_id=tenant_id, action="admin.plan_changed",
         target_type="tenant", target_id=tenant_id, detail={"from": before, "to": plan},
+        request=request,
     )
     await session.commit()
     return {"id": str(tenant_id), **_trial_view(tenant)}
@@ -380,7 +427,11 @@ async def set_tenant_plan(
 
 @router.post("/tenants/{tenant_id}/extend-trial")
 async def extend_trial(
-    tenant_id: UUID, req: ExtendTrialRequest, actor: SuperAdmin, session: Session
+    tenant_id: UUID,
+    req: ExtendTrialRequest,
+    actor: BillingOperator,
+    session: Session,
+    request: Request,
 ) -> dict:
     tenant = await session.get(Tenant, tenant_id)
     if tenant is None:
@@ -397,23 +448,33 @@ async def extend_trial(
     await _audit(
         session, actor, tenant_id=tenant_id, action="admin.trial_extended",
         target_type="tenant", target_id=tenant_id, detail={"days": req.days},
+        request=request,
     )
     await session.commit()
     return {"id": str(tenant_id), **_trial_view(tenant)}
 
 
 @router.post("/tenants/{tenant_id}/suspend")
-async def suspend_tenant(tenant_id: UUID, actor: SuperAdmin, session: Session) -> dict:
-    return await _set_tenant_active(session, actor, tenant_id, active=False)
+async def suspend_tenant(
+    tenant_id: UUID, actor: SuspendOperator, session: Session, request: Request
+) -> dict:
+    return await _set_tenant_active(session, actor, tenant_id, active=False, request=request)
 
 
 @router.post("/tenants/{tenant_id}/activate")
-async def activate_tenant(tenant_id: UUID, actor: SuperAdmin, session: Session) -> dict:
-    return await _set_tenant_active(session, actor, tenant_id, active=True)
+async def activate_tenant(
+    tenant_id: UUID, actor: SuspendOperator, session: Session, request: Request
+) -> dict:
+    return await _set_tenant_active(session, actor, tenant_id, active=True, request=request)
 
 
 async def _set_tenant_active(
-    session: AsyncSession, actor: SuperAdmin, tenant_id: UUID, *, active: bool
+    session: AsyncSession,
+    actor: Operator,
+    tenant_id: UUID,
+    *,
+    active: bool,
+    request: Request | None = None,
 ) -> dict:
     tenant = await session.get(Tenant, tenant_id)
     if tenant is None:
@@ -422,7 +483,7 @@ async def _set_tenant_active(
     await _audit(
         session, actor, tenant_id=tenant_id,
         action="admin.tenant_activated" if active else "admin.tenant_suspended",
-        target_type="tenant", target_id=tenant_id, detail={},
+        target_type="tenant", target_id=tenant_id, detail={}, request=request,
     )
     await session.commit()
     return {"id": str(tenant_id), "is_active": active}
@@ -436,19 +497,24 @@ async def _get_user(session: AsyncSession, user_id: UUID) -> User:
 
 
 @router.post("/users/{user_id}/approve")
-async def approve_user(user_id: UUID, actor: SuperAdmin, session: Session) -> dict:
+async def approve_user(
+    user_id: UUID, actor: UserOperator, session: Session, request: Request
+) -> dict:
     user = await _get_user(session, user_id)
     user.status = "active"
     await _audit(
         session, actor, tenant_id=user.tenant_id, action="admin.user_approved",
         target_type="user", target_id=user_id, detail={"email": user.email},
+        request=request,
     )
     await session.commit()
     return {"id": str(user_id), "status": user.status}
 
 
 @router.post("/users/{user_id}/suspend")
-async def suspend_user(user_id: UUID, actor: SuperAdmin, session: Session) -> dict:
+async def suspend_user(
+    user_id: UUID, actor: UserOperator, session: Session, request: Request
+) -> dict:
     user = await _get_user(session, user_id)
     if user.role == Role.OWNER.value:
         raise HTTPException(409, "suspend the owner via the tenant, not the user")
@@ -456,18 +522,22 @@ async def suspend_user(user_id: UUID, actor: SuperAdmin, session: Session) -> di
     await _audit(
         session, actor, tenant_id=user.tenant_id, action="admin.user_suspended",
         target_type="user", target_id=user_id, detail={"email": user.email},
+        request=request,
     )
     await session.commit()
     return {"id": str(user_id), "status": user.status}
 
 
 @router.post("/users/{user_id}/activate")
-async def activate_user(user_id: UUID, actor: SuperAdmin, session: Session) -> dict:
+async def activate_user(
+    user_id: UUID, actor: UserOperator, session: Session, request: Request
+) -> dict:
     user = await _get_user(session, user_id)
     user.status = "active"
     await _audit(
         session, actor, tenant_id=user.tenant_id, action="admin.user_activated",
         target_type="user", target_id=user_id, detail={"email": user.email},
+        request=request,
     )
     await session.commit()
     return {"id": str(user_id), "status": user.status}
@@ -475,7 +545,11 @@ async def activate_user(user_id: UUID, actor: SuperAdmin, session: Session) -> d
 
 @router.post("/users/{user_id}/role")
 async def set_user_role(
-    user_id: UUID, req: SetRoleRequest, actor: SuperAdmin, session: Session
+    user_id: UUID,
+    req: SetRoleRequest,
+    actor: RoleOperator,
+    session: Session,
+    request: Request,
 ) -> dict:
     role = req.role.strip().lower()
     if role not in _ROLES:
@@ -499,6 +573,7 @@ async def set_user_role(
     await _audit(
         session, actor, tenant_id=user.tenant_id, action="admin.role_changed",
         target_type="user", target_id=user_id, detail={"email": user.email, "role": role},
+        request=request,
     )
     await session.commit()
     return {"id": str(user_id), "role": user.role, "is_admin": user.is_admin}

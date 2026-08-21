@@ -35,8 +35,38 @@ class Settings(BaseSettings):
     trust_forwarded_for: bool = False
 
     secret_key: SecretStr = SecretStr("")
+
+    # ── Credential key custody (PRD §5.2) ────────────────────────────────────
+    # We store hundreds of businesses' mailbox passwords. Which provider wraps the
+    # per-secret data key — and, critically, whether THIS process can unwrap it —
+    # is the difference between "a compromised web pod leaks one request" and "a
+    # compromised web pod leaks every credential we hold". See security/keys.py.
+    #
+    #   local   — AES-GCM under credential_master_key. Development only.
+    #   x25519  — public-key wrapping; the API gets only the public half.
+    #             Recommended for self-hosted production.
+    #   aws     — AWS KMS Encrypt/Decrypt, split by IAM.
+    #   gcp     — Cloud KMS encrypt/decrypt, split by IAM.
+    #   auto    — infer from whichever key material is set (the default).
+    credential_key_provider: Literal["auto", "local", "x25519", "aws", "gcp"] = "auto"
+
     credential_master_key: SecretStr = SecretStr("")
+
+    #: base64 X25519 public key. Set this ALONE on the API to make it structurally
+    #: incapable of reading the credential store. Generate a pair with
+    #: `python -m envelock.security.keygen`.
+    credential_public_key: str | None = None
+    #: base64 X25519 private key. Set ONLY on the worker/broker deployment.
+    credential_private_key: SecretStr | None = None
+
     kms_key_id: str | None = None
+    kms_provider: Literal["aws", "gcp"] | None = None
+    kms_region: str | None = None
+    #: Declares that this process's IAM role is granted Decrypt. It is a statement
+    #: about the deployment, not something we can probe — an API pod should leave
+    #: it false so an attempt to decrypt fails loudly here rather than succeeding
+    #: because someone over-granted the role.
+    credential_can_decrypt: bool = True
 
     # ── Datastores ───────────────────────────────────────────────────────────
     postgres_dsn: str = "postgresql+asyncpg://envelock:envelock@localhost:5432/envelock"
@@ -379,12 +409,25 @@ class Settings(BaseSettings):
         missing: list[str] = []
         if not self.secret_key.get_secret_value():
             missing.append("ENVELOCK_SECRET_KEY")
-        if not self.credential_master_key.get_secret_value() and not self.kms_key_id:
-            missing.append("ENVELOCK_CREDENTIAL_MASTER_KEY or ENVELOCK_KMS_KEY_ID")
         if missing:
             raise ValueError(
                 f"Refusing to start in production without: {', '.join(missing)}"
             )
+
+        # Prove the credential key provider can actually be built. The previous
+        # check accepted ENVELOCK_KMS_KEY_ID on its own as satisfying the
+        # requirement, and then the sealing path raised at the first mailbox
+        # connect because no master key was set — a production deployment that
+        # started cleanly and could not store a single credential.
+        from envelock.security.keys import KeyProviderError, build_provider
+
+        try:
+            build_provider()
+        except KeyProviderError as exc:
+            raise ValueError(
+                f"Refusing to start in production: credential key custody is not "
+                f"usable — {exc}"
+            ) from exc
         return self
 
 

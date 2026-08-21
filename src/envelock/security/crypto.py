@@ -2,23 +2,35 @@
 
 Mailbox passwords and OAuth refresh tokens are the crown jewels — a store of them
 across hundreds of businesses is a bigger liability than the threat we sell
-against. Every secret is sealed with a per-secret data key (DEK), and that DEK is
-itself wrapped by a master key (KEK) held only in the environment / KMS. The
-plaintext key never lands in a column, a log or an error trace.
+against. Every secret is sealed under a fresh per-secret data key (DEK), and that
+DEK is wrapped by a key provider (`security/keys.py`): a KMS, a public key whose
+private half lives only in the worker, or — in development — a key derived from
+an environment variable.
 
-The wire format keeps its parameters, so rotating to a KMS-backed KEK later does
-not invalidate secrets sealed under the local key: `key_id` records which KEK
-sealed each `wrapped_dek`.
+Two properties matter and are enforced here rather than documented:
+
+* **The DEK is never stored in the clear.** Only its wrapped form is persisted.
+* **Sealing does not imply opening.** In a production deployment the API process
+  holds only the sealing half, so `open_secret` there raises a clear error
+  instead of returning a credential. That is the whole point of the split.
+
+The wire format carries its provenance: `key_id` records which provider and key
+sealed each record, so migrating providers leaves existing secrets readable while
+`rotate_credentials` re-wraps them in the background.
 """
 
 from __future__ import annotations
 
-import hashlib
+import os
 from dataclasses import dataclass
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from envelock.config import get_settings
+from envelock.security.keys import (
+    KeyProviderError,
+    active_provider,
+    provider_for_key_id,
+)
 
 
 class CryptoError(Exception):
@@ -32,65 +44,93 @@ class SealedSecret:
     key_id: str
 
 
-def _kek() -> bytes:
-    """Derive a 256-bit KEK from the configured master key.
-
-    In production a KMS/HSM wraps the DEK directly; the local key path exists so
-    the system runs end to end without cloud dependencies (the config validator
-    refuses to start production without one of the two — see config.py)."""
-    raw = get_settings().credential_master_key.get_secret_value()
-    if not raw:
-        raise CryptoError(
-            "no credential master key configured — refusing to seal a secret in "
-            "plaintext-equivalent form"
-        )
-    # A hash gives a uniform 32-byte key regardless of the configured length.
-    return hashlib.sha256(raw.encode()).digest()
-
-
-def _key_id() -> str:
-    settings = get_settings()
-    if settings.kms_key_id:
-        return f"kms:{settings.kms_key_id}"
-    # Fingerprint the local KEK so a rotation is detectable without revealing it.
-    return "local:" + hashlib.sha256(_kek()).hexdigest()[:16]
+def _context(aad: bytes | None) -> str:
+    """The encryption context bound into the wrap. The caller's `aad` is the
+    mailbox id, so a wrapped DEK cannot be replayed onto another row."""
+    return (aad or b"").decode("utf-8", "replace")
 
 
 def seal(plaintext: bytes, *, aad: bytes | None = None) -> SealedSecret:
-    """Encrypt `plaintext` under a fresh DEK, then wrap the DEK under the KEK.
+    """Encrypt `plaintext` under a fresh DEK, then wrap the DEK with the provider.
 
     `aad` binds the ciphertext to a context (e.g. the mailbox id) so a sealed
     secret cannot be lifted and replayed against a different record.
     """
-    import os
+    try:
+        provider = active_provider()
+    except KeyProviderError as exc:
+        raise CryptoError(str(exc)) from exc
 
     dek = AESGCM.generate_key(bit_length=256)
     dek_nonce = os.urandom(12)
     ciphertext = dek_nonce + AESGCM(dek).encrypt(dek_nonce, plaintext, aad)
-
-    kek_nonce = os.urandom(12)
-    wrapped = kek_nonce + AESGCM(_kek()).encrypt(kek_nonce, dek, None)
-    return SealedSecret(ciphertext=ciphertext, wrapped_dek=wrapped, key_id=_key_id())
+    try:
+        wrapped = provider.wrap(dek, context=_context(aad))
+    except KeyProviderError as exc:
+        raise CryptoError(f"could not wrap the data key — {exc}") from exc
+    return SealedSecret(ciphertext=ciphertext, wrapped_dek=wrapped, key_id=provider.key_id)
 
 
 def open_secret(sealed: SealedSecret, *, aad: bytes | None = None) -> bytes:
-    """Unwrap the DEK, then decrypt. Raises `CryptoError` on any tamper."""
+    """Unwrap the DEK, then decrypt. Raises `CryptoError` on any tamper — or when
+    this process deliberately holds no decryption key."""
     try:
-        kek_nonce, wrapped = sealed.wrapped_dek[:12], sealed.wrapped_dek[12:]
-        dek = AESGCM(_kek()).decrypt(kek_nonce, wrapped, None)
+        provider = provider_for_key_id(sealed.key_id)
+    except KeyProviderError as exc:
+        raise CryptoError(str(exc)) from exc
+
+    if not provider.can_unwrap:
+        raise CryptoError(
+            "this process cannot decrypt stored credentials by design — the "
+            "decryption key lives only in the worker/broker deployment"
+        )
+    try:
+        dek = provider.unwrap(sealed.wrapped_dek, context=_context(aad))
         nonce, body = sealed.ciphertext[:12], sealed.ciphertext[12:]
         return AESGCM(dek).decrypt(nonce, body, aad)
+    except KeyProviderError as exc:
+        raise CryptoError(str(exc)) from exc
     except Exception as exc:  # cryptography raises InvalidTag, among others
         raise CryptoError("could not open sealed secret — wrong key or tampered") from exc
 
 
+def can_decrypt() -> bool:
+    """Whether this process holds a key that can open stored credentials.
+
+    Used at boot to refuse to start a worker that would silently fail every poll,
+    and on the admin security page to show the custody split honestly.
+    """
+    try:
+        return active_provider().can_unwrap
+    except KeyProviderError:
+        return False
+
+
+# ── Rotation ─────────────────────────────────────────────────────────────────
+def reseal(sealed: SealedSecret, *, aad: bytes | None) -> SealedSecret:
+    """Open a secret with whichever provider sealed it and re-seal under the
+    provider this process is configured with.
+
+    This is how a deployment migrates from the development `local` key to a KMS
+    or public-key provider: run `rotate_credentials` with both sets of key
+    material present, and every credential moves without the customer noticing.
+    """
+    plaintext = open_secret(sealed, aad=aad)
+    return seal(plaintext, aad=aad)
+
+
 def _kek_from(raw: str) -> bytes:
+    """Kept for the `local` → `local` master-key rotation path."""
+    import hashlib
+
     if not raw:
         raise CryptoError("empty master key")
     return hashlib.sha256(raw.encode()).digest()
 
 
 def _key_id_from(kek: bytes) -> str:
+    import hashlib
+
     return "local:" + hashlib.sha256(kek).hexdigest()[:16]
 
 
@@ -101,16 +141,12 @@ def rekey(
     old_master_key: str,
     new_master_key: str,
 ) -> SealedSecret:
-    """Re-seal a secret under a new master key without exposing the plaintext to
-    a column, log, or the caller.
+    """Re-seal a `local`-provider secret under a new master key.
 
     Rotating `ENVELOCK_CREDENTIAL_MASTER_KEY` otherwise silently bricks every
-    stored credential (the mailbox reads as connected but can't be read). Run this
-    over the credential store as part of a planned rotation so secrets survive.
-    Decrypt with the old KEK, re-encrypt under a fresh DEK wrapped by the new KEK.
+    stored credential (the mailbox reads as connected but can't be read). For a
+    move to a *different provider*, use `reseal` instead.
     """
-    import os
-
     old_kek = _kek_from(old_master_key)
     try:
         kek_nonce, wrapped = sealed.wrapped_dek[:12], sealed.wrapped_dek[12:]
@@ -127,3 +163,14 @@ def rekey(
     kek_nonce = os.urandom(12)
     wrapped = kek_nonce + AESGCM(new_kek).encrypt(kek_nonce, new_dek, None)
     return SealedSecret(ciphertext=ciphertext, wrapped_dek=wrapped, key_id=_key_id_from(new_kek))
+
+
+__all__ = [
+    "CryptoError",
+    "SealedSecret",
+    "can_decrypt",
+    "open_secret",
+    "rekey",
+    "reseal",
+    "seal",
+]

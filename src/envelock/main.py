@@ -16,6 +16,9 @@ from envelock.api import (
     channels,
     governance,
     health,
+    security_posture,
+    staff,
+    staff_auth,
     tenants,
     v1,
     webhooks,
@@ -40,6 +43,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
     logger.info("envelock starting", extra={"env": settings.env})
+
+    # Say out loud what custody this process actually has over stored mailbox
+    # credentials (PRD §5.2). "We use a KMS" has to be checkable in a log line,
+    # not just claimed in a doc — and a seal-only process needs to know it is one
+    # before it starts workers that would fail every poll.
+    from envelock.security.keys import custody_summary
+
+    custody = custody_summary()
+    can_decrypt_credentials = bool(custody.get("can_decrypt"))
+    if not custody.get("ok"):
+        logger.error("credential key custody NOT configured: %s", custody.get("error"))
+    elif custody.get("separated"):
+        logger.info(
+            "credential key custody: %s (seal-only — this process cannot decrypt "
+            "stored credentials, which is the intended production split)",
+            custody["key_id"],
+        )
+    else:
+        logger.info(
+            "credential key custody: %s (this process CAN decrypt stored credentials)",
+            custody["key_id"],
+        )
 
     # Ensure the schema exists on the configured Postgres. Idempotent, so moving
     # from a local DB to a production one is only a change of ENVELOCK_POSTGRES_DSN.
@@ -112,7 +137,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     imap_stop = asyncio.Event()
     imap_task: asyncio.Task | None = None
-    if settings.imap_poll_worker_enabled:
+    if settings.imap_poll_worker_enabled and not can_decrypt_credentials:
+        # Deliberate, not a failure: in the split deployment the API pod holds only
+        # the sealing key, so a poller here could never open a credential. Starting
+        # it anyway would log an authentication error every 60 seconds and look
+        # exactly like broken customer credentials.
+        logger.info(
+            "imap poll worker not started in this process — it holds no credential "
+            "decryption key. Run the worker deployment (with the private key) to poll."
+        )
+    elif settings.imap_poll_worker_enabled:
         from envelock.workers.imap_fetch import imap_poll_loop
 
         imap_task = asyncio.create_task(
@@ -226,6 +260,12 @@ def create_app() -> FastAPI:
     app.include_router(tenants.router)
     app.include_router(channels.router)
     app.include_router(webhooks.router)
+    # Order matters: the staff routers declare `/admin/staff…` and
+    # `/admin/auth/…`, which must be matched before `admin.router`'s
+    # `/admin/tenants/{tenant_id}`-style paths get a chance to swallow them.
+    app.include_router(staff_auth.router)
+    app.include_router(staff.router)
+    app.include_router(security_posture.router)
     app.include_router(admin.router)
     return app
 

@@ -188,23 +188,40 @@ def start(stop: asyncio.Event) -> list[asyncio.Task]:
         ),
         asyncio.create_task(
             _run_forever(
-                "oauth_refresh", oauth_refresh_job,
-                interval=settings.oauth_refresh_seconds, stop=stop,
-            )
-        ),
-        asyncio.create_task(
-            _run_forever(
-                "oauth_fetch", oauth_fetch_job,
-                interval=settings.oauth_refresh_seconds, stop=stop,
-            )
-        ),
-        asyncio.create_task(
-            _run_forever(
                 "domain_reverify", domain_reverify_job,
                 interval=settings.domain_reverify_seconds, stop=stop,
             )
         ),
     ]
+
+    # The OAuth jobs decrypt stored refresh tokens. In the split deployment the
+    # API process holds only the sealing key, so running them there would burn a
+    # cycle every half hour failing to open a credential — and look like the
+    # customer's grant had expired. Only the process that can decrypt runs them.
+    from envelock.security.crypto import can_decrypt
+
+    if can_decrypt():
+        tasks.extend(
+            [
+                asyncio.create_task(
+                    _run_forever(
+                        "oauth_refresh", oauth_refresh_job,
+                        interval=settings.oauth_refresh_seconds, stop=stop,
+                    )
+                ),
+                asyncio.create_task(
+                    _run_forever(
+                        "oauth_fetch", oauth_fetch_job,
+                        interval=settings.oauth_refresh_seconds, stop=stop,
+                    )
+                ),
+            ]
+        )
+    else:
+        logger.info(
+            "oauth refresh/fetch jobs not started — this process holds no "
+            "credential decryption key (run them in the worker deployment)"
+        )
     if settings.ct_watcher_enabled:
         tasks.append(asyncio.create_task(run_ct_watcher(stop)))
     logger.info("scheduler started (%d jobs)", len(tasks))

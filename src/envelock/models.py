@@ -95,6 +95,69 @@ class User(Base, UUIDMixin, TimestampMixin):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Platform staff (Envelock's own people — NOT a customer tenant)
+# ─────────────────────────────────────────────────────────────────────────────
+class StaffAccount(Base, UUIDMixin, TimestampMixin):
+    """An Envelock operator: support, billing, security, engineering.
+
+    Deliberately a separate table from `users`, with its own credentials and its
+    own token type. A platform operator is not a member of any customer tenant,
+    so modelling them as one would mean either a fake tenant row or a customer
+    account that can read every other customer — and it would put the two
+    populations one bug apart. Nothing in the customer product can create,
+    promote or authenticate one of these.
+    """
+
+    __tablename__ = "staff_accounts"
+
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    name: Mapped[str | None] = mapped_column(String(255))
+    password_hash: Mapped[str | None] = mapped_column(String(255))
+    #: What they were hired to do — drives the default permission set
+    #: (auth/staff.py DEPARTMENT_PERMISSIONS).
+    department: Mapped[str] = mapped_column(String(32), default="support")
+    #: Exceptions on top of the department default. Revocation beats a grant.
+    granted_permissions: Mapped[list[str]] = mapped_column(StringList, default=list)
+    revoked_permissions: Mapped[list[str]] = mapped_column(StringList, default=list)
+    #: active | suspended. Checked on every request, not just at sign-in.
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    #: A new operator signs in with a one-time password and must replace it
+    #: before reaching anything.
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=True)
+    totp_secret: Mapped[str | None] = mapped_column(String(64))
+    #: MFA is NOT deferrable for staff, unlike customer accounts: these
+    #: credentials reach every tenant's metadata.
+    mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    recovery_hashes: Mapped[list[str]] = mapped_column(StringList, default=list)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_login_ip: Mapped[str | None] = mapped_column(String(64))
+    created_by: Mapped[str | None] = mapped_column(String(320))
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class StaffAuditEvent(Base, UUIDMixin, TimestampMixin):
+    """What an operator did, in its own log.
+
+    The customer-facing `audit_events` table is tenant-scoped and shown to
+    customers; platform actions belong somewhere a customer cannot see and an
+    operator cannot quietly prune from their own tenant view.
+    """
+
+    __tablename__ = "staff_audit_events"
+
+    actor_email: Mapped[str] = mapped_column(String(320), index=True)
+    actor_id: Mapped[UUID | None] = mapped_column(Uuid)
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    target_type: Mapped[str | None] = mapped_column(String(32))
+    target_id: Mapped[str | None] = mapped_column(String(64))
+    #: The tenant an action touched, when it touched one — so a customer-impacting
+    #: action can be traced from either direction.
+    tenant_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
+    ip: Mapped[str | None] = mapped_column(String(64))
+    detail: Mapped[dict] = mapped_column(JsonDict, default=dict)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Domains
 # ─────────────────────────────────────────────────────────────────────────────
 class Domain(Base, UUIDMixin, TimestampMixin):
