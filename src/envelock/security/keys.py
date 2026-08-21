@@ -336,11 +336,18 @@ class GcpKmsProvider:
 _ACTIVE: KeyProvider | None = None
 
 
-def build_provider() -> KeyProvider:
-    """The provider this process should use, from configuration."""
-    from envelock.config import get_settings
+def build_provider(settings=None) -> KeyProvider:  # noqa: ANN001 — config.Settings
+    """The provider this process should use, from configuration.
 
-    settings = get_settings()
+    `settings` is passed explicitly by the production start-up validator, which
+    runs *during* `Settings()` construction: calling `get_settings()` from there
+    re-enters the constructor and recurses until the stack blows. Every other
+    caller leaves it None and gets the cached settings.
+    """
+    if settings is None:
+        from envelock.config import get_settings
+
+        settings = get_settings()
     mode = (settings.credential_key_provider or "").strip().lower()
 
     if not mode or mode == "auto":

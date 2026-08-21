@@ -422,7 +422,10 @@ class Settings(BaseSettings):
         from envelock.security.keys import KeyProviderError, build_provider
 
         try:
-            build_provider()
+            # `self`, not get_settings(): this validator runs inside the Settings
+            # constructor, so asking for the cached settings here would re-enter
+            # it and recurse until the stack blows.
+            build_provider(self)
         except KeyProviderError as exc:
             raise ValueError(
                 f"Refusing to start in production: credential key custody is not "

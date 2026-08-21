@@ -223,3 +223,114 @@ def test_a_kms_key_id_alone_no_longer_looks_configured(key_env: dict) -> None:
     )
     with pytest.raises(keys.KeyProviderError):
         keys.build_provider()
+
+
+# ── Production start-up ──────────────────────────────────────────────────────
+#: The production validator runs *inside* `Settings()`. It once called
+#: `get_settings()` from there, which re-entered the constructor and recursed
+#: until the stack blew — so the deploy died with a `RecursionError` thousands of
+#: frames deep instead of starting. These run the real boot in a subprocess, from
+#: a directory with no `.env`, which is exactly what the container does.
+_BOOT = """
+import json, os, sys
+
+for key in [k for k in os.environ if k.startswith("ENVELOCK_")]:
+    del os.environ[key]
+os.environ.update(json.loads(sys.argv[1]))
+os.environ["ENVELOCK_ENV"] = "production"
+os.environ["ENVELOCK_SECRET_KEY"] = "s" * 64
+os.environ["ENVELOCK_POSTGRES_DSN"] = "postgresql+asyncpg://u:p@localhost:5432/db"
+# Low enough that a re-entrant validator blows up immediately rather than
+# spending a minute building a 1000-frame traceback.
+sys.setrecursionlimit(200)
+try:
+    from envelock.config import get_settings
+
+    get_settings()
+    from envelock.security.keys import custody_summary
+
+    print("STARTED " + json.dumps(custody_summary()))
+except RecursionError:
+    print("RECURSION")
+except Exception as exc:  # noqa: BLE001
+    print("REFUSED " + str(exc).replace(chr(10), " "))
+"""
+
+
+def _boot(env: dict[str, str]) -> str:
+    """Run a production start-up in a clean process and report what happened."""
+    import json
+    import pathlib
+    import subprocess
+    import sys
+    import tempfile
+
+    src = str(pathlib.Path(__file__).resolve().parents[1] / "src")
+    with tempfile.TemporaryDirectory() as empty:  # no .env to fall back on
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-c", _BOOT, json.dumps(env)],
+            capture_output=True,
+            text=True,
+            cwd=empty,
+            env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": src},
+            timeout=120,
+        )
+    return (result.stdout or result.stderr).strip()
+
+
+def test_production_boots_with_a_local_master_key() -> None:
+    out = _boot({"ENVELOCK_CREDENTIAL_MASTER_KEY": "m" * 64})
+    assert out.startswith("STARTED"), out
+    assert '"mode": "local"' in out
+
+
+def test_production_boots_seal_only_on_the_api_deployment() -> None:
+    """The API pod gets the public key alone and must start — holding no
+    decryption key is the intended configuration, not an error."""
+    public, _ = generate()
+    out = _boot(
+        {
+            "ENVELOCK_CREDENTIAL_KEY_PROVIDER": "x25519",
+            "ENVELOCK_CREDENTIAL_PUBLIC_KEY": public,
+        }
+    )
+    assert out.startswith("STARTED"), out
+    assert '"can_decrypt": false' in out
+    assert '"separated": true' in out
+
+
+def test_production_boots_with_both_halves_on_the_worker() -> None:
+    public, private = generate()
+    out = _boot(
+        {
+            "ENVELOCK_CREDENTIAL_KEY_PROVIDER": "x25519",
+            "ENVELOCK_CREDENTIAL_PUBLIC_KEY": public,
+            "ENVELOCK_CREDENTIAL_PRIVATE_KEY": private,
+        }
+    )
+    assert out.startswith("STARTED"), out
+    assert '"can_decrypt": true' in out
+
+
+def test_production_boots_against_a_kms_key() -> None:
+    out = _boot(
+        {
+            "ENVELOCK_CREDENTIAL_KEY_PROVIDER": "aws",
+            "ENVELOCK_KMS_KEY_ID": "arn:aws:kms:eu-west-1:1:key/abc",
+            "ENVELOCK_KMS_REGION": "eu-west-1",
+        }
+    )
+    assert out.startswith("STARTED"), out
+    assert '"mode": "awskms"' in out
+
+
+def test_production_refuses_to_start_with_no_key_material() -> None:
+    """And says why, in a sentence — not a stack trace."""
+    out = _boot({})
+    assert out.startswith("REFUSED"), out
+    assert "credential key custody is not usable" in out
+
+
+def test_production_refuses_a_kms_key_id_with_no_provider_named() -> None:
+    out = _boot({"ENVELOCK_KMS_KEY_ID": "arn:aws:kms:eu-west-1:1:key/abc"})
+    assert out.startswith("REFUSED"), out
